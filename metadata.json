@@ -1,0 +1,10 @@
+{
+  "name": "Remix: Yosri GSM - Shop and Sales Management",
+  "description": "تطبيق تسيير البضاعة والبيع بالتفصيل لـ Yosri GSM، يدعم الفواتير المتعددة الأسطر، إدارة الستوك وبطاقات الشحن، الديون، ومصاريف اليوم مع ميزة الاستماع المباشر والباركود.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

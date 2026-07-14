@@ -1,0 +1,30 @@
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Cairo", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #faf6ef; /* warm paper background */
+  color: #1c1a17; /* rich charcoal ink */
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #faf6ef;
+}
+::-webkit-scrollbar-thumb {
+  background: #c8102e33;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #c8102e66;
+}
+
