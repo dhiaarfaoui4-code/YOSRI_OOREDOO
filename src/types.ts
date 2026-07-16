@@ -6,6 +6,7 @@ export interface Item {
   qty: number;
   barcodes?: string[];
   barcode?: string; // Legacy fallback
+  category?: string; // e.g., 'phone', 'battery', 'speaker', 'bluetooth', 'accessory'
 }
 
 export interface Sale {

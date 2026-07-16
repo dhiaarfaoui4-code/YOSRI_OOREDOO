@@ -40,6 +40,14 @@ async function sha256Hex(text: string): Promise<string> {
   return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+export const CATEGORY_MAP: Record<string, { label: string, icon: string }> = {
+  phone: { label: 'هواتف', icon: '📱' },
+  battery: { label: 'بطاريات', icon: '🔋' },
+  speaker: { label: 'سبيكرات', icon: '🔊' },
+  bluetooth: { label: 'سماعات بلوتوث', icon: '🎧' },
+  accessory: { label: 'أكسسوارات أخرى', icon: '🔌' }
+};
+
 // Helper to parse Firebase Realtime Database objects into arrays with exact IDs
 function parseRawWithKeys<T>(rawObj: any): T[] {
   if (!rawObj) return [];
@@ -91,7 +99,7 @@ export default function App() {
   });
 
   // ---- Form Inputs ----
-  const [newItem, setNewItem] = useState({ name: '', barcode: '', buy: '', sell: '', qty: '' });
+  const [newItem, setNewItem] = useState({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory' });
   const [cardOperator, setCardOperator] = useState('Ooredoo');
   const [cardValue, setCardValue] = useState('1');
   const [cardQty, setCardQty] = useState('');
@@ -102,6 +110,11 @@ export default function App() {
   const [newPlanPrice, setNewPlanPrice] = useState('');
   const [manualDebt, setManualDebt] = useState({ name: '', phone: '', amount: '', note: '' });
   const [expenseInput, setExpenseInput] = useState({ desc: '', amount: '' });
+  const [whatsappConfig, setWhatsappConfig] = useState<{ enabled: boolean; phone: string; apiKey: string }>({
+    enabled: false,
+    phone: '+21641444355',
+    apiKey: ''
+  });
 
   // Income Line Form State
   const [incomeType, setIncomeType] = useState<'item' | 'recharge' | 'forfait' | 'photo' | 'service'>('item');
@@ -131,6 +144,8 @@ export default function App() {
 
   // Searches
   const [stockSearch, setStockSearch] = useState('');
+  const [selectedStockCategory, setSelectedStockCategory] = useState<string>('all');
+  const [selectedSellCategory, setSelectedSellCategory] = useState<string>('all');
   const [debtSearch, setDebtSearch] = useState('');
   const [auditLogSearch, setAuditLogSearch] = useState('');
   const [historySearch, setHistorySearch] = useState('');
@@ -245,12 +260,13 @@ export default function App() {
         fetchJsonWithRetry('/forfaitPlans.json').catch(() => null),
         fetchJsonWithRetry('/forfaitBalance.json').catch(() => null),
         fetchJsonWithRetry('/auditLog.json').catch(() => null),
-        fetchJsonWithRetry('/pin.json').catch(() => '1234')
+        fetchJsonWithRetry('/pin.json').catch(() => '1234'),
+        fetchJsonWithRetry('/whatsappConfig.json').catch(() => null)
       ]);
 
       const [
         itemsRaw, salesRaw, otherIncomeRaw, debtsRaw, cardStockRaw,
-        cashRegisterRaw, expensesRaw, plansRaw, balanceRaw, auditRaw, pinRaw
+        cashRegisterRaw, expensesRaw, plansRaw, balanceRaw, auditRaw, pinRaw, whatsappConfigRaw
       ] = results;
 
       setItems(parseRawWithKeys<Item>(itemsRaw));
@@ -260,6 +276,13 @@ export default function App() {
       setCardStock(parseRawWithKeys<CardStockEntry>(cardStockRaw));
       setCashRegister(typeof cashRegisterRaw === 'number' ? cashRegisterRaw : 0);
       setExpenses(parseRawWithKeys<Expense>(expensesRaw));
+      if (whatsappConfigRaw) {
+        setWhatsappConfig({
+          enabled: !!whatsappConfigRaw.enabled,
+          phone: whatsappConfigRaw.phone || '+21641444355',
+          apiKey: whatsappConfigRaw.apiKey || ''
+        });
+      }
       setAuditLog(parseRawWithKeys<AuditLogEntry>(auditRaw).reverse());
 
       // If forfait plans are empty, generate default ones
@@ -323,7 +346,7 @@ export default function App() {
   // ---- 1. Stock / Items Actions ----
   const handleAddItem = async (e: React.FormEvent) => {
     e.preventDefault();
-    const { name, barcode, buy, sell, qty } = newItem;
+    const { name, barcode, buy, sell, qty, category } = newItem;
     if (!name) return triggerToast('❌ الرجاء إدخال اسم السلعة');
     
     const buyVal = parseFloat(buy) || 0;
@@ -364,7 +387,8 @@ export default function App() {
             qty: existing.qty + qtyVal,
             buy: buyVal > 0 ? buyVal : existing.buy,
             sell: sellVal > 0 ? sellVal : existing.sell,
-            barcodes: mergedBarcodes
+            barcodes: mergedBarcodes,
+            category: category || existing.category || 'accessory'
           };
           const ok = await putWithOutbox(`/items/${existing.id}.json`, updated);
           if (ok) {
@@ -372,7 +396,7 @@ export default function App() {
             logAudit('edit', `تحديث ستوك سلعة مكررة: ${name} (+${qtyVal})`);
             loadAllData();
           }
-          setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '' });
+          setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory' });
         }
       });
       return;
@@ -384,14 +408,15 @@ export default function App() {
       buy: buyVal,
       sell: sellVal,
       qty: qtyVal,
-      barcodes: barcodeArray
+      barcodes: barcodeArray,
+      category: category || 'accessory'
     };
 
     const ok = await putWithOutbox(`/items/${item.id}.json`, item);
     if (ok) {
       triggerToast('✅ تم إضافة السلعة الجديدة للمخزن');
       logAudit('edit', `إضافة سلعة جديدة: ${name} (${qtyVal} قطعة)`);
-      setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '' });
+      setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory' });
       loadAllData();
     }
   };
@@ -454,6 +479,92 @@ export default function App() {
       loadAllData();
     } else {
       triggerToast('❌ فشل تعديل الاسم، حاول لاحقاً');
+    }
+  };
+
+  const handleEditItemCategory = async (itemId: string) => {
+    const item = items.find(i => i.id === itemId);
+    if (!item) return;
+    const currentCat = item.category || 'accessory';
+    const choice = prompt(
+      `اختر فئة جديدة لـ "${item.name}":\n1 - هواتف 📱\n2 - بطاريات 🔋\n3 - سبيكرات 🔊\n4 - سماعات بلوتوث 🎧\n5 - أكسسوارات أخرى 🔌`, 
+      currentCat === 'phone' ? '1' : currentCat === 'battery' ? '2' : currentCat === 'speaker' ? '3' : currentCat === 'bluetooth' ? '4' : '5'
+    );
+    if (choice === null) return;
+    let newCat = 'accessory';
+    if (choice === '1') newCat = 'phone';
+    else if (choice === '2') newCat = 'battery';
+    else if (choice === '3') newCat = 'speaker';
+    else if (choice === '4') newCat = 'bluetooth';
+    else if (choice === '5') newCat = 'accessory';
+    else {
+      return triggerToast('❌ اختيار غير صحيح');
+    }
+
+    if (newCat === currentCat) return;
+
+    const updated = { ...item, category: newCat };
+    const ok = await putWithOutbox(`/items/${itemId}.json`, updated);
+    if (ok) {
+      triggerToast('✅ تم تعديل الفئة بنجاح');
+      logAudit('edit', `تعديل فئة سلعة "${item.name}" إلى ${CATEGORY_MAP[newCat].label}`);
+      loadAllData();
+    } else {
+      triggerToast('❌ فشل تعديل الفئة، حاول لاحقاً');
+    }
+  };
+
+  const triggerWhatsAppNotification = async (
+    invoiceCart: CartLine[],
+    totalAmount: number,
+    isDebt: boolean,
+    customer: string
+  ) => {
+    if (!whatsappConfig.enabled || !whatsappConfig.apiKey) {
+      console.log('WhatsApp notification skipped');
+      return;
+    }
+
+    const formattedDate = new Date().toLocaleString('fr-FR', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    let msg = `🛍️ *عملية بيع جديدة!*\n`;
+    msg += `📅 *الوقت:* ${formattedDate}\n`;
+    msg += `💰 *المجموع:* ${totalAmount.toFixed(3)} د.ت\n`;
+    msg += `💳 *النوع:* ${isDebt ? `دين على [${customer}]` : 'نقدي كاش'}\n\n`;
+    msg += `📦 *السلع والخدمات:*\n`;
+
+    invoiceCart.forEach(c => {
+      msg += `• ${c.label} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
+    });
+
+    try {
+      const cleanPhone = whatsappConfig.phone.replace('+', '').replace(/\s/g, '');
+      const url = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(
+        cleanPhone
+      )}&text=${encodeURIComponent(msg)}&apikey=${encodeURIComponent(whatsappConfig.apiKey)}`;
+      
+      fetch(url, { mode: 'no-cors' }).catch(e => {
+        console.error('Failed to send WhatsApp via callmebot', e);
+      });
+    } catch (err) {
+      console.error('Error preparing WhatsApp message', err);
+    }
+  };
+
+  const handleSaveWhatsAppConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const ok = await putWithOutbox('/whatsappConfig.json', whatsappConfig);
+    if (ok) {
+      triggerToast('✅ تم حفظ إعدادات واتساب بنجاح');
+      logAudit('edit', `تعديل إعدادات إشعارات واتساب: ${whatsappConfig.enabled ? 'مفعلة' : 'معطلة'} للرقم ${whatsappConfig.phone}`);
+    } else {
+      triggerToast('❌ فشل الحفظ، يرجى التحقق من الاتصال بالإنترنت');
     }
   };
 
@@ -989,6 +1100,9 @@ export default function App() {
       setLastInvoice(null);
     }
 
+    // Trigger WhatsApp notification for the sale
+    triggerWhatsAppNotification(cart, grandTotal, invoiceIsDebt, invoiceCustomerName);
+
     // Reset Form
     setCart([]);
     setInvoiceCustomerName('');
@@ -1351,8 +1465,40 @@ export default function App() {
   const paidDebts = debts.filter(d => d.status === 'paid').slice(-8).reverse();
   const lowStockItems = items.filter(i => i.qty <= 3);
 
-  const filteredItems = items.filter(i => !stockSearch || normalizeArabic(i.name).includes(normalizeArabic(stockSearch)));
-  const sellFilteredItems = items.filter(i => !sellSearch || normalizeArabic(i.name).includes(normalizeArabic(sellSearch)));
+  // Grouped counters for each category
+  const categoryTotals = useMemo(() => {
+    const totals = {
+      phone: { count: 0, qty: 0 },
+      battery: { count: 0, qty: 0 },
+      speaker: { count: 0, qty: 0 },
+      bluetooth: { count: 0, qty: 0 },
+      accessory: { count: 0, qty: 0 }
+    };
+    items.forEach(i => {
+      const cat = (i.category || 'accessory') as keyof typeof totals;
+      if (totals[cat]) {
+        totals[cat].count += 1;
+        totals[cat].qty += i.qty;
+      } else {
+        totals.accessory.count += 1;
+        totals.accessory.qty += i.qty;
+      }
+    });
+    return totals;
+  }, [items]);
+
+  const filteredItems = items.filter(i => {
+    const matchesSearch = !stockSearch || normalizeArabic(i.name).includes(normalizeArabic(stockSearch));
+    const cat = i.category || 'accessory';
+    const matchesCategory = selectedStockCategory === 'all' || cat === selectedStockCategory;
+    return matchesSearch && matchesCategory;
+  });
+  const sellFilteredItems = items.filter(i => {
+    const matchesSearch = !sellSearch || normalizeArabic(i.name).includes(normalizeArabic(sellSearch));
+    const cat = i.category || 'accessory';
+    const matchesCategory = selectedSellCategory === 'all' || cat === selectedSellCategory;
+    return matchesSearch && matchesCategory;
+  });
 
   // Filtered History for Manager
   const filteredHistory = useMemo(() => {
@@ -1738,7 +1884,7 @@ export default function App() {
                       {currentRole === 'manager' ? '📦 تسجيل وإضافة سلع جديدة للمخزن' : '📦 تسجيل وزيادة كميات السلع بالمخزن'}
                     </h3>
                     <form onSubmit={handleAddItem} className="space-y-3">
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                         <div>
                           <label className="block text-[11px] text-stone-500 mb-1">اسم السلعة بالتفصيل</label>
                           <input 
@@ -1748,6 +1894,20 @@ export default function App() {
                             onChange={e => setNewItem(prev => ({ ...prev, name: e.target.value }))}
                             className="w-full bg-stone-50 border border-stone-200 px-3 py-2.5 rounded-xl text-xs text-stone-800"
                           />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] text-stone-500 mb-1">الفئة</label>
+                          <select 
+                            value={newItem.category}
+                            onChange={e => setNewItem(prev => ({ ...prev, category: e.target.value }))}
+                            className="w-full bg-stone-50 border border-stone-200 px-3 py-2.5 rounded-xl text-xs text-stone-800 font-bold"
+                          >
+                            <option value="phone">📱 هواتف</option>
+                            <option value="battery">🔋 بطاريات</option>
+                            <option value="speaker">🔊 سبيكرات</option>
+                            <option value="bluetooth">🎧 سماعات بلوتوث</option>
+                            <option value="accessory">🔌 أكسسوارات أخرى</option>
+                          </select>
                         </div>
                         <div>
                           <label className="block text-[11px] text-stone-500 mb-1">الباركود (اختياري)</label>
@@ -2033,6 +2193,91 @@ export default function App() {
                     )}
                   </div>
 
+                  <div className="mb-4 bg-amber-50/70 border border-amber-200/60 rounded-xl p-3 text-amber-900 text-xs flex items-start gap-2">
+                    <span className="text-sm">💡</span>
+                    <div>
+                      <p className="font-bold text-amber-950">ملاحظة لتصنيف السلع المسجلة سابقاً:</p>
+                      <p className="text-[11px] text-amber-800 mt-0.5 leading-relaxed">
+                        جميع السلع التي قمت بتسجيلها مسبقاً تقع حالياً تحت تصنيف <strong>"أكسسوارات أخرى" 🔌</strong>. يمكنك تصنيفها وترتيبها بسهولة في أي وقت بالضغط مباشرةً على رمز الفئة بجانب اسم السلعة في القائمة أدناه!
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Category Aggregated Counters */}
+                  <div className="mb-5 bg-stone-50/50 rounded-2xl border border-stone-100 p-4">
+                    <h4 className="font-bold text-stone-700 text-[11px] mb-2.5 flex items-center gap-1">
+                      📊 إحصائيات المخزون الإجمالي بالفئات
+                    </h4>
+                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                      <div className="bg-blue-50/60 border border-blue-100 p-2.5 rounded-xl text-center">
+                        <span className="text-base">📱</span>
+                        <div className="text-[10px] text-stone-500 font-bold mt-0.5">الهواتف</div>
+                        <div className="font-mono text-xs font-black text-blue-900 mt-0.5">
+                          {categoryTotals.phone.qty} <span className="text-[8px] font-bold">قطعة</span>
+                        </div>
+                        <div className="text-[8px] text-stone-400">({categoryTotals.phone.count} أنواع)</div>
+                      </div>
+                      <div className="bg-emerald-50/60 border border-emerald-100 p-2.5 rounded-xl text-center">
+                        <span className="text-base">🔋</span>
+                        <div className="text-[10px] text-stone-500 font-bold mt-0.5">البطاريات</div>
+                        <div className="font-mono text-xs font-black text-emerald-900 mt-0.5">
+                          {categoryTotals.battery.qty} <span className="text-[8px] font-bold">قطعة</span>
+                        </div>
+                        <div className="text-[8px] text-stone-400">({categoryTotals.battery.count} أنواع)</div>
+                      </div>
+                      <div className="bg-indigo-50/60 border border-indigo-100 p-2.5 rounded-xl text-center">
+                        <span className="text-base">🔊</span>
+                        <div className="text-[10px] text-stone-500 font-bold mt-0.5">السبيكرات</div>
+                        <div className="font-mono text-xs font-black text-indigo-900 mt-0.5">
+                          {categoryTotals.speaker.qty} <span className="text-[8px] font-bold">قطعة</span>
+                        </div>
+                        <div className="text-[8px] text-stone-400">({categoryTotals.speaker.count} أنواع)</div>
+                      </div>
+                      <div className="bg-purple-50/60 border border-purple-100 p-2.5 rounded-xl text-center">
+                        <span className="text-base">🎧</span>
+                        <div className="text-[10px] text-stone-500 font-bold mt-0.5">سماعات بلوتوث</div>
+                        <div className="font-mono text-xs font-black text-purple-900 mt-0.5">
+                          {categoryTotals.bluetooth.qty} <span className="text-[8px] font-bold">قطعة</span>
+                        </div>
+                        <div className="text-[8px] text-stone-400">({categoryTotals.bluetooth.count} أنواع)</div>
+                      </div>
+                      <div className="bg-stone-50 border border-stone-200 p-2.5 rounded-xl text-center col-span-2 sm:col-span-1">
+                        <span className="text-base">🔌</span>
+                        <div className="text-[10px] text-stone-500 font-bold mt-0.5">أكسسوارات أخرى</div>
+                        <div className="font-mono text-xs font-black text-stone-800 mt-0.5">
+                          {categoryTotals.accessory.qty} <span className="text-[8px] font-bold">قطعة</span>
+                        </div>
+                        <div className="text-[8px] text-stone-400">({categoryTotals.accessory.count} أنواع)</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Category Filter Tabs */}
+                  <div className="flex gap-1 overflow-x-auto scrollbar-none pb-2 mb-2">
+                    {[
+                      { id: 'all', label: 'الكل', icon: '📦' },
+                      { id: 'phone', label: 'هواتف', icon: '📱' },
+                      { id: 'battery', label: 'بطاريات', icon: '🔋' },
+                      { id: 'speaker', label: 'سبيكرات', icon: '🔊' },
+                      { id: 'bluetooth', label: 'سماعات بلوتوث', icon: '🎧' },
+                      { id: 'accessory', label: 'أكسسوارات أخرى', icon: '🔌' }
+                    ].map(tab => (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => setSelectedStockCategory(tab.id)}
+                        className={`px-3 py-1.5 rounded-xl text-[11px] font-bold flex items-center gap-1.5 whitespace-nowrap cursor-pointer transition-all ${
+                          selectedStockCategory === tab.id
+                            ? 'bg-stone-900 text-white'
+                            : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
+                        }`}
+                      >
+                        <span>{tab.icon}</span>
+                        <span>{tab.label}</span>
+                      </button>
+                    ))}
+                  </div>
+
                   <div className="relative mb-3">
                     <input 
                       type="text" 
@@ -2051,15 +2296,29 @@ export default function App() {
                       filteredItems.map((i, idx) => (
                         <div key={idx} className="p-3 bg-stone-50 hover:bg-stone-100/50 border border-stone-100 rounded-xl transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                           <div className="space-y-0.5">
-                            <div className="flex items-center gap-1.5">
+                            <div className="flex items-center gap-1.5 flex-wrap">
                               <h4 className="font-bold text-stone-800 text-xs">{i.name}</h4>
                               <button 
                                 onClick={() => handleEditItemName(i.id)} 
-                                className="p-1 text-stone-400 hover:text-stone-700 transition-colors cursor-pointer"
+                                className="p-1 text-stone-400 hover:text-stone-700 transition-colors cursor-pointer mr-0.5"
                                 title="تعديل اسم السلعة"
                               >
                                 <Pencil size={11} />
                               </button>
+                              {(() => {
+                                const cat = i.category || 'accessory';
+                                const catInfo = CATEGORY_MAP[cat] || CATEGORY_MAP.accessory;
+                                return (
+                                  <span 
+                                    onClick={() => handleEditItemCategory(i.id)}
+                                    className="text-[10px] px-2 py-0.5 rounded-md font-bold flex items-center gap-1 border border-stone-200 bg-white cursor-pointer hover:bg-stone-100 text-stone-600 transition-colors"
+                                    title="تغيير الفئة"
+                                  >
+                                    <span>{catInfo.icon}</span>
+                                    <span>{catInfo.label}</span>
+                                  </span>
+                                );
+                              })()}
                             </div>
                             <div className="text-[10px] text-stone-400 flex flex-wrap gap-x-2">
                               {costVisible && currentRole === 'manager' && (
@@ -2173,6 +2432,39 @@ export default function App() {
                             <Search className="absolute left-3 top-3 text-stone-400" size={12} />
                           </div>
 
+                           {/* Category filter tabs for selling */}
+                          <div className="space-y-1">
+                            <label className="block text-[10px] text-stone-500">تصفية حسب فئة السلعة</label>
+                            <div className="flex gap-1 overflow-x-auto scrollbar-none pb-1.5">
+                              {[
+                                { id: 'all', label: 'الكل', icon: '📦' },
+                                { id: 'phone', label: 'هواتف', icon: '📱' },
+                                { id: 'battery', label: 'بطاريات', icon: '🔋' },
+                                { id: 'speaker', label: 'سبيكرات', icon: '🔊' },
+                                { id: 'bluetooth', label: 'سماعات بلوتوث', icon: '🎧' },
+                                { id: 'accessory', label: 'أكسسوارات أخرى', icon: '🔌' }
+                              ].map(tab => (
+                                <button
+                                  key={tab.id}
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedSellCategory(tab.id);
+                                    // Reset selected item so we don't have mismatch or keep it as is
+                                    setSellItemId('');
+                                  }}
+                                  className={`px-2.5 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 whitespace-nowrap cursor-pointer transition-all ${
+                                    selectedSellCategory === tab.id
+                                      ? 'bg-stone-800 text-white'
+                                      : 'bg-stone-200/60 text-stone-600 hover:bg-stone-200'
+                                  }`}
+                                >
+                                  <span>{tab.icon}</span>
+                                  <span>{tab.label}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
                           <div>
                             <label className="block text-[10px] text-stone-500 mb-0.5">اختر السلعة المطلوبة</label>
                             <select 
@@ -2181,11 +2473,15 @@ export default function App() {
                               className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
                             >
                               <option value="">-- اختر السلعة --</option>
-                              {sellFilteredItems.map((i, idx) => (
-                                <option key={idx} value={i.id}>
-                                  {i.name} (المتوفر: {i.qty} قطع) — {i.sell.toFixed(3)} د.ت
-                                </option>
-                              ))}
+                              {sellFilteredItems.map((i, idx) => {
+                                const cat = i.category || 'accessory';
+                                const catInfo = CATEGORY_MAP[cat] || CATEGORY_MAP.accessory;
+                                return (
+                                  <option key={idx} value={i.id}>
+                                    {catInfo.icon} [{catInfo.label}] {i.name} (المتوفر: {i.qty} قطع) — {i.sell.toFixed(3)} د.ت
+                                  </option>
+                                );
+                              })}
                             </select>
                           </div>
 
@@ -2931,6 +3227,65 @@ export default function App() {
                   <button onClick={handleChangePin} className="bg-stone-800 hover:bg-stone-900 text-white font-bold py-2.5 px-4 rounded-xl text-xs cursor-pointer">
                     تعديل رمز المدير السري ✏️
                   </button>
+                </div>
+
+                {/* WhatsApp Notification Card */}
+                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
+                  <h3 className="font-extrabold text-stone-800 text-xs mb-1 flex items-center gap-1.5 text-emerald-800">
+                    <span>🟢 إشعارات مبيعات واتساب الفورية (WhatsApp Notifications)</span>
+                  </h3>
+                  <p className="text-stone-400 text-[11px] mb-3">تلقي إشعار تفصيلي فوري على هاتفك مع كل عملية بيع أو مدخول جديد:</p>
+                  
+                  <form onSubmit={handleSaveWhatsAppConfig} className="space-y-3">
+                    <div className="flex items-center gap-3 bg-stone-50 p-2.5 rounded-xl border border-stone-100">
+                      <input 
+                        type="checkbox" 
+                        id="whatsapp-enabled"
+                        checked={whatsappConfig.enabled}
+                        onChange={e => setWhatsappConfig(prev => ({ ...prev, enabled: e.target.checked }))}
+                        className="w-4 h-4 text-emerald-600 focus:ring-emerald-500 border-stone-300 rounded cursor-pointer"
+                      />
+                      <label htmlFor="whatsapp-enabled" className="text-xs font-bold text-stone-700 cursor-pointer select-none">
+                        تفعيل الخدمة وإرسال الإشعارات تلقائياً عند كل عملية بيع
+                      </label>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-[10px] text-stone-500 mb-1">رقم هاتف الواتساب لتلقي الإشعار</label>
+                        <input 
+                          type="text" 
+                          placeholder="+21641444355"
+                          value={whatsappConfig.phone}
+                          onChange={e => setWhatsappConfig(prev => ({ ...prev, phone: e.target.value }))}
+                          className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] text-stone-500 mb-1">رمز API الخاص بـ CallMeBot</label>
+                        <input 
+                          type="text" 
+                          placeholder="أدخل الرمز السري للـ API..."
+                          value={whatsappConfig.apiKey}
+                          onChange={e => setWhatsappConfig(prev => ({ ...prev, apiKey: e.target.value }))}
+                          className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="bg-emerald-50 border border-emerald-150 rounded-xl p-3 text-emerald-900 text-[11px] leading-relaxed">
+                      <p className="font-bold text-emerald-950 mb-1">💡 كيف تحصل على رمز الـ API المجاني في 10 ثوانٍ؟</p>
+                      <ol className="list-decimal list-inside space-y-1 text-emerald-800">
+                        <li>احفظ رقم CallMeBot في جهات اتصال هاتفك: <strong className="font-mono text-emerald-950">+34 621 07 31 43</strong></li>
+                        <li>أرسل له هذه الرسالة الدقيقة عبر الواتساب: <code className="bg-emerald-100 px-1 py-0.5 rounded font-mono text-emerald-950">I allow callmebot to send me messages</code></li>
+                        <li>سيقوم البوت بإرسال رمز الـ API الخاص بك فوراً وبالمجان! انسخه والصقه في الخانة أعلاه ثم اضغط حفظ الإعدادات.</li>
+                      </ol>
+                    </div>
+
+                    <button type="submit" className="bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-2.5 px-4 rounded-xl text-xs cursor-pointer">
+                      حفظ إعدادات إشعارات واتساب 💾
+                    </button>
+                  </form>
                 </div>
 
                 {/* Merge Duplicate Items Utility */}
