@@ -7,7 +7,7 @@ import {
 } from 'lucide-react';
 import { 
   Item, Sale, OtherIncome, Debt, CardStockEntry, Expense, 
-  ForfaitPlan, ForfaitBalance, AuditLogEntry, AppTab, AppRole 
+  ForfaitPlan, ForfaitBalance, AuditLogEntry, AppTab, AppRole, SparePart 
 } from './types';
 import {
   ensureAuth, signInManager, resumeManagerSession, logoutManager,
@@ -115,6 +115,14 @@ export default function App() {
     phone: '+21641444355',
     apiKey: ''
   });
+
+  // Spare Parts States
+  const [spareParts, setSpareParts] = useState<SparePart[]>([]);
+  const [newSparePart, setNewSparePart] = useState({ name: '', supplierName: '', qty: '1', unitCost: '', notes: '' });
+  const [sparePartSearch, setSparePartSearch] = useState('');
+  const [sparePartSupplierFilter, setSparePartSupplierFilter] = useState('all');
+  const [sparePartStatusFilter, setSparePartStatusFilter] = useState<'all' | 'unpaid' | 'paid'>('all');
+  const [sparePartsLimit, setSparePartsLimit] = useState(20);
 
   // Income Line Form State
   const [incomeType, setIncomeType] = useState<'item' | 'recharge' | 'forfait' | 'photo' | 'service'>('item');
@@ -262,12 +270,14 @@ export default function App() {
         fetchJsonWithRetry('/forfaitBalance.json').catch(() => null),
         fetchJsonWithRetry('/auditLog.json').catch(() => null),
         fetchJsonWithRetry('/pin.json').catch(() => '1234'),
-        fetchJsonWithRetry('/whatsappConfig.json').catch(() => null)
+        fetchJsonWithRetry('/whatsappConfig.json').catch(() => null),
+        fetchJsonWithRetry('/spareParts.json').catch(() => null)
       ]);
 
       const [
         itemsRaw, salesRaw, otherIncomeRaw, debtsRaw, cardStockRaw,
-        cashRegisterRaw, expensesRaw, plansRaw, balanceRaw, auditRaw, pinRaw, whatsappConfigRaw
+        cashRegisterRaw, expensesRaw, plansRaw, balanceRaw, auditRaw, pinRaw, whatsappConfigRaw,
+        sparePartsRaw
       ] = results;
 
       setItems(parseRawWithKeys<Item>(itemsRaw));
@@ -277,6 +287,7 @@ export default function App() {
       setCardStock(parseRawWithKeys<CardStockEntry>(cardStockRaw));
       setCashRegister(typeof cashRegisterRaw === 'number' ? cashRegisterRaw : 0);
       setExpenses(parseRawWithKeys<Expense>(expensesRaw));
+      setSpareParts(parseRawWithKeys<SparePart>(sparePartsRaw));
       if (whatsappConfigRaw) {
         setWhatsappConfig({
           enabled: !!whatsappConfigRaw.enabled,
@@ -852,6 +863,84 @@ export default function App() {
       logAudit('delete', `حذف ملف دين بالكامل: ${debt.customerName}`);
       loadAllData();
     } catch (e) {}
+  };
+
+  // ---- Spare Parts Actions ----
+  const handleAddSparePart = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const { name, supplierName, qty, unitCost, notes } = newSparePart;
+    if (!name.trim()) return triggerToast('❌ الرجاء إدخال اسم القطعة (مثال: شاشة، بطارية...)');
+    if (!supplierName.trim()) return triggerToast('❌ الرجاء إدخال اسم المزوّد (الفورنيسور)');
+    const qtyVal = parseInt(qty, 10) || 1;
+    const costVal = parseFloat(unitCost) || 0;
+    if (qtyVal <= 0) return triggerToast('❌ الكمية يجب أن تكون أكبر من 0');
+    if (costVal < 0) return triggerToast('❌ سعر التكلفة غير صالح');
+
+    const sp: SparePart = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      name: name.trim(),
+      supplierName: supplierName.trim(),
+      qty: qtyVal,
+      unitCost: costVal,
+      totalCost: qtyVal * costVal,
+      status: 'unpaid',
+      date: new Date().toISOString(),
+      notes: notes.trim() || undefined
+    };
+
+    const ok = await putWithOutbox(`/spareParts/${sp.id}.json`, sp);
+    if (ok) {
+      triggerToast('✅ تم تسجيل قطعة الغيار بنجاح');
+      logAudit('edit', `إضافة قطعة غيار من المزوّد ${supplierName}: ${name} عدد ${qtyVal} بتكلفة ${sp.totalCost.toFixed(3)} د.ت`);
+      setNewSparePart({ name: '', supplierName: '', qty: '1', unitCost: '', notes: '' });
+      loadAllData();
+    } else {
+      triggerToast('❌ فشل تسجيل قطعة الغيار، الرجاء المحاولة مجدداً');
+    }
+  };
+
+  const handleToggleSparePartPayment = async (id: string) => {
+    const sp = spareParts.find(s => s.id === id);
+    if (!sp) return;
+
+    const newStatus = sp.status === 'paid' ? 'unpaid' : 'paid';
+    const updated = { ...sp, status: newStatus };
+    const ok = await putWithOutbox(`/spareParts/${sp.id}.json`, updated);
+    if (ok) {
+      triggerToast(newStatus === 'paid' ? '✅ تم تمييز القطعة كخالصة (خُلصت)' : '⏳ تم إرجاع القطعة كغير خالصة (لم تُدفع بعد)');
+      logAudit('edit', `تعديل حالة دفع قطعة الغيار "${sp.name}" من المزوّد ${sp.supplierName} إلى ${newStatus === 'paid' ? 'خالصة' : 'غير خالصة'}`);
+      loadAllData();
+    }
+  };
+
+  const handleDeleteSparePart = async (id: string) => {
+    const sp = spareParts.find(s => s.id === id);
+    if (!sp) return;
+    if (!await promptAndVerifyPin(`هل ترغب فعلاً بحذف قطعة الغيار "${sp.name}" من المزوّد ${sp.supplierName}؟`)) return;
+
+    try {
+      await fetch(dbUrl(`/spareParts/${id}.json`), { method: 'DELETE' });
+      triggerToast('✅ تم حذف قطعة الغيار من القائمة');
+      logAudit('delete', `حذف قطعة غيار من المزوّد ${sp.supplierName}: ${sp.name} بتكلفة ${sp.totalCost.toFixed(3)} د.ت`);
+      loadAllData();
+    } catch (e) {
+      triggerToast('❌ فشل الحذف، الرجاء المحاولة مجدداً');
+    }
+  };
+
+  const handleAdjustSparePartQty = async (id: string, delta: number) => {
+    const sp = spareParts.find(s => s.id === id);
+    if (!sp) return;
+    if (delta < 0 && sp.qty <= 1) return triggerToast('❌ لا يمكن للكمية أن تكون أقل من 1، يمكنك حذف السطر إن أردت');
+
+    const newVal = sp.qty + delta;
+    const updated = { ...sp, qty: newVal, totalCost: newVal * sp.unitCost };
+    const ok = await putWithOutbox(`/spareParts/${sp.id}.json`, updated);
+    if (ok) {
+      triggerToast('✅ تم تعديل الكمية');
+      logAudit('edit', `تعديل سريع لكمية قطعة الغيار "${sp.name}": ${sp.qty} ← ${newVal}`);
+      loadAllData();
+    }
   };
 
   // ---- 6. Unified Billing Cart Logic ----
@@ -1693,6 +1782,17 @@ export default function App() {
             </button>
             {currentRole === 'manager' && (
               <>
+                <button 
+                  onClick={() => setCurrentTab('spare_parts')}
+                  className={`flex-1 min-w-[130px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
+                    currentTab === 'spare_parts' 
+                      ? 'bg-red-700 text-white shadow-md shadow-red-700/15 scale-[1.03]' 
+                      : 'text-stone-600 hover:bg-stone-100/80 hover:text-stone-800'
+                  }`}
+                >
+                  <span>🔧</span>
+                  <span>قطع الغيار (الفورنيسور)</span>
+                </button>
                 <button 
                   onClick={() => setCurrentTab('history')}
                   className={`flex-1 min-w-[130px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
@@ -3416,6 +3516,237 @@ export default function App() {
                   <button onClick={handleDownloadBackup} className="bg-amber-600 hover:bg-amber-700 text-white font-bold py-2.5 px-4 rounded-xl text-xs cursor-pointer flex items-center gap-1.5">
                     تحميل نسخة احتياطية كاملة (.json) 💾
                   </button>
+                </div>
+
+              </div>
+            )}
+
+            {/* TAB: SPARE PARTS (Manager Only) */}
+            {currentTab === 'spare_parts' && currentRole === 'manager' && (
+              <div className="space-y-4 animate-fade-in">
+                
+                {/* Add Spare Part Card */}
+                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs text-right">
+                  <h3 className="font-extrabold text-stone-800 text-sm mb-3 text-red-800 flex items-center gap-1.5">
+                    <span>🔧 تسجيل قطع غيار مقتناة من المزوّد (الفورنيسور)</span>
+                  </h3>
+                  <p className="text-stone-400 text-[11px] mb-4">
+                    يمكنك هنا تسجيل الشاشات، البطاريات، أو أي قطع غيار اشتريتها لكي لا تنساها عند مقابلته كل مدة وسدادها إياه.
+                  </p>
+                  
+                  <form onSubmit={handleAddSparePart} className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-3.5">
+                    <div className="md:col-span-1">
+                      <label className="block text-[10px] text-stone-500 mb-1 font-bold">اسم القطعة (مثال: شاشة آيفون 11)</label>
+                      <input 
+                        type="text" 
+                        placeholder="شاشة iPhone 11"
+                        value={newSparePart.name}
+                        onChange={e => setNewSparePart(prev => ({ ...prev, name: e.target.value }))}
+                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-850 font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-stone-500 mb-1 font-bold">اسم الفورنيسور (المزوّد)</label>
+                      <input 
+                        type="text" 
+                        placeholder="مثال: أحمد للأكسسوارات"
+                        value={newSparePart.supplierName}
+                        onChange={e => setNewSparePart(prev => ({ ...prev, supplierName: e.target.value }))}
+                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-850 font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-stone-500 mb-1 font-bold">الكمية</label>
+                      <input 
+                        type="number" 
+                        min="1"
+                        value={newSparePart.qty}
+                        onChange={e => setNewSparePart(prev => ({ ...prev, qty: e.target.value }))}
+                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-stone-500 mb-1 font-bold">سعر تكلفة القطعة الواحدة (د.ت)</label>
+                      <input 
+                        type="number" 
+                        step="0.001"
+                        placeholder="0.000"
+                        value={newSparePart.unitCost}
+                        onChange={e => setNewSparePart(prev => ({ ...prev, unitCost: e.target.value }))}
+                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono font-bold"
+                      />
+                    </div>
+                    <div className="md:col-span-1 flex items-end">
+                      <button type="submit" className="w-full bg-red-700 hover:bg-red-800 text-white font-extrabold rounded-xl text-xs py-2.5 cursor-pointer flex items-center justify-center gap-1 transition-colors select-none">
+                        <Plus size={14} /> سجل قطعة الغيار 🔧
+                      </button>
+                    </div>
+                  </form>
+                </div>
+
+                {/* Search & Filters */}
+                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs text-right">
+                  <div className="flex flex-col md:flex-row items-center justify-between gap-3 mb-4">
+                    <h3 className="font-extrabold text-stone-800 text-xs self-start md:self-auto flex items-center gap-1.5">
+                      <span>📦 أرشيف ودفتر حساب قطع الغيار</span>
+                    </h3>
+                    
+                    <div className="flex flex-wrap gap-2 w-full md:w-auto">
+                      <select 
+                        value={sparePartStatusFilter} 
+                        onChange={e => setSparePartStatusFilter(e.target.value as any)}
+                        className="bg-stone-50 border border-stone-200 px-3 py-1.5 rounded-xl text-[11px] text-stone-700 font-bold"
+                      >
+                        <option value="all">كل قطع الغيار (الكل)</option>
+                        <option value="unpaid">⏳ غير خالصة (ديون للمزوّد)</option>
+                        <option value="paid">✅ خالصة (تم السداد)</option>
+                      </select>
+
+                      <select 
+                        value={sparePartSupplierFilter} 
+                        onChange={e => setSparePartSupplierFilter(e.target.value)}
+                        className="bg-stone-50 border border-stone-200 px-3 py-1.5 rounded-xl text-[11px] text-stone-700 font-bold"
+                      >
+                        <option value="all">كل المزوّدين (الفورنيسور)</option>
+                        {Array.from(new Set(spareParts.map(s => s.supplierName))).map((sup, idx) => (
+                          <option key={idx} value={sup}>{sup}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="relative mb-4">
+                    <input 
+                      type="text" 
+                      placeholder="🔍 ابحث باسم القطعة أو اسم الفورنيسور..."
+                      value={sparePartSearch}
+                      onChange={e => setSparePartSearch(e.target.value)}
+                      className="w-full bg-stone-50 border border-stone-200 pl-10 pr-3 py-2.5 rounded-xl text-xs text-stone-850"
+                    />
+                    <Search className="absolute left-3 top-3 text-stone-400" size={14} />
+                  </div>
+
+                  {/* Calculations summary card inside list */}
+                  {(() => {
+                    const filtered = spareParts.filter(s => {
+                      const matchesSearch = !sparePartSearch || normalizeArabic(s.name + ' ' + s.supplierName).includes(normalizeArabic(sparePartSearch));
+                      const matchesSupplier = sparePartSupplierFilter === 'all' || s.supplierName === sparePartSupplierFilter;
+                      const matchesStatus = sparePartStatusFilter === 'all' || s.status === sparePartStatusFilter;
+                      return matchesSearch && matchesSupplier && matchesStatus;
+                    });
+
+                    const totalSum = filtered.reduce((acc, curr) => acc + curr.totalCost, 0);
+                    const unpaidSum = filtered.filter(f => f.status === 'unpaid').reduce((acc, curr) => acc + curr.totalCost, 0);
+                    const paidSum = filtered.filter(f => f.status === 'paid').reduce((acc, curr) => acc + curr.totalCost, 0);
+
+                    return (
+                      <>
+                        <div className="grid grid-cols-3 gap-3 mb-4 bg-stone-50 p-3 rounded-2xl border border-stone-100">
+                          <div className="text-center p-2">
+                            <span className="text-[10px] text-stone-400 block font-bold">المجموع الكلي للقطع</span>
+                            <span className="font-mono text-xs font-black text-stone-800">{totalSum.toFixed(3)} د.ت</span>
+                          </div>
+                          <div className="text-center p-2 border-r border-stone-200/60">
+                            <span className="text-[10px] text-stone-400 block font-bold text-red-700">⏳ غير خالص (مطلوب)</span>
+                            <span className="font-mono text-xs font-black text-red-700">{unpaidSum.toFixed(3)} د.ت</span>
+                          </div>
+                          <div className="text-center p-2 border-r border-stone-200/60">
+                            <span className="text-[10px] text-stone-400 block font-bold text-emerald-700">✅ خالص ومدفوع</span>
+                            <span className="font-mono text-xs font-black text-emerald-700">{paidSum.toFixed(3)} د.ت</span>
+                          </div>
+                        </div>
+
+                        {filtered.length === 0 ? (
+                          <div className="text-center py-10 text-stone-400 text-xs">
+                            لا توجد أي قطع غيار مسجلة تطابق خيارات البحث الحالية.
+                          </div>
+                        ) : (
+                          <div className="space-y-2 max-h-[500px] overflow-y-auto pr-1">
+                            {filtered.slice(0, sparePartsLimit).map((sp) => (
+                              <div key={sp.id} className="flex flex-col sm:flex-row justify-between items-start sm:items-center p-3 bg-stone-50 hover:bg-stone-100/50 rounded-xl border border-stone-100 transition-colors gap-2 text-right">
+                                <div className="space-y-1">
+                                  <div className="flex items-center flex-wrap gap-2">
+                                    <span className="font-bold text-stone-900 text-sm">{sp.name}</span>
+                                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-50 text-red-700 border border-red-100 font-bold">
+                                      👤 المزوّد: {sp.supplierName}
+                                    </span>
+                                  </div>
+                                  <div className="text-[10px] text-stone-400 flex flex-wrap gap-x-3 gap-y-1">
+                                    <span>📅 التاريخ: {new Date(sp.date).toLocaleString('fr-TN')}</span>
+                                    {sp.notes && <span className="text-amber-700 font-medium">📝 ملاحظات: {sp.notes}</span>}
+                                  </div>
+                                </div>
+                                
+                                <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 pt-2 sm:pt-0 border-stone-200/60">
+                                  <div className="flex items-center gap-1 ml-2">
+                                    <button 
+                                      onClick={() => handleAdjustSparePartQty(sp.id, -1)}
+                                      className="w-6 h-6 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                                      title="إنقاص الكمية بـ 1"
+                                    >
+                                      -
+                                    </button>
+                                    <span className="text-xs font-bold text-stone-800 font-mono px-1">{sp.qty}</span>
+                                    <button 
+                                      onClick={() => handleAdjustSparePartQty(sp.id, 1)}
+                                      className="w-6 h-6 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                                      title="زيادة الكمية بـ 1"
+                                    >
+                                      +
+                                    </button>
+                                  </div>
+
+                                  <div className="text-left font-mono text-xs font-bold text-stone-800 min-w-[75px]">
+                                    <div>{sp.totalCost.toFixed(3)} د.ت</div>
+                                    <div className="text-[9px] text-stone-400 font-medium">({sp.unitCost.toFixed(3)} للقطعة)</div>
+                                  </div>
+
+                                  <div className="flex items-center gap-1">
+                                    <button 
+                                      onClick={() => handleToggleSparePartPayment(sp.id)}
+                                      className={`px-3 py-1 rounded-xl text-[10px] font-black cursor-pointer transition-colors shadow-xs ${
+                                        sp.status === 'paid' 
+                                          ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200' 
+                                          : 'bg-rose-100 text-rose-800 hover:bg-rose-200'
+                                      }`}
+                                      title="تبديل حالة السداد"
+                                    >
+                                      {sp.status === 'paid' ? '✅ خالص' : '⏳ غير خالص'}
+                                    </button>
+
+                                    <button 
+                                      onClick={() => handleDeleteSparePart(sp.id)} 
+                                      className="text-stone-400 hover:text-red-700 cursor-pointer p-1.5 transition-colors rounded-xl hover:bg-red-50"
+                                      title="حذف القطعة"
+                                    >
+                                      <Trash2 size={14} />
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {filtered.length > sparePartsLimit && (
+                          <div className="mt-4 pt-3 border-t border-stone-100 flex gap-2 justify-center">
+                            <button 
+                              onClick={() => setSparePartsLimit(prev => prev + 50)}
+                              className="bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold px-4 py-1.5 rounded-xl text-xs cursor-pointer"
+                            >
+                              عرض المزيد من قطع الغيار (+50) 🔄
+                            </button>
+                            <button 
+                              onClick={() => setSparePartsLimit(filtered.length)}
+                              className="bg-stone-800 text-white font-bold px-4 py-1.5 rounded-xl text-xs cursor-pointer"
+                            >
+                              عرض الكل ({filtered.length})
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
                 </div>
 
               </div>

@@ -92,5 +92,17 @@ export interface ForfaitBalance {
   [key: string]: number;
 }
 
-export type AppTab = 'dashboard' | 'stock' | 'income' | 'debts' | 'history' | 'settings';
+export interface SparePart {
+  id: string;
+  name: string;          // e.g. شاشة آيفون 11، Plaque charge، بطارية A51
+  supplierName: string;  // اسم الفورنيسور (المزوّد)
+  qty: number;           // الكمية
+  unitCost: number;      // تكلفة القطعة الواحدة
+  totalCost: number;     // التكلفة الإجمالية (qty * unitCost)
+  status: 'unpaid' | 'paid'; // حالة السداد (خالصة / غير خالصة)
+  date: string;          // تاريخ الشراء
+  notes?: string;        // ملاحظات إضافية
+}
+
+export type AppTab = 'dashboard' | 'stock' | 'income' | 'debts' | 'history' | 'settings' | 'spare_parts';
 export type AppRole = 'manager' | 'seller';
