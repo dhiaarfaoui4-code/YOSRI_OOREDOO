@@ -168,6 +168,7 @@ export default function App() {
     customerPhone?: string;
   }
   const [cart, setCart] = useState<CartLine[]>([]);
+  const [isFinalizing, setIsFinalizing] = useState(false);
   const [chartDayOffset, setChartDayOffset] = useState<number>(0);
 
   // Loaders
@@ -628,6 +629,23 @@ export default function App() {
     }
   };
 
+  const handleAdjustCardQty = async (id: string, delta: number) => {
+    const card = cardStock.find(c => c.id === id);
+    if (!card) return;
+    if (delta < 0 && card.qty <= 0) return triggerToast('❌ المخزن فارغ بالفعل');
+
+    const newVal = card.qty + delta;
+    const updated = { ...card, qty: newVal };
+    const ok = await putWithOutbox(`/cardStock/${card.id}.json`, updated);
+    if (ok) {
+      triggerToast('✅ تم تحديث كمية البطاقات');
+      logAudit('edit', `تعديل سريع لستوك بطاقات ${card.operator} فئة ${card.value}: ${card.qty} ← ${newVal} (${delta > 0 ? '+' : ''}${delta})`);
+      loadAllData();
+    } else {
+      triggerToast('❌ فشل تعديل الكمية، الرجاء المحاولة مجدداً');
+    }
+  };
+
   const handleDeleteCardStock = async (id: string) => {
     const card = cardStock.find(c => c.id === id);
     if (!card) return;
@@ -971,144 +989,153 @@ export default function App() {
   const handleFinalizeInvoice = async (showInvoice: boolean) => {
     if (cart.length === 0) return triggerToast('❌ الفاتورة فارغة لتوة');
     if (invoiceIsDebt && !invoiceCustomerName) return triggerToast('❌ يرجى كتابة اسم الحريف لتسجيل الدين');
+    if (isFinalizing) return;
 
-    // Optimistic stock decrement checking first
-    const itemsToDecrement = cart.filter(c => c.type === 'item' && c.itemId);
-    const successList: { itemId: string; amt: number }[] = [];
-    let stockError = '';
+    setIsFinalizing(true);
+    try {
+      // Optimistic stock decrement checking first
+      const itemsToDecrement = cart.filter(c => c.type === 'item' && c.itemId);
+      const successList: { itemId: string; amt: number }[] = [];
+      let stockError = '';
 
-    for (const line of itemsToDecrement) {
-      const res = await safeDecrementItemQty(line.itemId!, line.qty);
-      if (res.success) {
-        successList.push({ itemId: line.itemId!, amt: line.qty });
-      } else {
-        stockError = res.reason === 'insufficient' 
-          ? `❌ السلعة "${line.label}" لم تعد كافية بالمخزن! المتبقي: ${res.available}`
-          : `❌ فشل تحديث المخزن للسلعة "${line.label}" بسبب تداخل بالشبكة`;
-        break;
+      for (const line of itemsToDecrement) {
+        const res = await safeDecrementItemQty(line.itemId!, line.qty);
+        if (res.success) {
+          successList.push({ itemId: line.itemId!, amt: line.qty });
+        } else {
+          stockError = res.reason === 'insufficient' 
+            ? `❌ السلعة "${line.label}" لم تعد كافية بالمخزن! المتبقي: ${res.available}`
+            : `❌ فشل تحديث المخزن للسلعة "${line.label}" بسبب تداخل بالشبكة`;
+          break;
+        }
       }
-    }
 
-    // Rollback if any error occurred
-    if (stockError) {
-      for (const item of successList) {
-        await safeIncrementItemQty(item.itemId, item.amt);
+      // Rollback if any error occurred
+      if (stockError) {
+        for (const item of successList) {
+          await safeIncrementItemQty(item.itemId, item.amt);
+        }
+        return triggerToast(stockError);
       }
-      return triggerToast(stockError);
-    }
 
-    // Process other balances (deplete card stock & forfait balance)
-    for (const line of cart) {
-      if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
-        const entry = cardStock.find(c => c.operator === line.cardOperator && c.value === line.cardValue);
-        if (entry) {
-          await putWithOutbox(`/cardStock/${entry.id}.json`, {
-            ...entry,
-            qty: Math.max(0, entry.qty - line.qty)
+      // Process other balances (deplete card stock & forfait balance)
+      for (const line of cart) {
+        if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
+          const entry = cardStock.find(c => c.operator === line.cardOperator && c.value === line.cardValue);
+          if (entry) {
+            await putWithOutbox(`/cardStock/${entry.id}.json`, {
+              ...entry,
+              qty: Math.max(0, entry.qty - line.qty)
+            });
+          }
+        }
+        if (line.type === 'forfait' && line.cardOperator) {
+          const curBal = forfaitBalance[line.cardOperator] || 0;
+          await putWithOutbox('/forfaitBalance.json', {
+            ...forfaitBalance,
+            [line.cardOperator]: Math.max(0, curBal - line.unitPrice)
           });
         }
       }
-      if (line.type === 'forfait' && line.cardOperator) {
-        const curBal = forfaitBalance[line.cardOperator] || 0;
-        await putWithOutbox('/forfaitBalance.json', {
-          ...forfaitBalance,
-          [line.cardOperator]: Math.max(0, curBal - line.unitPrice)
-        });
-      }
-    }
 
-    const date = new Date().toISOString();
-    const grandTotal = cart.reduce((s, c) => s + c.total, 0);
+      const date = new Date().toISOString();
+      const grandTotal = cart.reduce((s, c) => s + c.total, 0);
 
-    if (invoiceIsDebt) {
-      const debtLines = cart.map(c => ({
-        type: c.type,
-        itemId: c.itemId || null,
-        itemName: c.type === 'item' ? c.label : null,
-        qty: c.qty,
-        cardOperator: c.cardOperator || null,
-        cardValue: c.cardValue || null,
-        total: c.total
-      }));
-
-      const newDebt: Debt = {
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        customerName: invoiceCustomerName,
-        customerPhone: invoiceCustomerPhone || undefined,
-        note: cart.map(c => c.label).join(' + '),
-        lines: debtLines,
-        amount: grandTotal,
-        paid: 0,
-        date,
-        status: 'open'
-      };
-
-      await putWithOutbox(`/debts/${newDebt.id}.json`, newDebt);
-      logAudit('sale', `فاتورة مبيعات بالدين للحريف ${invoiceCustomerName}: ${grandTotal} د.ت`);
-      triggerToast(`🧾 تم حفظ الفاتورة بالكامل بالدين على ${invoiceCustomerName}`);
-    } else {
-      // Create Sale records for items or OtherIncome records for other services
-      for (const line of cart) {
-        const rId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6) + Math.floor(Math.random() * 100);
-        if (line.type === 'item') {
-          const sale: Sale = {
-            id: rId,
-            itemId: line.itemId || null,
-            itemName: line.label,
-            qty: line.qty,
-            unitPrice: line.unitPrice,
-            unitBuy: line.unitBuy || 0,
-            total: line.total,
-            date
-          };
-          await putWithOutbox(`/sales/${sale.id}.json`, sale);
-        } else {
-          const income: OtherIncome = {
-            id: rId,
-            category: line.type,
-            label: line.label,
-            amount: line.total,
-            commission: line.commission || 0,
-            date,
-            cardOperator: line.cardOperator || null,
-            cardValue: line.cardValue || null,
-            qty: line.qty || null
-          };
-          await putWithOutbox(`/otherIncome/${income.id}.json`, income);
-        }
-      }
-      logAudit('sale', `فاتورة بيع نقدية جديدة: ${grandTotal} د.ت`);
-      triggerToast('✅ تم تسجيل المبيعات النقدية وتحديث الخزينة');
-    }
-
-    if (showInvoice) {
-      // Set preview invoice modal
-      setLastInvoice({
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5).toUpperCase(),
-        lines: cart.map(c => ({
-          name: c.label,
+      if (invoiceIsDebt) {
+        const debtLines = cart.map(c => ({
+          type: c.type,
+          itemId: c.itemId || null,
+          itemName: c.type === 'item' ? c.label : null,
           qty: c.qty,
-          unitPrice: c.unitPrice,
+          cardOperator: c.cardOperator || null,
+          cardValue: c.cardValue || null,
           total: c.total
-        })),
-        grandTotal,
-        date,
-        isDebt: invoiceIsDebt,
-        customerName: invoiceCustomerName || undefined
-      });
-    } else {
-      setLastInvoice(null);
+        }));
+
+        const newDebt: Debt = {
+          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+          customerName: invoiceCustomerName,
+          customerPhone: invoiceCustomerPhone || undefined,
+          note: cart.map(c => c.label).join(' + '),
+          lines: debtLines,
+          amount: grandTotal,
+          paid: 0,
+          date,
+          status: 'open'
+        };
+
+        await putWithOutbox(`/debts/${newDebt.id}.json`, newDebt);
+        logAudit('sale', `فاتورة مبيعات بالدين للحريف ${invoiceCustomerName}: ${grandTotal} د.ت`);
+        triggerToast(`🧾 تم حفظ الفاتورة بالكامل بالدين على ${invoiceCustomerName}`);
+      } else {
+        // Create Sale records for items or OtherIncome records for other services
+        for (const line of cart) {
+          const rId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6) + Math.floor(Math.random() * 100);
+          if (line.type === 'item') {
+            const sale: Sale = {
+              id: rId,
+              itemId: line.itemId || null,
+              itemName: line.label,
+              qty: line.qty,
+              unitPrice: line.unitPrice,
+              unitBuy: line.unitBuy || 0,
+              total: line.total,
+              date
+            };
+            await putWithOutbox(`/sales/${sale.id}.json`, sale);
+          } else {
+            const income: OtherIncome = {
+              id: rId,
+              category: line.type,
+              label: line.label,
+              amount: line.total,
+              commission: line.commission || 0,
+              date,
+              cardOperator: line.cardOperator || null,
+              cardValue: line.cardValue || null,
+              qty: line.qty || null
+            };
+            await putWithOutbox(`/otherIncome/${income.id}.json`, income);
+          }
+        }
+        logAudit('sale', `فاتورة بيع نقدية جديدة: ${grandTotal} د.ت`);
+        triggerToast('✅ تم تسجيل المبيعات النقدية وتحديث الخزينة');
+      }
+
+      if (showInvoice) {
+        // Set preview invoice modal
+        setLastInvoice({
+          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5).toUpperCase(),
+          lines: cart.map(c => ({
+            name: c.label,
+            qty: c.qty,
+            unitPrice: c.unitPrice,
+            total: c.total
+          })),
+          grandTotal,
+          date,
+          isDebt: invoiceIsDebt,
+          customerName: invoiceCustomerName || undefined
+        });
+      } else {
+        setLastInvoice(null);
+      }
+
+      // Trigger WhatsApp notification for the sale
+      triggerWhatsAppNotification(cart, grandTotal, invoiceIsDebt, invoiceCustomerName);
+
+      // Reset Form
+      setCart([]);
+      setInvoiceCustomerName('');
+      setInvoiceCustomerPhone('');
+      setInvoiceIsDebt(false);
+      loadAllData();
+    } catch (err) {
+      console.error('Error in handleFinalizeInvoice:', err);
+      triggerToast('❌ حدث خطأ أثناء معالجة الفاتورة');
+    } finally {
+      setIsFinalizing(false);
     }
-
-    // Trigger WhatsApp notification for the sale
-    triggerWhatsAppNotification(cart, grandTotal, invoiceIsDebt, invoiceCustomerName);
-
-    // Reset Form
-    setCart([]);
-    setInvoiceCustomerName('');
-    setInvoiceCustomerPhone('');
-    setInvoiceIsDebt(false);
-    loadAllData();
   };
 
   const handleDeleteHistorySale = async (id: string, isSaleRecord: boolean) => {
@@ -2026,14 +2053,31 @@ export default function App() {
                             <span className="font-bold text-stone-800">📶 {c.operator} — {c.value} د.ت</span>
                             <div className="flex items-center gap-2">
                               {currentRole === 'manager' ? (
-                                <button 
-                                  onClick={() => handleEditCardQty(c.id)}
-                                  className={`px-3 py-1 rounded-full font-bold font-mono text-[11px] ${
-                                    c.qty <= 3 ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'
-                                  }`}
-                                >
-                                  {c.qty} قطع
-                                </button>
+                                <div className="flex items-center gap-1">
+                                  <button 
+                                    onClick={() => handleAdjustCardQty(c.id, -1)}
+                                    className="w-6 h-6 rounded-full bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                                    title="إنقاص 1"
+                                  >
+                                    -
+                                  </button>
+                                  <button 
+                                    onClick={() => handleEditCardQty(c.id)}
+                                    className={`px-2.5 py-1 rounded-lg font-bold font-mono text-[11px] cursor-pointer ${
+                                      c.qty <= 3 ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'
+                                    }`}
+                                    title="تعديل الكمية الدقيقة"
+                                  >
+                                    {c.qty} قطع
+                                  </button>
+                                  <button 
+                                    onClick={() => handleAdjustCardQty(c.id, 1)}
+                                    className="w-6 h-6 rounded-full bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                                    title="زيادة 1"
+                                  >
+                                    +
+                                  </button>
+                                </div>
                               ) : (
                                 <span 
                                   className={`px-3 py-1 rounded-full font-bold font-mono text-[11px] ${
@@ -2794,15 +2838,17 @@ export default function App() {
                       <div className="grid grid-cols-2 gap-2">
                         <button 
                           onClick={() => handleFinalizeInvoice(false)}
-                          className="bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold py-2.5 px-2 rounded-xl text-[11px] cursor-pointer shadow-md shadow-emerald-600/10 transition-colors flex items-center justify-center gap-1"
+                          disabled={isFinalizing}
+                          className={`bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold py-2.5 px-2 rounded-xl text-[11px] cursor-pointer shadow-md shadow-emerald-600/10 transition-colors flex items-center justify-center gap-1 ${isFinalizing ? 'opacity-50 cursor-not-allowed' : ''}`}
                         >
-                          ⚡ بيع سريع
+                          {isFinalizing ? 'جاري التسجيل...' : '⚡ بيع سريع'}
                         </button>
                         <button 
                           onClick={() => handleFinalizeInvoice(true)}
-                          className="bg-stone-800 hover:bg-stone-950 text-white font-extrabold py-2.5 px-2 rounded-xl text-[11px] cursor-pointer transition-colors flex items-center justify-center gap-1"
+                          disabled={isFinalizing}
+                          className={`bg-stone-800 hover:bg-stone-950 text-white font-extrabold py-2.5 px-2 rounded-xl text-[11px] cursor-pointer transition-colors flex items-center justify-center gap-1 ${isFinalizing ? 'opacity-50 cursor-not-allowed' : ''}`}
                         >
-                          🖨️ تسجيل وطباعة
+                          {isFinalizing ? 'جاري التسجيل...' : '🖨️ تسجيل وطباعة'}
                         </button>
                       </div>
                     </div>
@@ -2854,6 +2900,72 @@ export default function App() {
                       ));
                     })()}
                   </div>
+                </div>
+
+                {/* Daily Expenses Section */}
+                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
+                  <h3 className="font-extrabold text-stone-800 text-sm mb-3 text-red-800">💸 تسجيل المصاريف اليومية</h3>
+                  <form onSubmit={handleAddExpense} className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <input 
+                      type="text" 
+                      placeholder="وصف المصروف"
+                      value={expenseInput.desc}
+                      onChange={e => setExpenseInput(prev => ({ ...prev, desc: e.target.value }))}
+                      className="bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
+                    />
+                    <input 
+                      type="number" 
+                      step="0.001"
+                      placeholder="المبلغ د.ت"
+                      value={expenseInput.amount}
+                      onChange={e => setExpenseInput(prev => ({ ...prev, amount: e.target.value }))}
+                      className="bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
+                    />
+                    <button type="submit" className="bg-red-700 hover:bg-red-800 text-white font-bold rounded-xl text-xs py-2 cursor-pointer flex items-center justify-center gap-1">
+                      <Plus size={14} /> سجل المصروف
+                    </button>
+                  </form>
+
+                  {/* List of expenses */}
+                  <div className="mt-4 space-y-1.5 max-h-60 overflow-y-auto pr-1">
+                    {expenses.length === 0 ? (
+                      <p className="text-center text-stone-400 py-4 text-xs">لا توجد مصاريف مسجلة</p>
+                    ) : (
+                      expenses.slice(0, expensesLimit).map((e, idx) => (
+                        <div key={idx} className="flex justify-between items-center text-xs p-2.5 bg-stone-50 rounded-xl border border-stone-100">
+                          <div>
+                            <span className="font-bold text-stone-800">{e.desc}</span>
+                            <span className="text-[10px] text-stone-400 mr-2">{new Date(e.date).toLocaleDateString('fr-TN')}</span>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="font-mono text-red-700 font-bold">{e.amount.toFixed(3)} د.ت</span>
+                            <button onClick={() => handleDeleteExpense(e.id)} className="text-stone-400 hover:text-red-700 cursor-pointer">
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  {expenses.length > expensesLimit && (
+                    <div className="mt-3 flex gap-2 justify-center">
+                      <button 
+                        type="button"
+                        onClick={() => setExpensesLimit(prev => prev + 50)}
+                        className="bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold px-3 py-1.5 rounded-lg text-[10px] cursor-pointer"
+                      >
+                        عرض المزيد من المصاريف (+50) 🔄
+                      </button>
+                      <button 
+                        type="button"
+                        onClick={() => setExpensesLimit(expenses.length)}
+                        className="bg-stone-800 text-white font-bold px-3 py-1.5 rounded-lg text-[10px] cursor-pointer"
+                      >
+                        عرض جميع المصاريف ({expenses.length})
+                      </button>
+                    </div>
+                  )}
                 </div>
 
               </div>
