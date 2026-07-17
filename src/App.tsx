@@ -848,18 +848,58 @@ export default function App() {
     if (!debt) return;
     if (!await promptAndVerifyPin(`هل ترغب بحذف ملف دين الحريف "${debt.customerName}" نهائياً؟`)) return;
 
-    // Rollback items to inventory
+    // Rollback items, recharge cards, and forfait balances to inventory/balances
     if (debt.lines) {
+      const itemIncrements: Record<string, number> = {};
+      const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
+      const forfaitIncrements: Record<string, number> = {};
+
       for (const line of debt.lines) {
         if (line.type === 'item' && line.itemId) {
-          await safeIncrementItemQty(line.itemId, line.qty);
+          itemIncrements[line.itemId] = (itemIncrements[line.itemId] || 0) + line.qty;
         }
+        if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
+          const card = cardStock.find(c => c.operator === line.cardOperator && c.value === line.cardValue);
+          if (card) {
+            if (!cardIncrements[card.id]) {
+              cardIncrements[card.id] = { entry: card, totalQty: 0 };
+            }
+            cardIncrements[card.id].totalQty += line.qty;
+          }
+        }
+        if (line.type === 'forfait' && line.cardOperator) {
+          forfaitIncrements[line.cardOperator] = (forfaitIncrements[line.cardOperator] || 0) + (line.total || 0);
+        }
+      }
+
+      // 1. Rollback items
+      for (const itemId of Object.keys(itemIncrements)) {
+        await safeIncrementItemQty(itemId, itemIncrements[itemId]);
+      }
+
+      // 2. Rollback recharge cards
+      for (const cardId of Object.keys(cardIncrements)) {
+        const { entry, totalQty } = cardIncrements[cardId];
+        await putWithOutbox(`/cardStock/${cardId}.json`, {
+          ...entry,
+          qty: entry.qty + totalQty
+        });
+      }
+
+      // 3. Rollback forfait balance
+      if (Object.keys(forfaitIncrements).length > 0) {
+        const updatedBalance = { ...forfaitBalance };
+        for (const op of Object.keys(forfaitIncrements)) {
+          const curBal = updatedBalance[op] || 0;
+          updatedBalance[op] = curBal + forfaitIncrements[op];
+        }
+        await putWithOutbox('/forfaitBalance.json', updatedBalance);
       }
     }
 
     try {
       await fetch(dbUrl(`/debts/${id}.json`), { method: 'DELETE' });
-      triggerToast('✅ تم حذف الدين ورجعت السلع للمستودع');
+      triggerToast('✅ تم حذف الدين ورجعت كافة السلع والأرصدة للمستودع');
       logAudit('delete', `حذف ملف دين بالكامل: ${debt.customerName}`);
       loadAllData();
     } catch (e) {}
@@ -1082,19 +1122,29 @@ export default function App() {
 
     setIsFinalizing(true);
     try {
-      // Optimistic stock decrement checking first
-      const itemsToDecrement = cart.filter(c => c.type === 'item' && c.itemId);
+      // Optimistic stock decrement checking first (grouped by itemId to prevent duplicate hits and race conditions)
+      const itemQtyMap: Record<string, { itemId: string; qty: number; label: string }> = {};
+      for (const line of cart) {
+        if (line.type === 'item' && line.itemId) {
+          if (!itemQtyMap[line.itemId]) {
+            itemQtyMap[line.itemId] = { itemId: line.itemId, qty: 0, label: line.label };
+          }
+          itemQtyMap[line.itemId].qty += line.qty;
+        }
+      }
+
+      const uniqueItemsToDecrement = Object.values(itemQtyMap);
       const successList: { itemId: string; amt: number }[] = [];
       let stockError = '';
 
-      for (const line of itemsToDecrement) {
-        const res = await safeDecrementItemQty(line.itemId!, line.qty);
+      for (const group of uniqueItemsToDecrement) {
+        const res = await safeDecrementItemQty(group.itemId, group.qty);
         if (res.success) {
-          successList.push({ itemId: line.itemId!, amt: line.qty });
+          successList.push({ itemId: group.itemId, amt: group.qty });
         } else {
           stockError = res.reason === 'insufficient' 
-            ? `❌ السلعة "${line.label}" لم تعد كافية بالمخزن! المتبقي: ${res.available}`
-            : `❌ فشل تحديث المخزن للسلعة "${line.label}" بسبب تداخل بالشبكة`;
+            ? `❌ السلعة "${group.label}" لم تعد كافية بالمخزن! المتبقي: ${res.available}`
+            : `❌ فشل تحديث المخزن للسلعة "${group.label}" بسبب تداخل بالشبكة`;
           break;
         }
       }
@@ -1104,27 +1154,53 @@ export default function App() {
         for (const item of successList) {
           await safeIncrementItemQty(item.itemId, item.amt);
         }
+        setIsFinalizing(false);
         return triggerToast(stockError);
       }
 
-      // Process other balances (deplete card stock & forfait balance)
+      // Group card stock depletions by cardStock entry ID
+      const cardStockDepletions: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
       for (const line of cart) {
         if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
           const entry = cardStock.find(c => c.operator === line.cardOperator && c.value === line.cardValue);
           if (entry) {
-            await putWithOutbox(`/cardStock/${entry.id}.json`, {
-              ...entry,
-              qty: Math.max(0, entry.qty - line.qty)
-            });
+            if (!cardStockDepletions[entry.id]) {
+              cardStockDepletions[entry.id] = { entry, totalQty: 0 };
+            }
+            cardStockDepletions[entry.id].totalQty += line.qty;
           }
         }
+      }
+
+      // Apply card stock depletions
+      for (const entryId of Object.keys(cardStockDepletions)) {
+        const { entry, totalQty } = cardStockDepletions[entryId];
+        await putWithOutbox(`/cardStock/${entry.id}.json`, {
+          ...entry,
+          qty: Math.max(0, entry.qty - totalQty)
+        });
+      }
+
+      // Group forfait depletions by operator
+      const forfaitDepletions: Record<string, number> = {};
+      for (const line of cart) {
         if (line.type === 'forfait' && line.cardOperator) {
-          const curBal = forfaitBalance[line.cardOperator] || 0;
-          await putWithOutbox('/forfaitBalance.json', {
-            ...forfaitBalance,
-            [line.cardOperator]: Math.max(0, curBal - line.unitPrice)
-          });
+          const op = line.cardOperator;
+          if (!forfaitDepletions[op]) {
+            forfaitDepletions[op] = 0;
+          }
+          forfaitDepletions[op] += line.unitPrice * (line.qty || 1);
         }
+      }
+
+      // Apply forfait depletions to the forfaitBalance object and write once
+      if (Object.keys(forfaitDepletions).length > 0) {
+        const updatedBalance = { ...forfaitBalance };
+        for (const op of Object.keys(forfaitDepletions)) {
+          const curBal = updatedBalance[op] || 0;
+          updatedBalance[op] = Math.max(0, curBal - forfaitDepletions[op]);
+        }
+        await putWithOutbox('/forfaitBalance.json', updatedBalance);
       }
 
       const date = new Date().toISOString();
