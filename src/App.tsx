@@ -115,6 +115,11 @@ export default function App() {
     phone: '+21641444355',
     apiKey: ''
   });
+  const [telegramConfig, setTelegramConfig] = useState<{ enabled: boolean; botToken: string; chatId: string }>({
+    enabled: false,
+    botToken: '',
+    chatId: ''
+  });
 
   // Spare Parts States
   const [spareParts, setSpareParts] = useState<SparePart[]>([]);
@@ -271,13 +276,14 @@ export default function App() {
         fetchJsonWithRetry('/auditLog.json').catch(() => null),
         fetchJsonWithRetry('/pin.json').catch(() => '1234'),
         fetchJsonWithRetry('/whatsappConfig.json').catch(() => null),
-        fetchJsonWithRetry('/spareParts.json').catch(() => null)
+        fetchJsonWithRetry('/spareParts.json').catch(() => null),
+        fetchJsonWithRetry('/telegramConfig.json').catch(() => null)
       ]);
 
       const [
         itemsRaw, salesRaw, otherIncomeRaw, debtsRaw, cardStockRaw,
         cashRegisterRaw, expensesRaw, plansRaw, balanceRaw, auditRaw, pinRaw, whatsappConfigRaw,
-        sparePartsRaw
+        sparePartsRaw, telegramConfigRaw
       ] = results;
 
       setItems(parseRawWithKeys<Item>(itemsRaw));
@@ -293,6 +299,13 @@ export default function App() {
           enabled: !!whatsappConfigRaw.enabled,
           phone: whatsappConfigRaw.phone || '+21641444355',
           apiKey: whatsappConfigRaw.apiKey || ''
+        });
+      }
+      if (telegramConfigRaw) {
+        setTelegramConfig({
+          enabled: !!telegramConfigRaw.enabled,
+          botToken: telegramConfigRaw.botToken || '',
+          chatId: telegramConfigRaw.chatId || ''
         });
       }
       setAuditLog(parseRawWithKeys<AuditLogEntry>(auditRaw).reverse());
@@ -575,6 +588,58 @@ export default function App() {
     if (ok) {
       triggerToast('✅ تم حفظ إعدادات واتساب بنجاح');
       logAudit('edit', `تعديل إعدادات إشعارات واتساب: ${whatsappConfig.enabled ? 'مفعلة' : 'معطلة'} للرقم ${whatsappConfig.phone}`);
+    } else {
+      triggerToast('❌ فشل الحفظ، يرجى التحقق من الاتصال بالإنترنت');
+    }
+  };
+
+  const triggerTelegramNotification = async (
+    invoiceCart: CartLine[],
+    totalAmount: number,
+    isDebt: boolean,
+    customer: string
+  ) => {
+    if (!telegramConfig.enabled || !telegramConfig.botToken || !telegramConfig.chatId) {
+      console.log('Telegram notification skipped');
+      return;
+    }
+
+    const formattedDate = new Date().toLocaleString('fr-FR', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    let msg = `🛍️ *عملية بيع جديدة!*\n`;
+    msg += `📅 *الوقت:* ${formattedDate}\n`;
+    msg += `💰 *المجموع:* ${totalAmount.toFixed(3)} د.ت\n`;
+    msg += `💳 *النوع:* ${isDebt ? `دين على [${customer}]` : 'نقدي كاش'}\n\n`;
+    msg += `📦 *السلع والخدمات:*\n`;
+
+    invoiceCart.forEach(c => {
+      msg += `• ${c.label} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
+    });
+
+    try {
+      // Direct HTTP request to Telegram Bot API
+      const url = `https://api.telegram.org/bot${telegramConfig.botToken}/sendMessage?chat_id=${telegramConfig.chatId}&text=${encodeURIComponent(msg)}&parse_mode=Markdown`;
+      
+      fetch(url).catch(e => {
+        console.error('Failed to send Telegram message', e);
+      });
+    } catch (err) {
+      console.error('Error preparing Telegram message', err);
+    }
+  };
+
+  const handleSaveTelegramConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const ok = await putWithOutbox('/telegramConfig.json', telegramConfig);
+    if (ok) {
+      triggerToast('✅ تم حفظ إعدادات تلغرام بنجاح');
+      logAudit('edit', `تعديل إعدادات إشعارات تلغرام: ${telegramConfig.enabled ? 'مفعلة' : 'معطلة'}`);
     } else {
       triggerToast('❌ فشل الحفظ، يرجى التحقق من الاتصال بالإنترنت');
     }
@@ -1286,8 +1351,9 @@ export default function App() {
         setLastInvoice(null);
       }
 
-      // Trigger WhatsApp notification for the sale
+      // Trigger WhatsApp & Telegram notifications for the sale
       triggerWhatsAppNotification(cart, grandTotal, invoiceIsDebt, invoiceCustomerName);
+      triggerTelegramNotification(cart, grandTotal, invoiceIsDebt, invoiceCustomerName);
 
       // Reset Form
       setCart([]);
@@ -3517,63 +3583,140 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* WhatsApp Notification Card */}
+                {/* Unified Notifications Config Card */}
                 <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
-                  <h3 className="font-extrabold text-stone-800 text-xs mb-1 flex items-center gap-1.5 text-emerald-800">
-                    <span>🟢 إشعارات مبيعات واتساب الفورية (WhatsApp Notifications)</span>
+                  <h3 className="font-extrabold text-stone-800 text-xs mb-1 flex items-center gap-1.5 text-stone-900">
+                    <span>📱 إعدادات الإشعارات الفورية للهاتف (واتساب وتلغرام)</span>
                   </h3>
-                  <p className="text-stone-400 text-[11px] mb-3">تلقي إشعار تفصيلي فوري على هاتفك مع كل عملية بيع أو مدخول جديد:</p>
-                  
-                  <form onSubmit={handleSaveWhatsAppConfig} className="space-y-3">
-                    <div className="flex items-center gap-3 bg-stone-50 p-2.5 rounded-xl border border-stone-100">
-                      <input 
-                        type="checkbox" 
-                        id="whatsapp-enabled"
-                        checked={whatsappConfig.enabled}
-                        onChange={e => setWhatsappConfig(prev => ({ ...prev, enabled: e.target.checked }))}
-                        className="w-4 h-4 text-emerald-600 focus:ring-emerald-500 border-stone-300 rounded cursor-pointer"
-                      />
-                      <label htmlFor="whatsapp-enabled" className="text-xs font-bold text-stone-700 cursor-pointer select-none">
-                        تفعيل الخدمة وإرسال الإشعارات تلقائياً عند كل عملية بيع
-                      </label>
+                  <p className="text-stone-400 text-[11px] mb-4">احصل على تفاصيل المبيعات، المدخول اليومي، والدق على هاتفك بشكل فوري عند إتمام أي عملية بيع:</p>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                    
+                    {/* WhatsApp Column */}
+                    <div className="border border-stone-100 rounded-2xl p-4 bg-stone-50/50 space-y-3">
+                      <h4 className="font-extrabold text-xs text-emerald-800 flex items-center gap-1">
+                        <span>🟢 الخيار الأول: إشعارات واتساب (WhatsApp)</span>
+                      </h4>
+                      <p className="text-stone-500 text-[10px] leading-relaxed">
+                        يستخدم خدمة CallMeBot المجانية لإرسال رسائل واتساب. <span className="text-red-700 font-bold">بسبب ضغط السيرفرات والقيود، قد يتوقف الرقم أحياناً عن الرد أو إرسال كود التفعيل.</span>
+                      </p>
+
+                      <form onSubmit={handleSaveWhatsAppConfig} className="space-y-3">
+                        <div className="flex items-center gap-2 bg-white p-2 rounded-xl border border-stone-100">
+                          <input 
+                            type="checkbox" 
+                            id="whatsapp-enabled"
+                            checked={whatsappConfig.enabled}
+                            onChange={e => setWhatsappConfig(prev => ({ ...prev, enabled: e.target.checked }))}
+                            className="w-3.5 h-3.5 text-emerald-600 focus:ring-emerald-500 border-stone-300 rounded cursor-pointer"
+                          />
+                          <label htmlFor="whatsapp-enabled" className="text-[11px] font-bold text-stone-700 cursor-pointer select-none">
+                            تفعيل إشعارات واتساب الفورية
+                          </label>
+                        </div>
+
+                        <div className="space-y-2">
+                          <div>
+                            <label className="block text-[10px] text-stone-500 mb-0.5">رقم هاتف الواتساب (بالرمز الدولي)</label>
+                            <input 
+                              type="text" 
+                              placeholder="+21641444355"
+                              value={whatsappConfig.phone}
+                              onChange={e => setWhatsappConfig(prev => ({ ...prev, phone: e.target.value }))}
+                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[10px] text-stone-500 mb-0.5">رمز API الخاص بـ CallMeBot</label>
+                            <input 
+                              type="text" 
+                              placeholder="أدخل الرمز السري للـ API..."
+                              value={whatsappConfig.apiKey}
+                              onChange={e => setWhatsappConfig(prev => ({ ...prev, apiKey: e.target.value }))}
+                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-2.5 text-emerald-900 text-[10px] leading-relaxed space-y-1">
+                          <p className="font-bold text-emerald-950">💡 كيفية الحصول على كود الواتساب:</p>
+                          <ol className="list-decimal list-inside space-y-0.5 text-emerald-800">
+                            <li>احفظ الرقم في جهات اتصال هاتفك أولاً كشرط أساسي: <strong className="font-mono text-emerald-950">+34 644 32 66 12</strong></li>
+                            <li>أرسل له رسالة دقيقة: <code className="bg-emerald-100 px-1 py-0.5 rounded font-mono text-emerald-950">I allow callmebot to send me messages</code></li>
+                            <li>بمجرد تفعيله، سيرسل لك البوت الـ API Key فوراً مجاناً لتقوم بنسخه ووضعه هنا.</li>
+                          </ol>
+                        </div>
+
+                        <button type="submit" className="w-full bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-2 px-3 rounded-xl text-[11px] cursor-pointer transition-colors">
+                          حفظ إعدادات واتساب 💾
+                        </button>
+                      </form>
                     </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-[10px] text-stone-500 mb-1">رقم هاتف الواتساب لتلقي الإشعار</label>
-                        <input 
-                          type="text" 
-                          placeholder="+21641444355"
-                          value={whatsappConfig.phone}
-                          onChange={e => setWhatsappConfig(prev => ({ ...prev, phone: e.target.value }))}
-                          className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-stone-500 mb-1">رمز API الخاص بـ CallMeBot</label>
-                        <input 
-                          type="text" 
-                          placeholder="أدخل الرمز السري للـ API..."
-                          value={whatsappConfig.apiKey}
-                          onChange={e => setWhatsappConfig(prev => ({ ...prev, apiKey: e.target.value }))}
-                          className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
-                        />
-                      </div>
+                    {/* Telegram Column */}
+                    <div className="border border-stone-100 rounded-2xl p-4 bg-stone-50/50 space-y-3">
+                      <h4 className="font-extrabold text-xs text-blue-800 flex items-center gap-1">
+                        <span>🔵 الخيار الثاني (البديل الأقوى والأسرع): إشعارات تلغرام (Telegram)</span>
+                        <span className="bg-blue-100 text-blue-800 text-[9px] px-1.5 py-0.2 rounded-full font-normal">مستقر ومضمون 100% ⚡</span>
+                      </h4>
+                      <p className="text-stone-500 text-[10px] leading-relaxed">
+                        يرسل الإشعارات مباشرة إلى حسابك الخاص على تطبيق تلغرام عبر بوت خاص بك. <span className="text-blue-900 font-bold">مجاني بالكامل، سريع للغاية (أقل من ثانية واحدة)، ومستقر 100% بدون أي تجميد أو عدم رد.</span>
+                      </p>
+
+                      <form onSubmit={handleSaveTelegramConfig} className="space-y-3">
+                        <div className="flex items-center gap-2 bg-white p-2 rounded-xl border border-stone-100">
+                          <input 
+                            type="checkbox" 
+                            id="telegram-enabled"
+                            checked={telegramConfig.enabled}
+                            onChange={e => setTelegramConfig(prev => ({ ...prev, enabled: e.target.checked }))}
+                            className="w-3.5 h-3.5 text-blue-600 focus:ring-blue-500 border-stone-300 rounded cursor-pointer"
+                          />
+                          <label htmlFor="telegram-enabled" className="text-[11px] font-bold text-stone-700 cursor-pointer select-none">
+                            تفعيل إشعارات تلغرام الفورية
+                          </label>
+                        </div>
+
+                        <div className="space-y-2">
+                          <div>
+                            <label className="block text-[10px] text-stone-500 mb-0.5">رمز توكن البوت (Bot Token)</label>
+                            <input 
+                              type="text" 
+                              placeholder="مثال: 123456789:ABCdefGhIJK..."
+                              value={telegramConfig.botToken}
+                              onChange={e => setTelegramConfig(prev => ({ ...prev, botToken: e.target.value }))}
+                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[10px] text-stone-500 mb-0.5">معرف المحادثة الخاص بك (Chat ID)</label>
+                            <input 
+                              type="text" 
+                              placeholder="مثال: 987654321"
+                              value={telegramConfig.chatId}
+                              onChange={e => setTelegramConfig(prev => ({ ...prev, chatId: e.target.value }))}
+                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="bg-blue-50 border border-blue-100 rounded-xl p-2.5 text-blue-900 text-[10px] leading-relaxed space-y-1">
+                          <p className="font-bold text-blue-950">💡 طريقة إعداد بوت تلغرام مجاني في 10 ثوانٍ:</p>
+                          <ol className="list-decimal list-inside space-y-0.5 text-blue-800">
+                            <li>افتح تطبيق تلغرام وابحث عن البوت الرسمي الشهير: <strong className="text-blue-950">@BotFather</strong></li>
+                            <li>أرسل له الأمر <code className="bg-blue-100 px-1 rounded font-mono text-blue-950">/newbot</code> ثم اكتب أي اسم للبوت، ثم اسم مستخدم ينتهي بكلمة <code className="font-mono text-blue-950">bot</code>. سينشئ لك البوت فوراً ويرسل لك رمز <strong className="font-bold">Bot Token</strong> طويل لتقوم بنسخه ووضعه في الخانة الأولى أعلاه.</li>
+                            <li>الآن للحصول على الـ <strong className="font-bold">Chat ID</strong> الخاص بك، ابحث عن بوت المعرفات: <strong className="text-blue-950">@userinfobot</strong> وأرسل له أي رسالة، سيجيبك فوراً برقم معرفك (مثال: <code className="font-mono text-blue-950">54829342</code>). انسخه وضعه في الخانة الثانية.</li>
+                            <li><strong className="text-blue-950 font-bold">خطوة هامة:</strong> افتح البوت الذي أنشأته أنت واضغط على زر <strong className="font-bold text-blue-950">Start / ابدأ</strong> لكي تسمح له بإرسال الإشعارات لك.</li>
+                          </ol>
+                        </div>
+
+                        <button type="submit" className="w-full bg-blue-700 hover:bg-blue-800 text-white font-bold py-2 px-3 rounded-xl text-[11px] cursor-pointer transition-colors">
+                          حفظ إعدادات تلغرام 💾
+                        </button>
+                      </form>
                     </div>
 
-                    <div className="bg-emerald-50 border border-emerald-150 rounded-xl p-3 text-emerald-900 text-[11px] leading-relaxed">
-                      <p className="font-bold text-emerald-950 mb-1">💡 كيف تحصل على رمز الـ API المجاني في 10 ثوانٍ؟</p>
-                      <ol className="list-decimal list-inside space-y-1 text-emerald-800">
-                        <li>احفظ رقم CallMeBot في جهات اتصال هاتفك: <strong className="font-mono text-emerald-950">+34 621 07 31 43</strong></li>
-                        <li>أرسل له هذه الرسالة الدقيقة عبر الواتساب: <code className="bg-emerald-100 px-1 py-0.5 rounded font-mono text-emerald-950">I allow callmebot to send me messages</code></li>
-                        <li>سيقوم البوت بإرسال رمز الـ API الخاص بك فوراً وبالمجان! انسخه والصقه في الخانة أعلاه ثم اضغط حفظ الإعدادات.</li>
-                      </ol>
-                    </div>
-
-                    <button type="submit" className="bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-2.5 px-4 rounded-xl text-xs cursor-pointer">
-                      حفظ إعدادات إشعارات واتساب 💾
-                    </button>
-                  </form>
+                  </div>
                 </div>
 
                 {/* Merge Duplicate Items Utility */}
