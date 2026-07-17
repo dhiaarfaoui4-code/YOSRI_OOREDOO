@@ -569,16 +569,25 @@ export default function App() {
     });
 
     try {
-      const cleanPhone = whatsappConfig.phone.replace('+', '').replace(/\s/g, '');
-      const url = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(
-        cleanPhone
-      )}&text=${encodeURIComponent(msg)}&apikey=${encodeURIComponent(whatsappConfig.apiKey)}`;
-      
-      fetch(url, { mode: 'no-cors' }).catch(e => {
-        console.error('Failed to send WhatsApp via callmebot', e);
+      const response = await fetch('/api/send-whatsapp', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          phone: whatsappConfig.phone,
+          apiKey: whatsappConfig.apiKey,
+          message: msg
+        })
       });
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        console.error('WhatsApp API error via backend proxy:', errorData);
+      } else {
+        console.log('WhatsApp notification sent successfully via backend proxy');
+      }
     } catch (err) {
-      console.error('Error preparing WhatsApp message', err);
+      console.error('Error sending WhatsApp message via backend proxy', err);
     }
   };
 
@@ -591,6 +600,13 @@ export default function App() {
     } else {
       triggerToast('❌ فشل الحفظ، يرجى التحقق من الاتصال بالإنترنت');
     }
+  };
+
+  const escapeHTML = (text: string) => {
+    return (text || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
   };
 
   const triggerTelegramNotification = async (
@@ -612,25 +628,100 @@ export default function App() {
       minute: '2-digit',
     });
 
-    let msg = `🛍️ *عملية بيع جديدة!*\n`;
-    msg += `📅 *الوقت:* ${formattedDate}\n`;
-    msg += `💰 *المجموع:* ${totalAmount.toFixed(3)} د.ت\n`;
-    msg += `💳 *النوع:* ${isDebt ? `دين على [${customer}]` : 'نقدي كاش'}\n\n`;
-    msg += `📦 *السلع والخدمات:*\n`;
+    const cleanCustomer = escapeHTML(customer);
+    let msg = `<b>🛍️ عملية بيع جديدة!</b>\n`;
+    msg += `<b>📅 الوقت:</b> ${formattedDate}\n`;
+    msg += `<b>💰 المجموع:</b> ${totalAmount.toFixed(3)} د.ت\n`;
+    msg += `<b>💳 النوع:</b> ${isDebt ? `دين على [${cleanCustomer}]` : 'نقدي كاش'}\n\n`;
+    msg += `<b>📦 السلع والخدمات:</b>\n`;
 
     invoiceCart.forEach(c => {
-      msg += `• ${c.label} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
+      const cleanLabel = escapeHTML(c.label);
+      msg += `• ${cleanLabel} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
     });
 
     try {
-      // Direct HTTP request to Telegram Bot API
-      const url = `https://api.telegram.org/bot${telegramConfig.botToken}/sendMessage?chat_id=${telegramConfig.chatId}&text=${encodeURIComponent(msg)}&parse_mode=Markdown`;
-      
-      fetch(url).catch(e => {
-        console.error('Failed to send Telegram message', e);
+      const response = await fetch('/api/send-telegram', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          botToken: telegramConfig.botToken,
+          chatId: telegramConfig.chatId,
+          message: msg,
+          parseMode: 'HTML'
+        })
       });
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        console.error('Telegram API error via backend proxy:', errorData);
+      } else {
+        console.log('Telegram notification sent successfully via backend proxy');
+      }
     } catch (err) {
-      console.error('Error preparing Telegram message', err);
+      console.error('Error sending Telegram message via backend proxy', err);
+    }
+  };
+
+  const handleTestTelegram = async () => {
+    if (!telegramConfig.botToken || !telegramConfig.chatId) {
+      triggerToast('⚠️ يرجى إدخال رمز البوت ومعرف المحادثة أولاً');
+      return;
+    }
+    triggerToast('⚡ جاري إرسال رسالة تجريبية...');
+    try {
+      const msg = `🔔 <b>إشعار تجريبي ناجح!</b>\n\nلقد تم ربط نظام المتجر ببوت التلغرام الخاص بك بنجاح ⚡\nجاهز الآن لتلقي الإشعارات الفورية!`;
+      const res = await fetch('/api/send-telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          botToken: telegramConfig.botToken,
+          chatId: telegramConfig.chatId,
+          message: msg,
+          parseMode: 'HTML'
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        triggerToast('✅ تمت عملية الفحص بنجاح! تحقق من حسابك على تلغرام');
+        logAudit('edit', 'إرسال رسالة تجريبية ناجحة عبر تلغرام');
+      } else {
+        const errMsg = data.error || 'رمز غير صحيح أو لم تقم بتفعيل البوت أو لم تبدأ المحادثة';
+        triggerToast(`❌ فشل الاتصال: ${errMsg}`);
+      }
+    } catch (err: any) {
+      triggerToast(`❌ خطأ في الشبكة: ${err?.message || err}`);
+    }
+  };
+
+  const handleTestWhatsApp = async () => {
+    if (!whatsappConfig.phone || !whatsappConfig.apiKey) {
+      triggerToast('⚠️ يرجى إدخال رقم الهاتف ورمز الـ API أولاً');
+      return;
+    }
+    triggerToast('⚡ جاري إرسال رسالة تجريبية...');
+    try {
+      const msg = `🔔 إشعار تجريبي ناجح! لقد تم ربط نظام المتجر بالواتساب بنجاح 🟢`;
+      const res = await fetch('/api/send-whatsapp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone: whatsappConfig.phone,
+          apiKey: whatsappConfig.apiKey,
+          message: msg
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        triggerToast('✅ تمت عملية الفحص بنجاح! تحقق من هاتفك على واتساب');
+        logAudit('edit', 'إرسال رسالة تجريبية ناجحة عبر واتساب');
+      } else {
+        const errMsg = data.error || 'يرجى التأكد من الرقم والرمز السري وتفعيل البوت';
+        triggerToast(`❌ فشل الاتصال: ${errMsg}`);
+      }
+    } catch (err: any) {
+      triggerToast(`❌ خطأ في الشبكة: ${err?.message || err}`);
     }
   };
 
@@ -3647,9 +3738,18 @@ export default function App() {
                           </ol>
                         </div>
 
-                        <button type="submit" className="w-full bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-2 px-3 rounded-xl text-[11px] cursor-pointer transition-colors">
-                          حفظ إعدادات واتساب 💾
-                        </button>
+                        <div className="flex gap-2 pt-1">
+                          <button type="submit" className="flex-1 bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-2 px-3 rounded-xl text-[11px] cursor-pointer transition-colors">
+                            حفظ إعدادات واتساب 💾
+                          </button>
+                          <button 
+                            type="button" 
+                            onClick={handleTestWhatsApp}
+                            className="bg-emerald-100 hover:bg-emerald-200 text-emerald-800 font-bold py-2 px-3 rounded-xl text-[11px] cursor-pointer transition-colors"
+                          >
+                            تجربة الإرسال ⚡
+                          </button>
+                        </div>
                       </form>
                     </div>
 
@@ -3710,9 +3810,18 @@ export default function App() {
                           </ol>
                         </div>
 
-                        <button type="submit" className="w-full bg-blue-700 hover:bg-blue-800 text-white font-bold py-2 px-3 rounded-xl text-[11px] cursor-pointer transition-colors">
-                          حفظ إعدادات تلغرام 💾
-                        </button>
+                        <div className="flex gap-2 pt-1">
+                          <button type="submit" className="flex-1 bg-blue-700 hover:bg-blue-800 text-white font-bold py-2 px-3 rounded-xl text-[11px] cursor-pointer transition-colors">
+                            حفظ إعدادات تلغرام 💾
+                          </button>
+                          <button 
+                            type="button" 
+                            onClick={handleTestTelegram}
+                            className="bg-blue-100 hover:bg-blue-200 text-blue-800 font-bold py-2 px-3 rounded-xl text-[11px] cursor-pointer transition-colors"
+                          >
+                            تجربة الإرسال ⚡
+                          </button>
+                        </div>
                       </form>
                     </div>
 

@@ -1,0 +1,114 @@
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  // Enable JSON request body parsing
+  app.use(express.json());
+
+  // API Route: Send Telegram Notification
+  app.post("/api/send-telegram", async (req, res) => {
+    try {
+      const { botToken, chatId, message, parseMode = "HTML" } = req.body;
+
+      if (!botToken || !chatId || !message) {
+        return res.status(400).json({ error: "Missing required parameters: botToken, chatId, or message" });
+      }
+
+      console.log(`Sending Telegram notification to chat ${chatId} using mode ${parseMode}...`);
+
+      const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
+      const response = await fetch(telegramUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message,
+          parse_mode: parseMode,
+        }),
+      });
+
+      const responseData = await response.json();
+
+      if (!response.ok) {
+        console.error("Telegram API returned error:", responseData);
+        return res.status(response.status).json({
+          error: responseData.description || "Failed to send Telegram message",
+          details: responseData,
+        });
+      }
+
+      console.log("Telegram notification sent successfully.");
+      return res.json({ success: true, data: responseData });
+    } catch (err: any) {
+      console.error("Error in /api/send-telegram:", err);
+      return res.status(500).json({ error: "Internal server error", message: err.message });
+    }
+  });
+
+  // API Route: Send WhatsApp (CallMeBot) Notification
+  app.post("/api/send-whatsapp", async (req, res) => {
+    try {
+      const { phone, apiKey, message } = req.body;
+
+      if (!phone || !apiKey || !message) {
+        return res.status(400).json({ error: "Missing required parameters: phone, apiKey, or message" });
+      }
+
+      console.log(`Sending WhatsApp notification to phone ${phone}...`);
+
+      const cleanPhone = phone.replace("+", "").replace(/\s/g, "");
+      // CallMeBot uses a GET request
+      const whatsappUrl = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(
+        cleanPhone
+      )}&text=${encodeURIComponent(message)}&apikey=${encodeURIComponent(apiKey)}`;
+
+      const response = await fetch(whatsappUrl);
+      const textResponse = await response.text();
+
+      // CallMeBot usually returns plain text or HTML
+      if (!response.ok) {
+        console.error("CallMeBot API returned error:", textResponse);
+        return res.status(response.status).json({
+          error: "Failed to send WhatsApp message via CallMeBot",
+          details: textResponse,
+        });
+      }
+
+      console.log("WhatsApp notification sent successfully. Response:", textResponse);
+      return res.json({ success: true, details: textResponse });
+    } catch (err: any) {
+      console.error("Error in /api/send-whatsapp:", err);
+      return res.status(500).json({ error: "Internal server error", message: err.message });
+    }
+  });
+
+  // API health check
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok" });
+  });
+
+  // Vite middleware for development vs static files serving for production
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();
