@@ -593,10 +593,18 @@ export default function App() {
 
   const handleSaveWhatsAppConfig = async (e: React.FormEvent) => {
     e.preventDefault();
-    const ok = await putWithOutbox('/whatsappConfig.json', whatsappConfig);
+    const cleanPhone = (whatsappConfig.phone || '').replace(/\s+/g, '');
+    const cleanApiKey = (whatsappConfig.apiKey || '').replace(/\s+/g, '');
+    const cleanedConfig = {
+      ...whatsappConfig,
+      phone: cleanPhone,
+      apiKey: cleanApiKey
+    };
+    setWhatsappConfig(cleanedConfig);
+    const ok = await putWithOutbox('/whatsappConfig.json', cleanedConfig);
     if (ok) {
       triggerToast('✅ تم حفظ إعدادات واتساب بنجاح');
-      logAudit('edit', `تعديل إعدادات إشعارات واتساب: ${whatsappConfig.enabled ? 'مفعلة' : 'معطلة'} للرقم ${whatsappConfig.phone}`);
+      logAudit('edit', `تعديل إعدادات إشعارات واتساب: ${cleanedConfig.enabled ? 'مفعلة' : 'معطلة'} للرقم ${cleanedConfig.phone}`);
     } else {
       triggerToast('❌ فشل الحفظ، يرجى التحقق من الاتصال بالإنترنت');
     }
@@ -727,10 +735,18 @@ export default function App() {
 
   const handleSaveTelegramConfig = async (e: React.FormEvent) => {
     e.preventDefault();
-    const ok = await putWithOutbox('/telegramConfig.json', telegramConfig);
+    const cleanBotToken = (telegramConfig.botToken || '').replace(/\s+/g, '');
+    const cleanChatId = (telegramConfig.chatId || '').replace(/\s+/g, '');
+    const cleanedConfig = {
+      ...telegramConfig,
+      botToken: cleanBotToken,
+      chatId: cleanChatId
+    };
+    setTelegramConfig(cleanedConfig);
+    const ok = await putWithOutbox('/telegramConfig.json', cleanedConfig);
     if (ok) {
       triggerToast('✅ تم حفظ إعدادات تلغرام بنجاح');
-      logAudit('edit', `تعديل إعدادات إشعارات تلغرام: ${telegramConfig.enabled ? 'مفعلة' : 'معطلة'}`);
+      logAudit('edit', `تعديل إعدادات إشعارات تلغرام: ${cleanedConfig.enabled ? 'مفعلة' : 'معطلة'}`);
     } else {
       triggerToast('❌ فشل الحفظ، يرجى التحقق من الاتصال بالإنترنت');
     }
@@ -3713,8 +3729,9 @@ export default function App() {
                               type="text" 
                               placeholder="+21641444355"
                               value={whatsappConfig.phone}
-                              onChange={e => setWhatsappConfig(prev => ({ ...prev, phone: e.target.value }))}
-                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono"
+                              onChange={e => setWhatsappConfig(prev => ({ ...prev, phone: e.target.value.replace(/\s+/g, '') }))}
+                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono text-left"
+                              dir="ltr"
                             />
                           </div>
                           <div>
@@ -3723,8 +3740,9 @@ export default function App() {
                               type="text" 
                               placeholder="أدخل الرمز السري للـ API..."
                               value={whatsappConfig.apiKey}
-                              onChange={e => setWhatsappConfig(prev => ({ ...prev, apiKey: e.target.value }))}
-                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono"
+                              onChange={e => setWhatsappConfig(prev => ({ ...prev, apiKey: e.target.value.replace(/\s+/g, '') }))}
+                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono text-left"
+                              dir="ltr"
                             />
                           </div>
                         </div>
@@ -3784,8 +3802,9 @@ export default function App() {
                               type="text" 
                               placeholder="مثال: 123456789:ABCdefGhIJK..."
                               value={telegramConfig.botToken}
-                              onChange={e => setTelegramConfig(prev => ({ ...prev, botToken: e.target.value }))}
-                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono"
+                              onChange={e => setTelegramConfig(prev => ({ ...prev, botToken: e.target.value.replace(/\s+/g, '') }))}
+                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono text-left"
+                              dir="ltr"
                             />
                           </div>
                           <div>
@@ -3794,8 +3813,9 @@ export default function App() {
                               type="text" 
                               placeholder="مثال: 987654321"
                               value={telegramConfig.chatId}
-                              onChange={e => setTelegramConfig(prev => ({ ...prev, chatId: e.target.value }))}
-                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono"
+                              onChange={e => setTelegramConfig(prev => ({ ...prev, chatId: e.target.value.replace(/\s+/g, '') }))}
+                              className="w-full bg-white border border-stone-200 px-3 py-1.5 rounded-xl text-xs text-stone-800 font-mono text-left"
+                              dir="ltr"
                             />
                           </div>
                         </div>

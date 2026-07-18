@@ -12,11 +12,14 @@ async function startServer() {
   // API Route: Send Telegram Notification
   app.post("/api/send-telegram", async (req, res) => {
     try {
-      const { botToken, chatId, message, parseMode = "HTML" } = req.body;
+      const { botToken: rawBotToken, chatId: rawChatId, message, parseMode = "HTML" } = req.body;
 
-      if (!botToken || !chatId || !message) {
+      if (!rawBotToken || !rawChatId || !message) {
         return res.status(400).json({ error: "Missing required parameters: botToken, chatId, or message" });
       }
+
+      const botToken = String(rawBotToken).replace(/\s+/g, "");
+      const chatId = String(rawChatId).replace(/\s+/g, "");
 
       console.log(`Sending Telegram notification to chat ${chatId} using mode ${parseMode}...`);
 
@@ -52,15 +55,18 @@ async function startServer() {
   // API Route: Send WhatsApp (CallMeBot) Notification
   app.post("/api/send-whatsapp", async (req, res) => {
     try {
-      const { phone, apiKey, message } = req.body;
+      const { phone: rawPhone, apiKey: rawApiKey, message } = req.body;
 
-      if (!phone || !apiKey || !message) {
+      if (!rawPhone || !rawApiKey || !message) {
         return res.status(400).json({ error: "Missing required parameters: phone, apiKey, or message" });
       }
 
+      const phone = String(rawPhone).replace(/\s+/g, "");
+      const apiKey = String(rawApiKey).replace(/\s+/g, "");
+
       console.log(`Sending WhatsApp notification to phone ${phone}...`);
 
-      const cleanPhone = phone.replace("+", "").replace(/\s/g, "");
+      const cleanPhone = phone.replace("+", "");
       // CallMeBot uses a GET request
       const whatsappUrl = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(
         cleanPhone
