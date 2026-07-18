@@ -296,14 +296,14 @@ export default function App() {
       setSpareParts(parseRawWithKeys<SparePart>(sparePartsRaw));
       if (whatsappConfigRaw) {
         setWhatsappConfig({
-          enabled: !!whatsappConfigRaw.enabled,
+          enabled: whatsappConfigRaw.enabled !== false,
           phone: whatsappConfigRaw.phone || '+21641444355',
           apiKey: whatsappConfigRaw.apiKey || ''
         });
       }
       if (telegramConfigRaw) {
         setTelegramConfig({
-          enabled: !!telegramConfigRaw.enabled,
+          enabled: telegramConfigRaw.enabled !== false,
           botToken: telegramConfigRaw.botToken || '',
           chatId: telegramConfigRaw.chatId || ''
         });
@@ -595,7 +595,7 @@ export default function App() {
     }
   };
 
-  const sendWhatsAppMessageDirectly = async (phone: string, apiKey: string, message: string) => {
+  const sendWhatsAppMessageDirectly = async (phone: string, apiKey: string, message: string): Promise<{ success: boolean; data?: any; error?: string; details?: string }> => {
     try {
       const cleanedPhoneNoPlus = (phone || '').replace('+', '').replace(/\s+/g, '');
       const url = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(
@@ -609,7 +609,7 @@ export default function App() {
     }
   };
 
-  const sendWhatsAppMessage = async (phone: string, apiKey: string, message: string) => {
+  const sendWhatsAppMessage = async (phone: string, apiKey: string, message: string): Promise<{ success: boolean; data?: any; error?: string; details?: string }> => {
     const cleanPhone = (phone || '').replace(/\s+/g, '');
     const cleanApiKey = (apiKey || '').replace(/\s+/g, '');
     
@@ -648,7 +648,7 @@ export default function App() {
     isDebt: boolean,
     customer: string
   ) => {
-    if (!whatsappConfig.enabled || !whatsappConfig.apiKey) {
+    if (whatsappConfig.enabled === false || !whatsappConfig.apiKey) {
       console.log('WhatsApp notification skipped');
       return;
     }
@@ -705,13 +705,330 @@ export default function App() {
       .replace(/>/g, '&gt;');
   };
 
+  const triggerTelegramDebtNotification = async (
+    customerName: string,
+    amount: number,
+    note: string,
+    phone?: string
+  ) => {
+    if (telegramConfig.enabled === false || !telegramConfig.botToken || !telegramConfig.chatId) {
+      console.log('Telegram debt notification skipped: Telegram is disabled or config is missing');
+      return;
+    }
+
+    const formattedDate = new Date().toLocaleString('fr-FR', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    const cleanName = escapeHTML(customerName);
+    const cleanNote = escapeHTML(note);
+    const cleanPhone = phone ? escapeHTML(phone) : '';
+
+    let msg = `<b>⚠️ تسجيل دين جديد! ⚠️</b>\n\n`;
+    msg += `<b>👤 الحريف:</b> ${cleanName}\n`;
+    if (cleanPhone) {
+      msg += `<b>📞 الهاتف:</b> <code>${cleanPhone}</code>\n`;
+    }
+    msg += `<b>💰 قيمة الدين:</b> <code>${amount.toFixed(3)}</code> د.ت\n`;
+    msg += `<b>📝 ملاحظة:</b> ${cleanNote}\n`;
+    msg += `<b>📅 التاريخ:</b> ${formattedDate}\n`;
+
+    const result = await sendTelegramMessage(telegramConfig.botToken, telegramConfig.chatId, msg, 'HTML');
+    if (result.success) {
+      console.log('Telegram debt notification sent successfully');
+    } else {
+      console.error('Telegram debt notification failed:', result.error);
+    }
+  };
+
+  const sendTelegramPDF = async (pdfBase64: string, filename: string, caption: string) => {
+    if (!telegramConfig.botToken || !telegramConfig.chatId) {
+      console.warn('Telegram botToken or chatId is not configured for PDF');
+      return { success: false, error: 'Telegram credentials missing' };
+    }
+    
+    try {
+      const response = await fetch('/api/send-telegram-pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          botToken: telegramConfig.botToken.replace(/\s+/g, ''),
+          chatId: telegramConfig.chatId.replace(/\s+/g, ''),
+          pdfBase64,
+          filename,
+          caption
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        return { success: true, data };
+      }
+      
+      const errData = await response.json().catch(() => ({}));
+      return { success: false, error: errData.error || `خطأ من الخادم: ${response.status}` };
+    } catch (err: any) {
+      console.error('Network error calling Telegram PDF API:', err);
+      return { success: false, error: err?.message || 'خطأ في الشبكة' };
+    }
+  };
+
+  const generateResetReportPDF = async (salesToRemove: Sale[], otherToRemove: OtherIncome[], days: number) => {
+    try {
+      // Create offscreen canvas for rendering
+      const canvas = document.createElement('canvas');
+      canvas.width = 1240;
+      canvas.height = 1754;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        console.error('Could not get 2D canvas context');
+        return null;
+      }
+
+      // White background
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, 1240, 1754);
+
+      // Accent color bar
+      ctx.fillStyle = '#991B1B'; // Burgundy/Red-800
+      ctx.fillRect(0, 0, 1240, 25);
+
+      // Title
+      ctx.fillStyle = '#1C1917'; // stone-900
+      ctx.font = 'bold 34px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.direction = 'rtl';
+      ctx.textAlign = 'right';
+      ctx.fillText('📋 تقرير تصفير سجل المبيعات والمداخيل', 1140, 95);
+
+      // Subtitle
+      ctx.fillStyle = '#78716C'; // stone-500
+      ctx.font = '18px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.fillText('نظام إدارة مبيعات Yosri GSM - متصل بالخادم السحابي', 1140, 135);
+
+      // Horizontal line
+      ctx.strokeStyle = '#E7E5E4'; // stone-200
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(100, 165);
+      ctx.lineTo(1140, 165);
+      ctx.stroke();
+
+      // Report Metadata (RTL)
+      ctx.fillStyle = '#44403C'; // stone-700
+      ctx.font = 'bold 16px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(`📅 تاريخ التصفير: ${new Date().toLocaleString('ar-TN')}`, 1140, 205);
+      ctx.fillText(`🧹 الفترة الممسوحة: آخر ${days} أيام`, 1140, 240);
+
+      ctx.textAlign = 'left';
+      ctx.fillText(`👤 المسؤول: مدير النظام`, 100, 205);
+      const reportId = `RST-${Date.now().toString(36).toUpperCase()}`;
+      ctx.fillText(`🔑 معرّف التقرير: #${reportId}`, 100, 240);
+
+      // Horizontal line
+      ctx.strokeStyle = '#E7E5E4'; // stone-200
+      ctx.beginPath();
+      ctx.moveTo(100, 275);
+      ctx.lineTo(1140, 275);
+      ctx.stroke();
+
+      // Calculations
+      const totalSalesVal = salesToRemove.reduce((s, x) => s + x.total, 0);
+      const totalOtherVal = otherToRemove.reduce((s, x) => s + x.amount, 0);
+      const totalRevenue = totalSalesVal + totalOtherVal;
+      const totalCost = salesToRemove.reduce((s, x) => s + (x.unitBuy * (x.qty || 1)), 0);
+      const profit = totalRevenue - totalCost;
+
+      // Draw 3 statistic cards
+      const drawCard = (cx: number, cy: number, cw: number, ch: number, title: string, value: string, color: string) => {
+        ctx.fillStyle = '#FAFAF9'; // stone-50
+        ctx.fillRect(cx, cy, cw, ch);
+        ctx.strokeStyle = '#E7E5E4'; // stone-200
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(cx, cy, cw, ch);
+        
+        ctx.fillStyle = color;
+        ctx.fillRect(cx, cy, cw, 6);
+        
+        ctx.fillStyle = '#78716C'; // stone-500
+        ctx.font = 'bold 15px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.direction = 'rtl';
+        ctx.textAlign = 'center';
+        ctx.fillText(title, cx + cw / 2, cy + 40);
+        
+        ctx.fillStyle = '#1C1917'; // stone-900
+        ctx.font = 'bold 24px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.fillText(value, cx + cw / 2, cy + 85);
+      };
+
+      drawCard(800, 310, 340, 120, '💵 إجمالي المداخيل الممسوحة', `${totalRevenue.toFixed(3)} د.ت`, '#991B1B');
+      drawCard(450, 310, 340, 120, '📦 تكلفة شراء السلع المبيعة', `${totalCost.toFixed(3)} د.ت`, '#78716C');
+      drawCard(100, 310, 340, 120, '📈 صافي أرباح الفترة ممسوحة', `${profit.toFixed(3)} د.ت`, '#047857');
+
+      // Table Header title
+      ctx.fillStyle = '#1C1917'; // stone-900
+      ctx.font = 'bold 20px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.direction = 'rtl';
+      ctx.textAlign = 'right';
+      ctx.fillText('📋 كشف تفصيلي بالعمليات ممسوحة (آخر 25 عملية):', 1140, 485);
+
+      // Draw table header
+      const tableY = 515;
+      ctx.fillStyle = '#1C1917'; // stone-900
+      ctx.fillRect(100, tableY, 1040, 40);
+      
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 15px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.direction = 'rtl';
+      ctx.textAlign = 'center';
+      
+      ctx.fillText('م', 1115, tableY + 25);
+      ctx.fillText('التاريخ والوقت', 990, tableY + 25);
+      ctx.fillText('البيان / تفاصيل العملية', 670, tableY + 25);
+      ctx.fillText('الكمية', 410, tableY + 25);
+      ctx.fillText('السعر', 310, tableY + 25);
+      ctx.fillText('الإجمالي', 175, tableY + 25);
+
+      // Prepare rows
+      const allRows = [
+        ...salesToRemove.map(s => ({
+          date: s.date,
+          label: s.itemName,
+          qty: s.qty,
+          price: s.unitPrice,
+          total: s.total
+        })),
+        ...otherToRemove.map(o => ({
+          date: o.date,
+          label: `${o.category === 'forfait_replenish' ? 'شحن رصيد فورفي' : o.category === 'card' ? 'بيع كارت شحن' : 'خدمة أخرى'}: ${o.label}`,
+          qty: o.qty || 1,
+          price: o.amount / (o.qty || 1),
+          total: o.amount
+        }))
+      ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+      let currentY = tableY + 40;
+      const rowsToShow = allRows.slice(0, 25);
+
+      rowsToShow.forEach((row, idx) => {
+        // bg
+        ctx.fillStyle = idx % 2 === 0 ? '#FAFAF9' : '#FFFFFF';
+        ctx.fillRect(100, currentY, 1040, 38);
+        
+        // border
+        ctx.strokeStyle = '#F5F5F4'; // stone-100
+        ctx.lineWidth = 1;
+        ctx.strokeRect(100, currentY, 1040, 38);
+        
+        // row text
+        ctx.fillStyle = '#44403C'; // stone-700
+        ctx.font = '14px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.direction = 'rtl';
+        ctx.textAlign = 'center';
+        
+        // Index
+        ctx.fillText(String(idx + 1), 1115, currentY + 24);
+        
+        // Date
+        const rowDateStr = new Date(row.date).toLocaleString('fr-FR', {
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit'
+        });
+        ctx.fillText(rowDateStr, 990, currentY + 24);
+        
+        // Label
+        ctx.textAlign = 'right';
+        let lbl = row.label || '';
+        if (lbl.length > 42) lbl = lbl.slice(0, 39) + '...';
+        ctx.fillText(lbl, 870, currentY + 24);
+        
+        // Qty
+        ctx.textAlign = 'center';
+        ctx.fillText(String(row.qty), 410, currentY + 24);
+        
+        // Price
+        ctx.fillText(row.price.toFixed(3), 310, currentY + 24);
+        
+        // Total
+        ctx.fillStyle = '#1C1917'; // stone-900
+        ctx.font = 'bold 14px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.fillText(row.total.toFixed(3), 175, currentY + 24);
+        
+        currentY += 38;
+      });
+
+      // Extra text if remaining
+      if (allRows.length > 25) {
+        ctx.fillStyle = '#78716C'; // stone-500
+        ctx.font = 'italic 14px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.direction = 'rtl';
+        ctx.textAlign = 'center';
+        ctx.fillText(`💡 ولقد تم تصفير ومسح ${allRows.length - 25} عملية إضافية أخرى لم يتسع الجدول لعرضها تفصيلياً.`, 620, currentY + 30);
+      }
+
+      // Footer Box
+      ctx.strokeStyle = '#E7E5E4'; // stone-200
+      ctx.lineWidth = 1;
+      ctx.strokeRect(100, 1630, 1040, 60);
+      
+      ctx.fillStyle = '#78716C'; // stone-500
+      ctx.font = '13px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.direction = 'rtl';
+      ctx.textAlign = 'center';
+      ctx.fillText('🛡️ تم تصفير هذا السجل وتوليد هذا التقرير القانوني تلقائياً لحفظ الحقوق والأرشيف.', 620, 1655);
+      ctx.fillText('متجر Yosri GSM - العنوان: تبر، الكاف | هاتف: 41 444 355 | متصل بالخادم السحابي لـ Yosri GSM', 620, 1675);
+
+      // Convert canvas to image and initialize jsPDF
+      const { jsPDF } = await import('jspdf');
+      const pdf = new jsPDF({
+        orientation: 'p',
+        unit: 'mm',
+        format: 'a4'
+      });
+
+      const imgData = canvas.toDataURL('image/png');
+      pdf.addImage(imgData, 'PNG', 0, 0, 210, 297);
+
+      // Trigger local browser download
+      const filename = `report_reset_${new Date().toISOString().split('T')[0]}_${reportId}.pdf`;
+      pdf.save(filename);
+
+      // If Telegram is enabled, send it!
+      if (telegramConfig.enabled && telegramConfig.botToken && telegramConfig.chatId) {
+        const pdfBase64 = pdf.output('datauristring');
+        const caption = `🧹 <b>تقرير تصفير سجل المبيعات والمداخيل</b>\n\n• <b>رقم التقرير:</b> <code>#${reportId}</code>\n• <b>الفترة ممسوحة:</b> آخر ${days} أيام\n• <b>إجمالي المداخيل ممسوحة:</b> ${totalRevenue.toFixed(3)} د.ت\n• <b>صافي الربح الممسوح:</b> ${profit.toFixed(3)} د.ت\n• <b>عدد العمليات الكلي:</b> ${allRows.length}\n\n<i>تم تصفير السجل بنجاح وإرسال التقرير تلقائياً للأرشيف.</i>`;
+        
+        triggerToast('📤 جاري إرسال تقرير PDF لتلغرام...');
+        const result = await sendTelegramPDF(pdfBase64, filename, caption);
+        if (result.success) {
+          triggerToast('✅ تم إرسال تقرير PDF بنجاح لتلغرام');
+        } else {
+          console.error('Failed to send PDF to Telegram:', result.error);
+          triggerToast(`❌ فشل إرسال PDF لتلغرام: ${result.error}`);
+        }
+      }
+
+      return pdf;
+    } catch (err: any) {
+      console.error('Error generating PDF report:', err);
+      triggerToast('❌ خطأ أثناء توليد تقرير PDF');
+      return null;
+    }
+  };
+
   const triggerTelegramNotification = async (
     invoiceCart: CartLine[],
     totalAmount: number,
     isDebt: boolean,
     customer: string
   ) => {
-    if (!telegramConfig.enabled || !telegramConfig.botToken || !telegramConfig.chatId) {
+    if (telegramConfig.enabled === false || !telegramConfig.botToken || !telegramConfig.chatId) {
       console.log('Telegram notification skipped');
       return;
     }
@@ -1018,6 +1335,10 @@ export default function App() {
     if (ok) {
       triggerToast('✅ تم تسجيل الدين اليدوي بنجاح');
       logAudit('sale', `تسجيل دين يدوي على ${name}: ${amtVal} د.ت`);
+      
+      // Trigger Telegram Notification for manual debt
+      triggerTelegramDebtNotification(name, amtVal, note || 'دين يدوي', phone || undefined);
+
       setManualDebt({ name: '', phone: '', amount: '', note: '' });
       loadAllData();
     }
@@ -1453,6 +1774,9 @@ export default function App() {
         await putWithOutbox(`/debts/${newDebt.id}.json`, newDebt);
         logAudit('sale', `فاتورة مبيعات بالدين للحريف ${invoiceCustomerName}: ${grandTotal} د.ت`);
         triggerToast(`🧾 تم حفظ الفاتورة بالكامل بالدين على ${invoiceCustomerName}`);
+        
+        // Trigger Telegram Notification for debt
+        triggerTelegramDebtNotification(invoiceCustomerName, grandTotal, cart.map(c => c.label).join(' + '), invoiceCustomerPhone || undefined);
       } else {
         // Create Sale records for items or OtherIncome records for other services
         for (const line of cart) {
@@ -1651,6 +1975,10 @@ export default function App() {
     }
 
     if (!await promptAndVerifyPin(`⚠️ هل أنت متأكد من مسح ${salesToRemove.length} مبيعة و ${otherToRemove.length} مدخول آخر لآخر ${days} أيام؟`)) return;
+
+    // Generate and save/send PDF report before deleting records
+    triggerToast('📊 جاري توليد تقرير PDF التصفير...');
+    await generateResetReportPDF(salesToRemove, otherToRemove, days);
 
     for (const s of salesToRemove) {
       await fetch(dbUrl(`/sales/${s.id}.json`), { method: 'DELETE' });

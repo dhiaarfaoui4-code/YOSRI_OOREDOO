@@ -6,8 +6,56 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Enable JSON request body parsing
-  app.use(express.json());
+  // Enable JSON request body parsing with size limits for PDF reports
+  app.use(express.json({ limit: "20mb" }));
+
+  // API Route: Send Telegram PDF Document
+  app.post("/api/send-telegram-pdf", async (req, res) => {
+    try {
+      const { botToken: rawBotToken, chatId: rawChatId, pdfBase64, filename = "report.pdf", caption } = req.body;
+
+      if (!rawBotToken || !rawChatId || !pdfBase64) {
+        return res.status(400).json({ error: "Missing required parameters: botToken, chatId, or pdfBase64" });
+      }
+
+      const botToken = String(rawBotToken).replace(/\s+/g, "");
+      const chatId = String(rawChatId).replace(/\s+/g, "");
+
+      const base64Data = pdfBase64.replace(/^data:application\/pdf;base64,/, "");
+      const buffer = Buffer.from(base64Data, "base64");
+      const blob = new Blob([buffer], { type: "application/pdf" });
+
+      const formData = new FormData();
+      formData.append("chat_id", chatId);
+      formData.append("document", blob, filename);
+      if (caption) {
+        formData.append("caption", caption);
+      }
+
+      console.log(`Sending Telegram document ${filename} to chat ${chatId}...`);
+
+      const telegramUrl = `https://api.telegram.org/bot${botToken}/sendDocument`;
+      const response = await fetch(telegramUrl, {
+        method: "POST",
+        body: formData,
+      });
+
+      const responseData = await response.json();
+
+      if (!response.ok) {
+        console.error("Telegram API sendDocument returned error:", responseData);
+        return res.status(response.status).json({
+          success: false,
+          error: responseData.description || "Telegram API failed to send document",
+        });
+      }
+
+      return res.json({ success: true, data: responseData });
+    } catch (error: any) {
+      console.error("Error in send-telegram-pdf API:", error);
+      return res.status(500).json({ success: false, error: error.message || "Internal server error" });
+    }
+  });
 
   // API Route: Send Telegram Notification
   app.post("/api/send-telegram", async (req, res) => {
