@@ -539,6 +539,109 @@ export default function App() {
     }
   };
 
+  const sendTelegramMessageDirectly = async (botToken: string, chatId: string, message: string, parseMode: string) => {
+    try {
+      const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message,
+          parse_mode: parseMode
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        return { success: true, data };
+      }
+      return { success: false, error: data.description || 'فشل إرسال الرسالة المباشرة عبر تلغرام' };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'خطأ في الشبكة أثناء الاتصال المباشر بتلغرام' };
+    }
+  };
+
+  const sendTelegramMessage = async (botToken: string, chatId: string, message: string, parseMode: string = 'HTML') => {
+    const cleanBotToken = (botToken || '').replace(/\s+/g, '');
+    const cleanChatId = (chatId || '').replace(/\s+/g, '');
+    
+    try {
+      const response = await fetch('/api/send-telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          botToken: cleanBotToken,
+          chatId: cleanChatId,
+          message,
+          parseMode
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        return { success: true, data };
+      }
+      
+      if (response.status === 404) {
+        console.warn('Backend proxy not found (404), falling back to direct client fetch to Telegram API...');
+        return await sendTelegramMessageDirectly(cleanBotToken, cleanChatId, message, parseMode);
+      }
+      
+      const errData = await response.json().catch(() => ({}));
+      return { success: false, error: errData.error || `خطأ من الخادم: ${response.status}` };
+    } catch (err: any) {
+      console.warn('Network error calling backend proxy, falling back to direct client fetch to Telegram API...', err);
+      return await sendTelegramMessageDirectly(cleanBotToken, cleanChatId, message, parseMode);
+    }
+  };
+
+  const sendWhatsAppMessageDirectly = async (phone: string, apiKey: string, message: string) => {
+    try {
+      const cleanedPhoneNoPlus = (phone || '').replace('+', '').replace(/\s+/g, '');
+      const url = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(
+        cleanedPhoneNoPlus
+      )}&text=${encodeURIComponent(message)}&apikey=${encodeURIComponent(apiKey)}`;
+      
+      await fetch(url, { mode: 'no-cors' });
+      return { success: true, details: 'تم إرسال الطلب المباشر بنجاح' };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'خطأ أثناء الاتصال المباشر بواتساب' };
+    }
+  };
+
+  const sendWhatsAppMessage = async (phone: string, apiKey: string, message: string) => {
+    const cleanPhone = (phone || '').replace(/\s+/g, '');
+    const cleanApiKey = (apiKey || '').replace(/\s+/g, '');
+    
+    try {
+      const response = await fetch('/api/send-whatsapp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone: cleanPhone,
+          apiKey: cleanApiKey,
+          message
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        return { success: true, data };
+      }
+      
+      if (response.status === 404) {
+        console.warn('Backend proxy not found (404), falling back to direct client fetch to CallMeBot API...');
+        return await sendWhatsAppMessageDirectly(cleanPhone, cleanApiKey, message);
+      }
+      
+      const errData = await response.json().catch(() => ({}));
+      return { success: false, error: errData.error || `خطأ من الخادم: ${response.status}` };
+    } catch (err: any) {
+      console.warn('Network error calling backend proxy, falling back to direct client fetch to CallMeBot API...', err);
+      return await sendWhatsAppMessageDirectly(cleanPhone, cleanApiKey, message);
+    }
+  };
+
   const triggerWhatsAppNotification = async (
     invoiceCart: CartLine[],
     totalAmount: number,
@@ -568,26 +671,11 @@ export default function App() {
       msg += `• ${c.label} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
     });
 
-    try {
-      const response = await fetch('/api/send-whatsapp', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          phone: whatsappConfig.phone,
-          apiKey: whatsappConfig.apiKey,
-          message: msg
-        })
-      });
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        console.error('WhatsApp API error via backend proxy:', errorData);
-      } else {
-        console.log('WhatsApp notification sent successfully via backend proxy');
-      }
-    } catch (err) {
-      console.error('Error sending WhatsApp message via backend proxy', err);
+    const result = await sendWhatsAppMessage(whatsappConfig.phone, whatsappConfig.apiKey, msg);
+    if (result.success) {
+      console.log('WhatsApp notification sent successfully');
+    } else {
+      console.error('WhatsApp notification failed:', result.error);
     }
   };
 
@@ -648,27 +736,11 @@ export default function App() {
       msg += `• ${cleanLabel} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
     });
 
-    try {
-      const response = await fetch('/api/send-telegram', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          botToken: telegramConfig.botToken,
-          chatId: telegramConfig.chatId,
-          message: msg,
-          parseMode: 'HTML'
-        })
-      });
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        console.error('Telegram API error via backend proxy:', errorData);
-      } else {
-        console.log('Telegram notification sent successfully via backend proxy');
-      }
-    } catch (err) {
-      console.error('Error sending Telegram message via backend proxy', err);
+    const result = await sendTelegramMessage(telegramConfig.botToken, telegramConfig.chatId, msg, 'HTML');
+    if (result.success) {
+      console.log('Telegram notification sent successfully');
+    } else {
+      console.error('Telegram notification failed:', result.error);
     }
   };
 
@@ -678,28 +750,19 @@ export default function App() {
       return;
     }
     triggerToast('⚡ جاري إرسال رسالة تجريبية...');
-    try {
-      const msg = `🔔 <b>إشعار تجريبي ناجح!</b>\n\nلقد تم ربط نظام المتجر ببوت التلغرام الخاص بك بنجاح ⚡\nجاهز الآن لتلقي الإشعارات الفورية!`;
-      const res = await fetch('/api/send-telegram', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          botToken: telegramConfig.botToken,
-          chatId: telegramConfig.chatId,
-          message: msg,
-          parseMode: 'HTML'
-        })
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data.success) {
-        triggerToast('✅ تمت عملية الفحص بنجاح! تحقق من حسابك على تلغرام');
-        logAudit('edit', 'إرسال رسالة تجريبية ناجحة عبر تلغرام');
-      } else {
-        const errMsg = data.error || 'رمز غير صحيح أو لم تقم بتفعيل البوت أو لم تبدأ المحادثة';
-        triggerToast(`❌ فشل الاتصال: ${errMsg}`);
+    const msg = `🔔 <b>إشعار تجريبي ناجح!</b>\n\nلقد تم ربط نظام المتجر ببوت التلغرام الخاص بك بنجاح ⚡\nجاهز الآن لتلقي الإشعارات الفورية!`;
+    const result = await sendTelegramMessage(telegramConfig.botToken, telegramConfig.chatId, msg, 'HTML');
+    if (result.success) {
+      triggerToast('✅ تمت عملية الفحص بنجاح! تحقق من حسابك على تلغرام');
+      logAudit('edit', 'إرسال رسالة تجريبية ناجحة عبر تلغرام');
+    } else {
+      let errMsg = result.error || 'رمز غير صحيح أو لم تقم بتفعيل البوت أو لم تبدأ المحادثة';
+      if (errMsg.includes('Unauthorized') || errMsg.includes('401')) {
+        errMsg = 'رمز البوت (Bot Token) غير صحيح، يرجى إعادة نسخه والتأكد منه';
+      } else if (errMsg.includes('chat not found') || errMsg.includes('400')) {
+        errMsg = 'معرف المحادثة (Chat ID) غير صحيح، أو لم تقم ببدء المحادثة مع البوت بالضغط على Start';
       }
-    } catch (err: any) {
-      triggerToast(`❌ خطأ في الشبكة: ${err?.message || err}`);
+      triggerToast(`❌ فشل الاتصال: ${errMsg}`);
     }
   };
 
@@ -709,27 +772,13 @@ export default function App() {
       return;
     }
     triggerToast('⚡ جاري إرسال رسالة تجريبية...');
-    try {
-      const msg = `🔔 إشعار تجريبي ناجح! لقد تم ربط نظام المتجر بالواتساب بنجاح 🟢`;
-      const res = await fetch('/api/send-whatsapp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          phone: whatsappConfig.phone,
-          apiKey: whatsappConfig.apiKey,
-          message: msg
-        })
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data.success) {
-        triggerToast('✅ تمت عملية الفحص بنجاح! تحقق من هاتفك على واتساب');
-        logAudit('edit', 'إرسال رسالة تجريبية ناجحة عبر واتساب');
-      } else {
-        const errMsg = data.error || 'يرجى التأكد من الرقم والرمز السري وتفعيل البوت';
-        triggerToast(`❌ فشل الاتصال: ${errMsg}`);
-      }
-    } catch (err: any) {
-      triggerToast(`❌ خطأ في الشبكة: ${err?.message || err}`);
+    const msg = `🔔 إشعار تجريبي ناجح! لقد تم ربط نظام المتجر بالواتساب بنجاح 🟢`;
+    const result = await sendWhatsAppMessage(whatsappConfig.phone, whatsappConfig.apiKey, msg);
+    if (result.success) {
+      triggerToast('✅ تمت عملية الفحص بنجاح! تحقق من هاتفك على واتساب');
+      logAudit('edit', 'إرسال رسالة تجريبية ناجحة عبر واتساب');
+    } else {
+      triggerToast(`❌ فشل الاتصال: ${result.error || 'يرجى التأكد من الرقم والرمز السري وتفعيل البوت'}`);
     }
   };
 
