@@ -648,34 +648,40 @@ export default function App() {
     isDebt: boolean,
     customer: string
   ) => {
-    if (whatsappConfig.enabled === false || !whatsappConfig.apiKey) {
-      console.log('WhatsApp notification skipped');
-      return;
-    }
+    try {
+      if (whatsappConfig.enabled === false || !whatsappConfig.apiKey) {
+        console.log('WhatsApp notification skipped');
+        return;
+      }
 
-    const formattedDate = new Date().toLocaleString('fr-FR', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
+      const formattedDate = new Date().toLocaleString('fr-FR', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
 
-    let msg = `🛍️ *عملية بيع جديدة!*\n`;
-    msg += `📅 *الوقت:* ${formattedDate}\n`;
-    msg += `💰 *المجموع:* ${totalAmount.toFixed(3)} د.ت\n`;
-    msg += `💳 *النوع:* ${isDebt ? `دين على [${customer}]` : 'نقدي كاش'}\n\n`;
-    msg += `📦 *السلع والخدمات:*\n`;
+      let msg = `🛍️ *عملية بيع جديدة!*\n`;
+      msg += `📅 *الوقت:* ${formattedDate}\n`;
+      msg += `💰 *المجموع:* ${totalAmount.toFixed(3)} د.ت\n`;
+      msg += `💳 *النوع:* ${isDebt ? `دين على [${customer}]` : 'نقدي كاش'}\n\n`;
+      msg += `📦 *السلع والخدمات:*\n`;
 
-    invoiceCart.forEach(c => {
-      msg += `• ${c.label} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
-    });
+      invoiceCart.forEach(c => {
+        msg += `• ${c.label} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
+      });
 
-    const result = await sendWhatsAppMessage(whatsappConfig.phone, whatsappConfig.apiKey, msg);
-    if (result.success) {
-      console.log('WhatsApp notification sent successfully');
-    } else {
-      console.error('WhatsApp notification failed:', result.error);
+      const result = await sendWhatsAppMessage(whatsappConfig.phone, whatsappConfig.apiKey, msg);
+      if (result.success) {
+        console.log('WhatsApp notification sent successfully');
+      } else {
+        console.error('WhatsApp notification failed:', result.error);
+        logAudit('warning', `فشل إرسال إشعار واتساب للمبيعات: ${result.error || 'خطأ غير معروف'}`);
+      }
+    } catch (err: any) {
+      console.error('Error in triggerWhatsAppNotification:', err);
+      logAudit('warning', `خطأ في إرسال إشعار واتساب للمبيعات: ${err?.message || 'خطأ فني'}`);
     }
   };
 
@@ -711,37 +717,43 @@ export default function App() {
     note: string,
     phone?: string
   ) => {
-    if (telegramConfig.enabled === false || !telegramConfig.botToken || !telegramConfig.chatId) {
-      console.log('Telegram debt notification skipped: Telegram is disabled or config is missing');
-      return;
-    }
+    try {
+      if (telegramConfig.enabled === false || !telegramConfig.botToken || !telegramConfig.chatId) {
+        console.log('Telegram debt notification skipped: Telegram is disabled or config is missing');
+        return;
+      }
 
-    const formattedDate = new Date().toLocaleString('fr-FR', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
+      const formattedDate = new Date().toLocaleString('fr-FR', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
 
-    const cleanName = escapeHTML(customerName);
-    const cleanNote = escapeHTML(note);
-    const cleanPhone = phone ? escapeHTML(phone) : '';
+      const cleanName = escapeHTML(customerName);
+      const cleanNote = escapeHTML(note);
+      const cleanPhone = phone ? escapeHTML(phone) : '';
 
-    let msg = `<b>⚠️ تسجيل دين جديد! ⚠️</b>\n\n`;
-    msg += `<b>👤 الحريف:</b> ${cleanName}\n`;
-    if (cleanPhone) {
-      msg += `<b>📞 الهاتف:</b> <code>${cleanPhone}</code>\n`;
-    }
-    msg += `<b>💰 قيمة الدين:</b> <code>${amount.toFixed(3)}</code> د.ت\n`;
-    msg += `<b>📝 ملاحظة:</b> ${cleanNote}\n`;
-    msg += `<b>📅 التاريخ:</b> ${formattedDate}\n`;
+      let msg = `<b>⚠️ تسجيل دين جديد! ⚠️</b>\n\n`;
+      msg += `<b>👤 الحريف:</b> ${cleanName}\n`;
+      if (cleanPhone) {
+        msg += `<b>📞 الهاتف:</b> <code>${cleanPhone}</code>\n`;
+      }
+      msg += `<b>💰 قيمة الدين:</b> <code>${amount.toFixed(3)}</code> د.ت\n`;
+      msg += `<b>📝 ملاحظة:</b> ${cleanNote}\n`;
+      msg += `<b>📅 التاريخ:</b> ${formattedDate}\n`;
 
-    const result = await sendTelegramMessage(telegramConfig.botToken, telegramConfig.chatId, msg, 'HTML');
-    if (result.success) {
-      console.log('Telegram debt notification sent successfully');
-    } else {
-      console.error('Telegram debt notification failed:', result.error);
+      const result = await sendTelegramMessage(telegramConfig.botToken, telegramConfig.chatId, msg, 'HTML');
+      if (result.success) {
+        console.log('Telegram debt notification sent successfully');
+      } else {
+        console.error('Telegram debt notification failed:', result.error);
+        logAudit('warning', `فشل إرسال إشعار تلغرام للديون: ${result.error || 'خطأ غير معروف'}`);
+      }
+    } catch (err: any) {
+      console.error('Error in triggerTelegramDebtNotification:', err);
+      logAudit('warning', `خطأ في إرسال إشعار تلغرام للديون: ${err?.message || 'خطأ فني'}`);
     }
   };
 
@@ -1028,36 +1040,42 @@ export default function App() {
     isDebt: boolean,
     customer: string
   ) => {
-    if (telegramConfig.enabled === false || !telegramConfig.botToken || !telegramConfig.chatId) {
-      console.log('Telegram notification skipped');
-      return;
-    }
+    try {
+      if (telegramConfig.enabled === false || !telegramConfig.botToken || !telegramConfig.chatId) {
+        console.log('Telegram notification skipped');
+        return;
+      }
 
-    const formattedDate = new Date().toLocaleString('fr-FR', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
+      const formattedDate = new Date().toLocaleString('fr-FR', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
 
-    const cleanCustomer = escapeHTML(customer);
-    let msg = `<b>🛍️ عملية بيع جديدة!</b>\n`;
-    msg += `<b>📅 الوقت:</b> ${formattedDate}\n`;
-    msg += `<b>💰 المجموع:</b> ${totalAmount.toFixed(3)} د.ت\n`;
-    msg += `<b>💳 النوع:</b> ${isDebt ? `دين على [${cleanCustomer}]` : 'نقدي كاش'}\n\n`;
-    msg += `<b>📦 السلع والخدمات:</b>\n`;
+      const cleanCustomer = escapeHTML(customer);
+      let msg = `<b>🛍️ عملية بيع جديدة!</b>\n`;
+      msg += `<b>📅 الوقت:</b> ${formattedDate}\n`;
+      msg += `<b>💰 المجموع:</b> ${totalAmount.toFixed(3)} د.ت\n`;
+      msg += `<b>💳 النوع:</b> ${isDebt ? `دين على [${cleanCustomer}]` : 'نقدي كاش'}\n\n`;
+      msg += `<b>📦 السلع والخدمات:</b>\n`;
 
-    invoiceCart.forEach(c => {
-      const cleanLabel = escapeHTML(c.label);
-      msg += `• ${cleanLabel} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
-    });
+      invoiceCart.forEach(c => {
+        const cleanLabel = escapeHTML(c.label);
+        msg += `• ${cleanLabel} × ${c.qty} (${c.unitPrice.toFixed(3)} د.ت)\n`;
+      });
 
-    const result = await sendTelegramMessage(telegramConfig.botToken, telegramConfig.chatId, msg, 'HTML');
-    if (result.success) {
-      console.log('Telegram notification sent successfully');
-    } else {
-      console.error('Telegram notification failed:', result.error);
+      const result = await sendTelegramMessage(telegramConfig.botToken, telegramConfig.chatId, msg, 'HTML');
+      if (result.success) {
+        console.log('Telegram notification sent successfully');
+      } else {
+        console.error('Telegram notification failed:', result.error);
+        logAudit('warning', `فشل إرسال إشعار تلغرام للمبيعات: ${result.error || 'خطأ غير معروف'}`);
+      }
+    } catch (err: any) {
+      console.error('Error in triggerTelegramNotification:', err);
+      logAudit('warning', `خطأ في إرسال إشعار تلغرام للمبيعات: ${err?.message || 'خطأ فني'}`);
     }
   };
 
@@ -1123,14 +1141,12 @@ export default function App() {
     if (!item) return;
     if (!await promptAndVerifyPin(`هل أنت متأكد من مسح السلعة "${item.name}" نهائياً من السيستم؟`)) return;
 
-    try {
-      const res = await fetch(dbUrl(`/items/${itemId}.json`), { method: 'DELETE' });
-      if (res.ok) {
-        triggerToast('✅ تم مسح السلعة بنجاح');
-        logAudit('delete', `حذف سلعة نهائياً: ${item.name}`);
-        loadAllData();
-      }
-    } catch (e) {
+    const ok = await putWithOutbox(`/items/${itemId}.json`, null);
+    if (ok) {
+      triggerToast('✅ تم مسح السلعة بنجاح');
+      logAudit('delete', `حذف سلعة نهائياً: ${item.name}`);
+      loadAllData();
+    } else {
       triggerToast('❌ فشل حذف السلعة، تأكد من الاتصال');
     }
   };
@@ -1200,12 +1216,14 @@ export default function App() {
     if (!card) return;
     if (!await promptAndVerifyPin(`حذف بطاقات الشحن لـ ${card.operator} (${card.value} د.ت)؟`)) return;
 
-    try {
-      await fetch(dbUrl(`/cardStock/${id}.json`), { method: 'DELETE' });
+    const ok = await putWithOutbox(`/cardStock/${id}.json`, null);
+    if (ok) {
       triggerToast('✅ تم حذف كارت الشحن من المخزن');
       logAudit('delete', `حذف ستوك كروت شحن: ${card.operator} فئة ${card.value}`);
       loadAllData();
-    } catch (e) {}
+    } else {
+      triggerToast('❌ فشل الحذف، تأكد من الاتصال');
+    }
   };
 
   // ---- 3. Forfait plans & balance ----
@@ -1268,11 +1286,13 @@ export default function App() {
 
   const handleDeletePlan = async (id: string) => {
     if (!await promptAndVerifyPin('حذف هذه الباقة نهائياً من الكتالوغ؟')) return;
-    try {
-      await fetch(dbUrl(`/forfaitPlans/${id}.json`), { method: 'DELETE' });
+    const ok = await putWithOutbox(`/forfaitPlans/${id}.json`, null);
+    if (ok) {
       triggerToast('✅ تم حذف الباقة');
       loadAllData();
-    } catch (e) {}
+    } else {
+      triggerToast('❌ فشل الحذف، تأكد من الاتصال');
+    }
   };
 
   // ---- 4. Expense Actions ----
@@ -1304,12 +1324,14 @@ export default function App() {
     if (!exp) return;
     if (!await promptAndVerifyPin(`هل ترغب بمسح المصروف "${exp.desc}"؟`)) return;
 
-    try {
-      await fetch(dbUrl(`/expenses/${id}.json`), { method: 'DELETE' });
+    const ok = await putWithOutbox(`/expenses/${id}.json`, null);
+    if (ok) {
       triggerToast('✅ تم مسح المصروف');
       logAudit('delete', `حذف مصروف يومي: ${exp.desc} (${exp.amount} د.ت)`);
       loadAllData();
-    } catch (e) {}
+    } else {
+      triggerToast('❌ فشل الحذف، تأكد من الاتصال');
+    }
   };
 
   // ---- 5. Debt Actions ----
@@ -1439,12 +1461,14 @@ export default function App() {
       }
     }
 
-    try {
-      await fetch(dbUrl(`/debts/${id}.json`), { method: 'DELETE' });
+    const ok = await putWithOutbox(`/debts/${id}.json`, null);
+    if (ok) {
       triggerToast('✅ تم حذف الدين ورجعت كافة السلع والأرصدة للمستودع');
       logAudit('delete', `حذف ملف دين بالكامل: ${debt.customerName}`);
       loadAllData();
-    } catch (e) {}
+    } else {
+      triggerToast('❌ فشل حذف الدين، تأكد من الاتصال');
+    }
   };
 
   // ---- Spare Parts Actions ----
@@ -1500,12 +1524,12 @@ export default function App() {
     if (!sp) return;
     if (!await promptAndVerifyPin(`هل ترغب فعلاً بحذف قطعة الغيار "${sp.name}" من المزوّد ${sp.supplierName}؟`)) return;
 
-    try {
-      await fetch(dbUrl(`/spareParts/${id}.json`), { method: 'DELETE' });
+    const ok = await putWithOutbox(`/spareParts/${id}.json`, null);
+    if (ok) {
       triggerToast('✅ تم حذف قطعة الغيار من القائمة');
       logAudit('delete', `حذف قطعة غيار من المزوّد ${sp.supplierName}: ${sp.name} بتكلفة ${sp.totalCost.toFixed(3)} د.ت`);
       loadAllData();
-    } catch (e) {
+    } else {
       triggerToast('❌ فشل الحذف، الرجاء المحاولة مجدداً');
     }
   };
@@ -1870,17 +1894,13 @@ export default function App() {
               await safeIncrementItemQty(record.itemId, record.qty);
             }
           }
-          try {
-            const res = await fetch(dbUrl(`/sales/${id}.json`), { method: 'DELETE' });
-            if (res.ok) {
-              triggerToast('✅ تم إلغاء البيع وإعادة الستوك');
-              logAudit('delete', `إلغاء بيع سلع: ${record?.itemName || 'غير معروف'}`);
-              loadAllData();
-            } else {
-              triggerToast('❌ فشل حذف العملية من الخادم السحابي');
-            }
-          } catch (e) {
-            triggerToast('❌ فشل الاتصال بالإنترنت لحذف العملية');
+          const ok = await putWithOutbox(`/sales/${id}.json`, null);
+          if (ok) {
+            triggerToast('✅ تم إلغاء البيع وإعادة الستوك');
+            logAudit('delete', `إلغاء بيع سلع: ${record?.itemName || 'غير معروف'}`);
+            loadAllData();
+          } else {
+            triggerToast('❌ فشل حذف العملية من الخادم السحابي');
           }
         } else {
           const record = otherIncome.find(o => o.id === id);
@@ -1898,17 +1918,13 @@ export default function App() {
               await putWithOutbox('/forfaitBalance.json', { ...forfaitBalance, [record.cardOperator]: curBal + record.amount });
             }
           }
-          try {
-            const res = await fetch(dbUrl(`/otherIncome/${id}.json`), { method: 'DELETE' });
-            if (res.ok) {
-              triggerToast('✅ تم إلغاء وحذف المدخول بنجاح');
-              logAudit('delete', `إلغاء مدخول: ${record?.label || 'غير معروف'}`);
-              loadAllData();
-            } else {
-              triggerToast('❌ فشل حذف العملية من الخادم السحابي');
-            }
-          } catch (e) {
-            triggerToast('❌ فشل الاتصال بالإنترنت لحذف العملية');
+          const ok = await putWithOutbox(`/otherIncome/${id}.json`, null);
+          if (ok) {
+            triggerToast('✅ تم إلغاء وحذف المدخول بنجاح');
+            logAudit('delete', `إلغاء مدخول: ${record?.label || 'غير معروف'}`);
+            loadAllData();
+          } else {
+            triggerToast('❌ فشل حذف العملية من الخادم السحابي');
           }
         }
       }
@@ -1956,7 +1972,7 @@ export default function App() {
 
       // Delete other duplicate instances
       for (let x = 1; x < group.length; x++) {
-        await fetch(dbUrl(`/items/${group[x].id}.json`), { method: 'DELETE' });
+        await putWithOutbox(`/items/${group[x].id}.json`, null);
       }
     }
 
@@ -1981,10 +1997,10 @@ export default function App() {
     await generateResetReportPDF(salesToRemove, otherToRemove, days);
 
     for (const s of salesToRemove) {
-      await fetch(dbUrl(`/sales/${s.id}.json`), { method: 'DELETE' });
+      await putWithOutbox(`/sales/${s.id}.json`, null);
     }
     for (const o of otherToRemove) {
-      await fetch(dbUrl(`/otherIncome/${o.id}.json`), { method: 'DELETE' });
+      await putWithOutbox(`/otherIncome/${o.id}.json`, null);
     }
 
     triggerToast('🧹 تم تصفير المدخول للفترة المحددة');
