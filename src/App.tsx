@@ -2582,6 +2582,9 @@ export default function App() {
 
   // ---- 9. Dashboard Financial Calculations ----
   const totalSales = sales.reduce((s, c) => s + c.total, 0);
+  const totalForfaitSales = otherIncome.filter(o => o.category === 'forfait').reduce((s, c) => s + c.amount, 0);
+  const totalRechargeSales = otherIncome.filter(o => o.category === 'recharge').reduce((s, c) => s + c.amount, 0);
+  const totalServicesAndOthers = otherIncome.filter(o => o.category !== 'forfait' && o.category !== 'recharge').reduce((s, c) => s + c.amount, 0);
   const totalOther = otherIncome.reduce((s, c) => s + c.amount, 0);
   const totalExpenses = expenses.reduce((s, c) => s + c.amount, 0);
   const totalOwed = debts.filter(d => d.status === 'open').reduce((s, d) => s + (d.amount - d.paid), 0);
@@ -2979,38 +2982,48 @@ export default function App() {
 
                 {/* Dashboard Stats Panel */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                  <div className="bg-white p-4 rounded-2xl border border-stone-200 shadow-xs text-center">
-                    <span className="text-xs text-stone-400">إجمالي السلع</span>
-                    <div className="font-mono text-xl font-black text-stone-800 mt-1">{items.length}</div>
+                  <div className="bg-emerald-50/80 border border-emerald-200 p-4 rounded-2xl text-center shadow-xs">
+                    <span className="text-xs font-bold text-emerald-800">🛍️ مبيعات السلع والمنتجات</span>
+                    <div className="font-mono text-xl font-black text-emerald-700 mt-1">{totalSales.toFixed(3)} د.ت</div>
                   </div>
-                  <div className="bg-white p-4 rounded-2xl border border-stone-200 shadow-xs text-center">
-                    <span className="text-xs text-stone-400">مخزون القطع</span>
-                    <div className="font-mono text-xl font-black text-stone-800 mt-1">
-                      {items.reduce((s, i) => s + i.qty, 0)}
-                    </div>
+                  <div className="bg-blue-50/80 border border-blue-200 p-4 rounded-2xl text-center shadow-xs">
+                    <span className="text-xs font-bold text-blue-800">🌐 إجمالي مبيعات الفورفي</span>
+                    <div className="font-mono text-xl font-black text-blue-700 mt-1">{totalForfaitSales.toFixed(3)} د.ت</div>
                   </div>
-                  <div className="bg-white p-4 rounded-2xl border border-stone-200 shadow-xs text-center">
-                    <span className="text-xs text-stone-400">مبيعات السلع</span>
-                    <div className="font-mono text-xl font-black text-emerald-700 mt-1">{totalSales.toFixed(2)} د.ت</div>
+                  <div className="bg-amber-50/80 border border-amber-200 p-4 rounded-2xl text-center shadow-xs">
+                    <span className="text-xs font-bold text-amber-800">📶 إجمالي بطاقات الشحن</span>
+                    <div className="font-mono text-xl font-black text-amber-700 mt-1">{totalRechargeSales.toFixed(3)} د.ت</div>
                   </div>
-                  <div className="bg-white p-4 rounded-2xl border border-stone-200 shadow-xs text-center">
-                    <span className="text-xs text-stone-400">شحن وخدمات</span>
-                    <div className="font-mono text-xl font-black text-amber-700 mt-1">{totalOther.toFixed(2)} د.ت</div>
+                  <div className="bg-purple-50/80 border border-purple-200 p-4 rounded-2xl text-center shadow-xs">
+                    <span className="text-xs font-bold text-purple-800">🛠️ بقية الخدمات والعمليات</span>
+                    <div className="font-mono text-xl font-black text-purple-700 mt-1">{totalServicesAndOthers.toFixed(3)} د.ت</div>
                   </div>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  <div className="bg-amber-500/10 border border-amber-300 p-4 rounded-2xl text-center">
-                    <span className="text-xs text-amber-800 font-bold">الربح الصافي الإجمالي</span>
-                    <div className="font-mono text-2xl font-black text-amber-700 mt-1">{netProfit.toFixed(3)} د.ت</div>
+                  <div className="bg-stone-900 text-stone-100 p-4 rounded-2xl text-center border border-stone-800 shadow-md">
+                    <span className="text-xs text-amber-400 font-bold">💰 الكاش المتوقع بالصندوق (الآن)</span>
+                    <div className="font-mono text-2xl font-black text-amber-400 mt-1">{expectedCashInHand.toFixed(3)} د.ت</div>
                   </div>
-                  <div className="bg-rose-500/10 border border-rose-300 p-4 rounded-2xl text-center">
-                    <span className="text-xs text-rose-800 font-bold">المصاريف الكلية</span>
+                  <div className="bg-rose-50/80 border border-rose-200 p-4 rounded-2xl text-center">
+                    <span className="text-xs text-rose-800 font-bold">💸 المصاريف الكلية</span>
                     <div className="font-mono text-2xl font-black text-rose-700 mt-1">{totalExpenses.toFixed(3)} د.ت</div>
                   </div>
-                  <div className="bg-stone-800 text-stone-100 p-4 rounded-2xl text-center col-span-1 md:col-span-1">
-                    <span className="text-xs text-stone-400">الكاش المتوقع بالصندوق</span>
-                    <div className="font-mono text-2xl font-black text-amber-400 mt-1">{expectedCashInHand.toFixed(3)} د.ت</div>
+                  <div className="bg-orange-50/80 border border-orange-200 p-4 rounded-2xl text-center">
+                    <span className="text-xs text-orange-800 font-bold">📑 إجمالي الديون القائمة</span>
+                    <div className="font-mono text-2xl font-black text-orange-700 mt-1">{totalOwed.toFixed(3)} د.ت</div>
+                  </div>
+                </div>
+
+                {/* Quick inventory totals */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="bg-white p-3.5 rounded-2xl border border-stone-200 flex items-center justify-between px-5">
+                    <span className="text-xs text-stone-500 font-bold">📦 أنواع السلع في الستوك:</span>
+                    <span className="font-mono text-base font-black text-stone-800">{items.length} نوع</span>
+                  </div>
+                  <div className="bg-white p-3.5 rounded-2xl border border-stone-200 flex items-center justify-between px-5">
+                    <span className="text-xs text-stone-500 font-bold">🧩 مجموع القطع الإجمالي:</span>
+                    <span className="font-mono text-base font-black text-stone-800">{items.reduce((s, i) => s + i.qty, 0)} قطعة</span>
                   </div>
                 </div>
 
