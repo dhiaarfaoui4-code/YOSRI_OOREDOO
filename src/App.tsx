@@ -20,6 +20,8 @@ import { InvoiceModal, InvoiceData } from './components/InvoiceModal';
 import { BarcodeScannerPopup } from './components/BarcodeScannerPopup';
 import { LoginOverlay } from './components/LoginOverlay';
 import { VisualProductRecognitionModal } from './components/VisualProductRecognitionModal';
+import { DuplicateProductModal } from './components/DuplicateProductModal';
+import { findSimilarProducts, recordLearningDecision, SimilarityResult } from './utils/productSimilarity';
 
 // Helper to normalize Arabic
 function normalizeArabic(str: string): string {
@@ -247,7 +249,7 @@ export default function App() {
   const [managerPin, setManagerPin] = useState<string>(''); // SHA256 string
   const [currentRole, setCurrentRole] = useState<AppRole | null>(null);
   const [costVisible, setCostVisible] = useState<boolean>(false);
-  const [currentTab, setCurrentTab] = useState<AppTab>('stock');
+  const [currentTab, setCurrentTab] = useState<AppTab>('income');
   const [connectionStatus, setConnectionStatus] = useState<'checking' | 'connected' | 'offline'>('checking');
   const [outboxCount, setOutboxCount] = useState<number>(0);
 
@@ -273,6 +275,8 @@ export default function App() {
 
   // ---- Form Inputs ----
   const [newItem, setNewItem] = useState({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory', imageUrl: '' });
+  const [duplicateCandidates, setDuplicateCandidates] = useState<SimilarityResult[]>([]);
+  const [showDuplicateModal, setShowDuplicateModal] = useState<boolean>(false);
   const [cardOperator, setCardOperator] = useState('Ooredoo');
   const [cardValue, setCardValue] = useState('1');
   const [cardQty, setCardQty] = useState('');
@@ -415,12 +419,12 @@ export default function App() {
       const sessionRole = sessionStorage.getItem('yosri_role_v2') as AppRole | null;
       if (sessionRole === 'seller') {
         setCurrentRole('seller');
-        setCurrentTab('stock');
+        setCurrentTab('income');
       } else if (sessionRole === 'manager') {
         const resumed = await resumeManagerSession();
         if (resumed) {
           setCurrentRole('manager');
-          setCurrentTab('dashboard');
+          setCurrentTab('income');
         } else {
           sessionStorage.removeItem('yosri_role_v2');
           setCurrentRole(null);
@@ -571,41 +575,75 @@ export default function App() {
       }
     }
 
-    // Check duplicate name
-    const existing = items.find(i => normalizeArabic(i.name) === normalizeArabic(name));
-    if (existing) {
-      setConfirmDialog({
-        isOpen: true,
-        title: 'السلعة موجودة بالفعل',
-        message: `السلعة "${existing.name}" موجودة بالفعل في المخازن. هل ترغب بزيادة الكمية الجديدة فوق المخزون السابق؟`,
-        confirmText: 'نعم، زيادة الكمية ➕',
-        cancelText: 'إلغاء ❌',
-        isDanger: false,
-        onConfirm: async () => {
-          const mergedBarcodes = Array.from(new Set([
-            ...(existing.barcodes || []),
-            ...barcodeArray
-          ]));
+    // Intelligent duplicate product detection across brand, model, specs, color, barcode, image & tokens
+    const similarMatches = findSimilarProducts(
+      {
+        name,
+        barcode: barcodeArray[0],
+        barcodes: barcodeArray,
+        imageUrl: newItem.imageUrl
+      },
+      items,
+      55 // 55% similarity threshold
+    );
 
-          const updated = {
-            ...existing,
-            qty: existing.qty + qtyVal,
-            buy: buyVal > 0 ? buyVal : existing.buy,
-            sell: sellVal > 0 ? sellVal : existing.sell,
-            barcodes: mergedBarcodes,
-            category: category || existing.category || 'accessory'
-          };
-          const ok = await putWithOutbox(`/items/${existing.id}.json`, updated);
-          if (ok) {
-            triggerToast('✅ تم تحديث كمية السلعة بنجاح');
-            logAudit('edit', `تحديث ستوك سلعة مكررة: ${name} (+${qtyVal})`);
-            loadAllData();
-          }
-          setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory', imageUrl: '' });
-        }
-      });
+    if (similarMatches.length > 0) {
+      setDuplicateCandidates(similarMatches);
+      setShowDuplicateModal(true);
       return;
     }
+
+    // No duplicate found above threshold -> add new item directly
+    await handleCreateNewProductDirectly();
+  };
+
+  const handleConfirmIncreaseQuantity = async (
+    existingItem: Item,
+    addedQty: number,
+    buyVal: number,
+    sellVal: number
+  ) => {
+    const { barcode } = newItem;
+    const barcodeArray = barcode
+      ? barcode.split(',').map(b => b.trim()).filter(b => b.length > 0)
+      : [];
+
+    const mergedBarcodes = Array.from(new Set([
+      ...(existingItem.barcodes || []),
+      ...barcodeArray
+    ]));
+
+    const updated: Item = {
+      ...existingItem,
+      qty: existingItem.qty + addedQty,
+      buy: buyVal > 0 ? buyVal : existingItem.buy,
+      sell: sellVal > 0 ? sellVal : existingItem.sell,
+      barcodes: mergedBarcodes,
+      category: newItem.category || existingItem.category || 'accessory',
+      imageUrl: existingItem.imageUrl || newItem.imageUrl || undefined
+    };
+
+    const ok = await putWithOutbox(`/items/${existingItem.id}.json`, updated);
+    if (ok) {
+      triggerToast(`✅ تم زيادة كمية "${existingItem.name}" بنجاح (+${addedQty} قطعة)`);
+      logAudit('edit', `دمج وتحديث ستوك سلعة مشابهة: ${existingItem.name} (+${addedQty})`);
+      recordLearningDecision(newItem.name, existingItem.name, true);
+      loadAllData();
+    }
+
+    setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory', imageUrl: '' });
+    setShowDuplicateModal(false);
+  };
+
+  const handleCreateNewProductDirectly = async () => {
+    const { name, barcode, buy, sell, qty, category } = newItem;
+    const buyVal = parseFloat(buy) || 0;
+    const sellVal = parseFloat(sell) || 0;
+    const qtyVal = parseInt(qty) || 0;
+
+    const barcodeArray = barcode
+      ? barcode.split(',').map(b => b.trim()).filter(b => b.length > 0)
+      : [];
 
     const item: Item = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -622,9 +660,14 @@ export default function App() {
     if (ok) {
       triggerToast('✅ تم إضافة السلعة الجديدة للمخزن');
       logAudit('edit', `إضافة سلعة جديدة: ${name} (${qtyVal} قطعة)`);
+      if (duplicateCandidates.length > 0) {
+        recordLearningDecision(name, duplicateCandidates[0].item.name, false);
+      }
       setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory', imageUrl: '' });
       loadAllData();
     }
+
+    setShowDuplicateModal(false);
   };
 
   const handleUpdateItemImage = async (itemId: string, imageUrl: string) => {
@@ -2811,6 +2854,39 @@ export default function App() {
       {currentRole && (
         <nav className="bg-white/90 backdrop-blur-md border-b border-stone-200 sticky top-0 z-30 shadow-sm px-4 py-2.5">
           <div className="max-w-4xl mx-auto flex items-center gap-1.5 overflow-x-auto scrollbar-none py-0.5">
+            <button 
+              onClick={() => setCurrentTab('income')}
+              className={`flex-1 min-w-[110px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
+                currentTab === 'income' 
+                  ? 'bg-red-700 text-white shadow-md shadow-red-700/15 scale-[1.03]' 
+                  : 'text-stone-600 hover:bg-stone-100/80 hover:text-stone-800'
+              }`}
+            >
+              <span>💵</span>
+              <span>الكاسة والمبيعات</span>
+            </button>
+            <button 
+              onClick={() => setCurrentTab('stock')}
+              className={`flex-1 min-w-[110px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
+                currentTab === 'stock' 
+                  ? 'bg-red-700 text-white shadow-md shadow-red-700/15 scale-[1.03]' 
+                  : 'text-stone-600 hover:bg-stone-100/80 hover:text-stone-800'
+              }`}
+            >
+              <span>📦</span>
+              <span>المخازن والأسعار</span>
+            </button>
+            <button 
+              onClick={() => setCurrentTab('debts')}
+              className={`flex-1 min-w-[80px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
+                currentTab === 'debts' 
+                  ? 'bg-red-700 text-white shadow-md shadow-red-700/15 scale-[1.03]' 
+                  : 'text-stone-600 hover:bg-stone-100/80 hover:text-stone-800'
+              }`}
+            >
+              <span>💳</span>
+              <span>الديون</span>
+            </button>
             {currentRole === 'manager' && (
               <button 
                 onClick={() => setCurrentTab('dashboard')}
@@ -2824,39 +2900,6 @@ export default function App() {
                 <span>لوحة التحكم</span>
               </button>
             )}
-            <button 
-              onClick={() => setCurrentTab('stock')}
-              className={`flex-1 min-w-[110px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
-                currentTab === 'stock' 
-                  ? 'bg-red-700 text-white shadow-md shadow-red-700/15 scale-[1.03]' 
-                  : 'text-stone-600 hover:bg-stone-100/80 hover:text-stone-800'
-              }`}
-            >
-              <span>📦</span>
-              <span>المخازن والأسعار</span>
-            </button>
-            <button 
-              onClick={() => setCurrentTab('income')}
-              className={`flex-1 min-w-[110px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
-                currentTab === 'income' 
-                  ? 'bg-red-700 text-white shadow-md shadow-red-700/15 scale-[1.03]' 
-                  : 'text-stone-600 hover:bg-stone-100/80 hover:text-stone-800'
-              }`}
-            >
-              <span>💵</span>
-              <span>الكاسة والمبيعات</span>
-            </button>
-            <button 
-              onClick={() => setCurrentTab('debts')}
-              className={`flex-1 min-w-[80px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
-                currentTab === 'debts' 
-                  ? 'bg-red-700 text-white shadow-md shadow-red-700/15 scale-[1.03]' 
-                  : 'text-stone-600 hover:bg-stone-100/80 hover:text-stone-800'
-              }`}
-            >
-              <span>💳</span>
-              <span>الديون</span>
-            </button>
             {currentRole === 'manager' && (
               <>
                 <button 
@@ -5213,14 +5256,14 @@ export default function App() {
           <LoginOverlay 
             onChooseSeller={() => {
               setCurrentRole('seller');
-              setCurrentTab('stock');
+              setCurrentTab('income');
               sessionStorage.setItem('yosri_role_v2', 'seller');
             }}
             onAttemptManagerLogin={async (pin) => {
               const success = await signInManager(pin);
               if (success) {
                 setCurrentRole('manager');
-                setCurrentTab('dashboard');
+                setCurrentTab('income');
                 sessionStorage.setItem('yosri_role_v2', 'manager');
                 logAudit('pin', 'تسجيل دخول المدير العام بنجاح');
                 return true;
@@ -5233,6 +5276,15 @@ export default function App() {
       </main>
 
       {/* Popups & Modals */}
+      <DuplicateProductModal 
+        isOpen={showDuplicateModal}
+        newItemInput={newItem}
+        similarCandidates={duplicateCandidates}
+        onConfirmIncreaseQuantity={handleConfirmIncreaseQuantity}
+        onConfirmCreateNew={handleCreateNewProductDirectly}
+        onClose={() => setShowDuplicateModal(false)}
+      />
+
       <InvoiceModal 
         invoice={lastInvoice} 
         onClose={() => setLastInvoice(null)} 
