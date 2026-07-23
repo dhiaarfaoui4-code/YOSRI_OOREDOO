@@ -238,10 +238,16 @@ export function tokenSetSimilarity(text1: string, text2: string): number {
 
 // Storage key for user learning decisions
 const LEARNING_STORAGE_KEY = 'yosri_learned_product_pairs';
+const VISUAL_OCR_LEARNING_KEY = 'yosri_learned_visual_ocr_pairs';
 
 interface LearningData {
   // key: "normName1||normName2" -> count positive (confirmed same) / negative (rejected)
   [pairKey: string]: { sameCount: number; diffCount: number };
+}
+
+interface VisualOcrLearningData {
+  // key: "normOcrText||itemId" -> count
+  [key: string]: number;
 }
 
 /**
@@ -254,6 +260,178 @@ function getLearningData(): LearningData {
   } catch {
     return {};
   }
+}
+
+function getVisualOcrLearningData(): VisualOcrLearningData {
+  try {
+    const raw = localStorage.getItem(VISUAL_OCR_LEARNING_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Record user correction choice when picking product from visual OCR
+ */
+export function recordVisualOcrCorrection(ocrText: string, itemId: string): void {
+  if (!ocrText || !itemId) return;
+  try {
+    const data = getVisualOcrLearningData();
+    const normOcr = normalizeText(ocrText).slice(0, 50); // first 50 chars normalized
+    if (!normOcr) return;
+    const key = `${normOcr}||${itemId}`;
+    data[key] = (data[key] || 0) + 1;
+    localStorage.setItem(VISUAL_OCR_LEARNING_KEY, JSON.stringify(data));
+  } catch (err) {
+    console.error('Failed to save visual OCR correction', err);
+  }
+}
+
+export function getVisualOcrLearnedModifier(ocrText: string, itemId: string): number {
+  if (!ocrText || !itemId) return 0;
+  try {
+    const data = getVisualOcrLearningData();
+    const normOcr = normalizeText(ocrText).slice(0, 50);
+    if (!normOcr) return 0;
+    const key = `${normOcr}||${itemId}`;
+    const count = data[key] || 0;
+    if (count > 0) {
+      return Math.min(30, count * 15);
+    }
+  } catch {
+    return 0;
+  }
+  return 0;
+}
+
+export interface MultiFactorMatchResult {
+  item: Item;
+  overallScore: number; // 0 - 100
+  reasons: string[];
+  matchedBrand?: string;
+  matchedModel?: string;
+  matchedSpecs?: string;
+  matchedColor?: string;
+}
+
+/**
+ * Multi-Factor Product Matching:
+ * Combines in-browser OCR text from box, visual image features, and DB metadata (Brand, Model, Power/Specs, Color)
+ */
+export function calculateMultiFactorMatch(
+  ocrText: string,
+  visualScore: number, // 0 to 100
+  existingItem: Item
+): MultiFactorMatchResult {
+  const reasons: string[] = [];
+  let score = 0;
+
+  const normOcr = normalizeText(ocrText);
+  const normItemName = normalizeText(existingItem.name);
+
+  // 1. OCR Text Token Set Similarity
+  let ocrTokenSim = 0;
+  if (normOcr.length > 0) {
+    ocrTokenSim = tokenSetSimilarity(ocrText, existingItem.name);
+    const levSim = levenshteinSimilarity(normOcr, normItemName);
+    
+    if (ocrTokenSim > 0.4 || levSim > 0.4) {
+      const subScore = Math.round(Math.max(ocrTokenSim, levSim) * 40);
+      score += subScore;
+      reasons.push(`✓ قراءة النصوص من العلبة (OCR) متطابقة (${Math.round(Math.max(ocrTokenSim, levSim) * 100)}%)`);
+    }
+  }
+
+  // 2. Brand Matching (OCR vs DB Item)
+  const ocrBrand = extractBrand(ocrText);
+  const itemBrand = extractBrand(existingItem.name);
+
+  if (ocrBrand && itemBrand) {
+    if (ocrBrand === itemBrand) {
+      score += 25;
+      reasons.push(`✓ البراند متطابق (${ocrBrand.toUpperCase()})`);
+    } else {
+      score -= 30; // Brand mismatch is a strong negative
+    }
+  } else if (itemBrand && normOcr.includes(itemBrand)) {
+    score += 20;
+    reasons.push(`✓ تم رصد ماركة ${itemBrand.toUpperCase()} في العلبة`);
+  }
+
+  // 3. Model Matching (e.g. A54, S23, Pro Max, Note 10)
+  const ocrModels = extractModelTokens(ocrText);
+  const itemModels = extractModelTokens(existingItem.name);
+
+  if (ocrModels.length > 0 && itemModels.length > 0) {
+    const common = ocrModels.filter(m => itemModels.includes(m));
+    if (common.length > 0) {
+      score += 25;
+      reasons.push(`✓ الموديل متطابق (${common.join(', ')})`);
+    }
+  }
+
+  // 4. Power & Capacity Specs Matching (e.g. 25W, 45W, 128GB, 20000mAh)
+  const ocrSpecs = extractSpecs(ocrText);
+  const itemSpecs = extractSpecs(existingItem.name);
+
+  if (ocrSpecs.length > 0 && itemSpecs.length > 0) {
+    const commonSpecs = ocrSpecs.filter(s => itemSpecs.includes(s));
+    if (commonSpecs.length > 0) {
+      score += 25;
+      reasons.push(`✓ السعة / القدرة متطابقة (${commonSpecs.join(', ').toUpperCase()})`);
+    } else {
+      score -= 25; // Conflict in power/capacity
+    }
+  } else if (itemSpecs.length > 0 && ocrText) {
+    // Check if any spec number appears in ocr text
+    const foundSpec = itemSpecs.find(s => normOcr.includes(s));
+    if (foundSpec) {
+      score += 15;
+      reasons.push(`✓ تم رصد القدرة/المواصفة ${foundSpec.toUpperCase()} في العلبة`);
+    }
+  }
+
+  // 5. Color Matching
+  const ocrColor = extractColor(ocrText);
+  const itemColor = extractColor(existingItem.name);
+
+  if (ocrColor && itemColor) {
+    if (ocrColor === itemColor) {
+      score += 15;
+      reasons.push(`✓ اللون متطابق (${ocrColor})`);
+    } else {
+      score -= 15;
+    }
+  }
+
+  // 6. Visual Image Feature Component
+  if (existingItem.imageUrl && visualScore > 0) {
+    const visualContrib = Math.round(visualScore * 0.35);
+    score += visualContrib;
+    if (visualScore >= 50) {
+      reasons.push(`✓ تطابق الصورة مع مخزن صور السلعة (${visualScore}%)`);
+    }
+  }
+
+  // 7. Local User Correction / Learning Memory Boost
+  const learnedModifier = getVisualOcrLearnedModifier(ocrText, existingItem.id);
+  if (learnedModifier > 0) {
+    score += learnedModifier;
+    reasons.push(`🧠 تعلّم محلي: قمت باختيار هذا المنتج سابقاً للنص المكتوب (+${learnedModifier}%)`);
+  }
+
+  const finalScore = Math.min(100, Math.max(0, Math.round(score)));
+
+  return {
+    item: existingItem,
+    overallScore: finalScore,
+    reasons,
+    matchedBrand: ocrBrand || itemBrand || undefined,
+    matchedModel: itemModels[0] || undefined,
+    matchedSpecs: itemSpecs[0] || undefined,
+    matchedColor: itemColor || undefined
+  };
 }
 
 /**

@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Camera, Upload, X, Check, Sparkles, Plus, Image as ImageIcon, RefreshCw, Zap } from 'lucide-react';
+import { Camera, Upload, X, Check, Sparkles, Plus, Image as ImageIcon, RefreshCw, Zap, Search, AlertCircle, CheckCircle2, Cpu, BrainCircuit, Type } from 'lucide-react';
+import { recognize } from 'tesseract.js';
 import { Item } from '../types';
+import { calculateMultiFactorMatch, recordVisualOcrCorrection, MultiFactorMatchResult } from '../utils/productSimilarity';
 
 interface VisualProductRecognitionModalProps {
   items: Item[];
@@ -11,12 +13,6 @@ interface VisualProductRecognitionModalProps {
   onAddNewItemWithImage?: (name: string, sellPrice: number, buyPrice: number, qty: number, category: string, imageUrl: string) => void;
   targetItemToUpdate?: Item | null;
   mode?: 'sell' | 'stock';
-}
-
-interface MatchResult {
-  item: Item;
-  confidence: number; // 0 to 100
-  reason: string;
 }
 
 interface ImageFeatures {
@@ -67,7 +63,7 @@ function extractFeaturesFromImage(imgElement: HTMLImageElement): ImageFeatures {
       grid.push([gridData[i], gridData[i + 1], gridData[i + 2]]);
     }
 
-    // 4x4 center grid (row 2..5, col 2..5)
+    // 4x4 center grid
     const centerGrid: number[][] = [];
     for (let y = 2; y < 6; y++) {
       for (let x = 2; x < 6; x++) {
@@ -82,18 +78,18 @@ function extractFeaturesFromImage(imgElement: HTMLImageElement): ImageFeatures {
   return { grid: [], centerGrid: [], colorHist };
 }
 
-// Compute smart visual similarity (0 to 100) combining color profile, object focus, and layout
+// Compute smart visual similarity (0 to 100)
 function compareImageFeatures(featA: ImageFeatures, featB: ImageFeatures): number {
   if (!featA || !featB || featA.grid.length === 0 || featB.grid.length === 0) return 0;
 
-  // 1. Color histogram intersection match (weight: 45%)
+  // 1. Color histogram intersection match
   let histDiff = 0;
   for (let i = 0; i < 24; i++) {
     histDiff += Math.abs(featA.colorHist[i] - featB.colorHist[i]);
   }
   const histSim = Math.max(0, 100 * (1 - histDiff / 1.1));
 
-  // 2. Center Grid similarity (weight: 40%)
+  // 2. Center Grid similarity
   let centerDiffSum = 0;
   for (let i = 0; i < featA.centerGrid.length; i++) {
     const dr = featA.centerGrid[i][0] - featB.centerGrid[i][0];
@@ -104,7 +100,7 @@ function compareImageFeatures(featA: ImageFeatures, featB: ImageFeatures): numbe
   const avgCenterDiff = centerDiffSum / featA.centerGrid.length;
   const centerSim = Math.max(0, 100 * (1 - avgCenterDiff / 160));
 
-  // 3. Full 8x8 Grid spatial similarity (weight: 15%)
+  // 3. Full 8x8 Grid spatial similarity
   let gridDiffSum = 0;
   for (let i = 0; i < featA.grid.length; i++) {
     const dr = featA.grid[i][0] - featB.grid[i][0];
@@ -131,11 +127,15 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
 }) => {
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState<boolean>(false);
+  const [scanStepMessage, setScanStepMessage] = useState<string>('');
+  const [extractedOcrText, setExtractedOcrText] = useState<string>('');
   const [useWebcam, setUseWebcam] = useState<boolean>(false);
-  const [matchResults, setMatchResults] = useState<MatchResult[]>([]);
+  const [matchResults, setMatchResults] = useState<MultiFactorMatchResult[]>([]);
   const [selectedItemToBind, setSelectedItemToBind] = useState<string>('');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [autoSelectedProduct, setAutoSelectedProduct] = useState<Item | null>(null);
   
-  // New Item Quick Add State (Stock Mode)
+  // New Item Quick Add State
   const [showQuickAddForm, setShowQuickAddForm] = useState<boolean>(false);
   const [newItemName, setNewItemName] = useState<string>('');
   const [newItemSell, setNewItemSell] = useState<string>('');
@@ -148,7 +148,7 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
   const streamRef = useRef<MediaStream | null>(null);
   const [itemFeatureMap, setItemFeatureMap] = useState<Record<string, ImageFeatures>>({});
 
-  // Helper to load image features asynchronously
+  // Load image features asynchronously
   const loadFeaturesFromUrl = (src: string): Promise<ImageFeatures | null> => {
     return new Promise((resolve) => {
       const img = new Image();
@@ -195,6 +195,9 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
       setCapturedImage(null);
       setMatchResults([]);
       setShowQuickAddForm(false);
+      setExtractedOcrText('');
+      setAutoSelectedProduct(null);
+      setSearchQuery('');
     }
     return () => stopCamera();
   }, [isOpen]);
@@ -228,18 +231,37 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
     reader.readAsDataURL(file);
   };
 
-  // Analyze image using multi-layered visual feature vectors
+  // Run free in-browser Tesseract OCR and multi-factor comparison
   const analyzeCapturedImage = async (dataUrl: string) => {
     setIsScanning(true);
+    setMatchResults([]);
+    setAutoSelectedProduct(null);
+    setScanStepMessage('🔍 1/2: جاري قراءة النصوص على علبة المنتج (Tesseract OCR)...');
+
     try {
+      // 1. In-browser OCR using Tesseract.js (no paid API)
+      let ocrText = '';
+      try {
+        const ocrResult = await recognize(dataUrl, 'eng');
+        ocrText = (ocrResult.data.text || '').replace(/\n+/g, ' ').trim();
+        setExtractedOcrText(ocrText);
+      } catch (ocrErr) {
+        console.warn('OCR processing error (skipping OCR layer):', ocrErr);
+        ocrText = '';
+      }
+
+      setScanStepMessage('⚡ 2/2: تحليل الصورة والبيانات المخزنة (البراند، الموديل، السعة، القدرة، اللون)...');
+
+      // 2. Extract visual features
       const capturedImg = new Image();
       capturedImg.src = dataUrl;
       await new Promise(res => { capturedImg.onload = res; });
       const capturedFeatures = extractFeaturesFromImage(capturedImg);
 
-      const results: MatchResult[] = [];
+      const results: MultiFactorMatchResult[] = [];
 
       for (const item of items) {
+        let visualScore = 0;
         if (item.imageUrl) {
           let feats = itemFeatureMap[item.id];
           if (!feats) {
@@ -249,40 +271,52 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
               setItemFeatureMap(prev => ({ ...prev, [item.id]: loaded }));
             }
           }
-
           if (feats) {
-            const conf = compareImageFeatures(capturedFeatures, feats);
-            results.push({
-              item,
-              confidence: conf,
-              reason: conf >= 60 ? '🔥 تطابق بكتريا/لون ممتاز' : conf >= 35 ? 'تطابق متوسط' : 'تطابق ضعيف'
-            });
-          } else {
-            results.push({ item, confidence: 0, reason: 'تعذر تحليل صورة المنتج' });
+            visualScore = compareImageFeatures(capturedFeatures, feats);
           }
-        } else {
-          results.push({
-            item,
-            confidence: 0,
-            reason: 'لا توجد صورة مسجلة لهذا المنتج'
-          });
+        }
+
+        // Multi-Factor Match combining OCR, Brand, Model, Specs (e.g. 25W), Color, Visual Features & Local Memory
+        const matchRes = calculateMultiFactorMatch(ocrText, visualScore, item);
+        results.push(matchRes);
+      }
+
+      // Sort descending by overall confidence score
+      results.sort((a, b) => b.overallScore - a.overallScore);
+      setMatchResults(results);
+
+      // 3. Threshold Decision Logic
+      if (mode === 'sell' && results.length > 0) {
+        const top = results[0];
+        
+        // Threshold > 95%: Direct Auto-Selection
+        if (top.overallScore > 95) {
+          setAutoSelectedProduct(top.item);
+          recordVisualOcrCorrection(ocrText, top.item.id);
+          
+          // Auto choose and trigger onSelectProduct
+          setTimeout(() => {
+            onSelectProduct(top.item);
+            onClose();
+          }, 800);
         }
       }
 
-      // Sort: highest confidence first, then products with saved images
-      results.sort((a, b) => {
-        if (b.confidence !== a.confidence) return b.confidence - a.confidence;
-        if (a.item.imageUrl && !b.item.imageUrl) return -1;
-        if (!a.item.imageUrl && b.item.imageUrl) return 1;
-        return 0;
-      });
-
-      setMatchResults(results);
     } catch (err) {
-      console.error('Visual analysis error:', err);
+      console.error('Visual OCR analysis error:', err);
     } finally {
       setIsScanning(false);
+      setScanStepMessage('');
     }
+  };
+
+  // Manual seller selection handler (Records decision for local learning)
+  const handleUserSelectProduct = (item: Item) => {
+    if (extractedOcrText) {
+      recordVisualOcrCorrection(extractedOcrText, item.id);
+    }
+    onSelectProduct(item);
+    onClose();
   };
 
   // Bind captured photo to selected product
@@ -300,14 +334,27 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
     }
   };
 
+  // Filtered results for manual search when accuracy < 70% or user types in search
+  const filteredResults = matchResults.filter(r => {
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase().trim();
+    return (
+      r.item.name.toLowerCase().includes(q) ||
+      (r.item.barcode && r.item.barcode.includes(q)) ||
+      (r.item.category && r.item.category.toLowerCase().includes(q))
+    );
+  });
+
+  const topMatchScore = matchResults.length > 0 ? matchResults[0].overallScore : 0;
+
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 z-50 animate-fade-in font-sans" dir="rtl">
-      <div className="bg-white rounded-3xl border border-stone-200 p-4 sm:p-6 w-full max-w-3xl max-h-[92vh] flex flex-col shadow-2xl animate-scale-up text-right">
+    <div className="fixed inset-0 bg-stone-950/80 backdrop-blur-sm flex items-center justify-center p-3 z-50 animate-fade-in font-sans text-stone-900" dir="rtl">
+      <div className="bg-white rounded-3xl border border-stone-200 p-4 sm:p-6 w-full max-w-4xl max-h-[94vh] flex flex-col shadow-2xl animate-scale-up text-right">
         
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-stone-100 pb-3 mb-3">
+        <div className="flex items-center justify-between border-b border-stone-100 pb-3 mb-3 shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="bg-amber-600 text-white p-2.5 rounded-2xl shadow-sm">
               <Camera size={20} />
@@ -317,21 +364,16 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
                 {targetItemToUpdate ? (
                   `📸 التقاط صورة لـ: "${targetItemToUpdate.name}"`
                 ) : mode === 'sell' ? (
-                  '📸 التعرف البصري بالصورة للبيع المباشر'
+                  '📸 التعرف بالصورة وقراءة العلبة (OCR + ذكاء متعدد) للبيع'
                 ) : (
                   '📸 إدارة صور المخزن والتعرف البصري'
                 )}
-                <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-0.5 rounded-full">
-                  محلي 100% بدون نت
+                <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2.5 py-0.5 rounded-full border border-emerald-200">
+                  100% مجاني بدون APIs مدفوعة
                 </span>
               </h3>
-              <p className="text-[11px] text-stone-500">
-                {targetItemToUpdate 
-                  ? 'وجه الكاميرا نحو المنتج والتقط صورة لحفظها مباشرة في بطاقة هذا المنتج بالمخزن'
-                  : mode === 'sell'
-                  ? 'التقط صورة المنتج للكشف عنه بين المنتجات المسجلة وإضافته لسلة البيع'
-                  : 'التقط صورة لإضافة منتج جديد أو ربطها بمنتج موجود بالستوك'
-                }
+              <p className="text-[11px] text-stone-500 font-medium">
+                يقرأ النص المكتوب على العلبة (Tesseract OCR) ويقارن البراند، الموديل، السعة والقدرة W مع صورة المنتج والمخزون
               </p>
             </div>
           </div>
@@ -343,112 +385,130 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
           </button>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 overflow-y-auto pr-1">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 overflow-y-auto pr-1 flex-1">
+          
           {/* Left / Top Side: Camera & Capture Viewfinder */}
-          <div className="space-y-3">
-            <div className="relative bg-stone-900 rounded-2xl overflow-hidden aspect-4/3 flex items-center justify-center border-2 border-stone-800 shadow-inner">
-              {capturedImage ? (
-                <div className="relative w-full h-full">
-                  <img src={capturedImage} alt="Captured product" className="w-full h-full object-cover" />
-                  <button 
-                    onClick={() => {
-                      setCapturedImage(null);
-                      setMatchResults([]);
-                      if (!useWebcam) startCamera();
-                    }}
-                    className="absolute top-2 right-2 bg-black/70 hover:bg-black text-white p-2 rounded-full cursor-pointer transition-all"
-                    title="إعادة الالتقاط"
-                  >
-                    <RefreshCw size={14} />
-                  </button>
-                </div>
-              ) : useWebcam ? (
-                <div className="relative w-full h-full">
-                  <video 
-                    ref={videoRef} 
-                    autoPlay 
-                    playsInline 
-                    className="w-full h-full object-cover"
-                  />
-                  {/* Camera overlay box */}
-                  <div className="absolute inset-8 border-2 border-dashed border-amber-400/80 rounded-xl pointer-events-none flex items-center justify-center">
-                    <span className="text-[10px] bg-black/60 text-amber-300 font-bold px-2 py-1 rounded">
-                      ضع المنتج في منتصف هذا الإطار
-                    </span>
+          <div className="space-y-3 flex flex-col justify-between">
+            <div className="space-y-3">
+              <div className="relative bg-stone-900 rounded-2xl overflow-hidden aspect-4/3 flex items-center justify-center border-2 border-stone-800 shadow-inner">
+                {capturedImage ? (
+                  <div className="relative w-full h-full">
+                    <img src={capturedImage} alt="Captured product" className="w-full h-full object-cover" />
+                    <button 
+                      onClick={() => {
+                        setCapturedImage(null);
+                        setMatchResults([]);
+                        setExtractedOcrText('');
+                        setAutoSelectedProduct(null);
+                        if (!useWebcam) startCamera();
+                      }}
+                      className="absolute top-2 right-2 bg-black/70 hover:bg-black text-white p-2 rounded-full cursor-pointer transition-all shadow-md"
+                      title="إعادة الالتقاط"
+                    >
+                      <RefreshCw size={14} />
+                    </button>
                   </div>
+                ) : useWebcam ? (
+                  <div className="relative w-full h-full">
+                    <video 
+                      ref={videoRef} 
+                      autoPlay 
+                      playsInline 
+                      className="w-full h-full object-cover"
+                    />
+                    {/* Camera overlay box */}
+                    <div className="absolute inset-6 border-2 border-dashed border-amber-400/80 rounded-2xl pointer-events-none flex items-center justify-center">
+                      <span className="text-[10px] bg-black/70 text-amber-300 font-bold px-2.5 py-1 rounded-lg backdrop-blur-xs">
+                        ضع علبة المنتج والنصوص الواضحة داخل هذا الإطار
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="p-6 text-center space-y-2">
+                    <Camera className="mx-auto text-stone-500" size={36} />
+                    <p className="text-xs text-stone-400 font-bold">الكاميرا غير نشطة</p>
+                    <button 
+                      onClick={startCamera}
+                      className="bg-amber-600 hover:bg-amber-700 text-white font-extrabold px-3 py-1.5 rounded-xl text-xs cursor-pointer"
+                    >
+                      تشغيل الكاميرا
+                    </button>
+                  </div>
+                )}
+
+                {isScanning && (
+                  <div className="absolute inset-0 bg-stone-950/85 backdrop-blur-xs flex flex-col items-center justify-center gap-2.5 text-white p-4 text-center">
+                    <Sparkles size={32} className="text-amber-400 animate-spin" />
+                    <span className="text-xs font-black text-amber-200 animate-pulse">{scanStepMessage || 'جاري المعالجة...'}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Actions for Camera / Upload */}
+              <div className="grid grid-cols-2 gap-2">
+                <button 
+                  type="button"
+                  onClick={captureFromVideo}
+                  disabled={!useWebcam || !!capturedImage}
+                  className="bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-black py-2.5 px-3 rounded-xl text-xs flex items-center justify-center gap-2 shadow-sm cursor-pointer transition-all"
+                >
+                  <Camera size={16} /> 📸 التقط الصورة للتحليل
+                </button>
+
+                <button 
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="bg-stone-800 hover:bg-stone-900 text-white font-bold py-2.5 px-3 rounded-xl text-xs flex items-center justify-center gap-2 shadow-sm cursor-pointer transition-all"
+                >
+                  <Upload size={16} /> رفع صورة علبة
+                </button>
+                <input 
+                  ref={fileInputRef} 
+                  type="file" 
+                  accept="image/*" 
+                  onChange={handleFileUpload} 
+                  className="hidden" 
+                />
+              </div>
+
+              {/* Extracted OCR Text Display */}
+              {extractedOcrText && (
+                <div className="bg-stone-900 text-stone-100 p-3 rounded-2xl border border-stone-800 text-xs space-y-1">
+                  <div className="flex items-center gap-1.5 text-amber-400 font-extrabold text-[11px]">
+                    <Type size={14} />
+                    <span>النص المستخرج من العلبة (Tesseract OCR):</span>
+                  </div>
+                  <p className="font-mono text-[11px] text-stone-300 bg-black/40 p-2 rounded-xl leading-relaxed break-words max-h-20 overflow-y-auto dir-ltr text-left">
+                    {extractedOcrText}
+                  </p>
                 </div>
-              ) : (
-                <div className="p-6 text-center space-y-2">
-                  <Camera className="mx-auto text-stone-500" size={36} />
-                  <p className="text-xs text-stone-400 font-bold">الكاميرا غير نشطة</p>
-                  <button 
-                    onClick={startCamera}
-                    className="bg-amber-600 hover:bg-amber-700 text-white font-extrabold px-3 py-1.5 rounded-xl text-xs cursor-pointer"
+              )}
+
+              {/* If updating a specific item */}
+              {capturedImage && targetItemToUpdate && (
+                <div className="bg-amber-50 border-2 border-amber-400 rounded-2xl p-3 text-center space-y-2 animate-scale-up">
+                  <p className="text-xs font-black text-amber-950">
+                    إسناد هذه الصورة للسلعة: <span className="underline decoration-amber-500">{targetItemToUpdate.name}</span>
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (capturedImage && targetItemToUpdate) {
+                        onUpdateItemImage(targetItemToUpdate.id, capturedImage);
+                        onClose();
+                      }
+                    }}
+                    className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold py-2.5 rounded-xl text-xs flex items-center justify-center gap-2 cursor-pointer shadow-md shadow-emerald-700/20"
                   >
-                    تشغيل الكاميرا
+                    <Check size={16} /> 💾 حفظ الصورة للمنتج الآن
                   </button>
                 </div>
               )}
-
-              {isScanning && (
-                <div className="absolute inset-0 bg-stone-900/80 backdrop-blur-xs flex flex-col items-center justify-center gap-2 text-white">
-                  <Sparkles size={28} className="text-amber-400 animate-spin" />
-                  <span className="text-xs font-black">جاري تحليل الألوان والملامح البصرية...</span>
-                </div>
-              )}
             </div>
 
-            {/* Actions for Camera / Upload */}
-            <div className="grid grid-cols-2 gap-2">
-              <button 
-                type="button"
-                onClick={captureFromVideo}
-                disabled={!useWebcam || !!capturedImage}
-                className="bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-black py-2.5 px-3 rounded-xl text-xs flex items-center justify-center gap-2 shadow-sm cursor-pointer transition-all"
-              >
-                <Camera size={16} /> 📸 التقط الصورة
-              </button>
-
-              <button 
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="bg-stone-800 hover:bg-stone-900 text-white font-bold py-2.5 px-3 rounded-xl text-xs flex items-center justify-center gap-2 shadow-sm cursor-pointer transition-all"
-              >
-                <Upload size={16} /> رفع صورة
-              </button>
-              <input 
-                ref={fileInputRef} 
-                type="file" 
-                accept="image/*" 
-                onChange={handleFileUpload} 
-                className="hidden" 
-              />
-            </div>
-
-            {/* If updating a specific item */}
-            {capturedImage && targetItemToUpdate && (
-              <div className="bg-amber-50 border-2 border-amber-400 rounded-2xl p-3 text-center space-y-2 animate-scale-up">
-                <p className="text-xs font-black text-amber-950">
-                  إسناد هذه الصورة للسلعة: <span className="underline decoration-amber-500">{targetItemToUpdate.name}</span>
-                </p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (capturedImage && targetItemToUpdate) {
-                      onUpdateItemImage(targetItemToUpdate.id, capturedImage);
-                      onClose();
-                    }
-                  }}
-                  className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold py-2.5 rounded-xl text-xs flex items-center justify-center gap-2 cursor-pointer shadow-md shadow-emerald-700/20"
-                >
-                  <Check size={16} /> 💾 حفظ الصورة للمنتج الآن
-                </button>
-              </div>
-            )}
-
-            {/* Stock Mode Options: Quick add new product or bind image */}
+            {/* Stock Mode Options */}
             {capturedImage && !targetItemToUpdate && mode === 'stock' && (
-              <div className="bg-stone-50 border border-stone-200 rounded-2xl p-3 space-y-3">
+              <div className="bg-stone-50 border border-stone-200 rounded-2xl p-3 space-y-3 mt-auto">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-black text-stone-900">
                     {showQuickAddForm ? '✨ إضافة سلعة جديدة بالصورة للستوك' : '💾 خيارات الصورة الملتقطة:'}
@@ -575,103 +635,162 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
             )}
           </div>
 
-          {/* Right Side: Visual Match Results */}
+          {/* Right Side: Recognition Results & Decision Thresholds */}
           <div className="flex flex-col h-full space-y-2">
-            <div className="flex items-center justify-between bg-stone-900 text-white px-3 py-2 rounded-xl text-xs font-extrabold">
+            
+            {/* Header */}
+            <div className="flex items-center justify-between bg-stone-900 text-white px-3.5 py-2.5 rounded-xl text-xs font-extrabold">
               <span className="flex items-center gap-1.5">
-                <Zap size={14} className="text-amber-400 fill-amber-400" />
-                المنتجات المتطابقة بصرياً
+                <BrainCircuit size={16} className="text-amber-400" />
+                نتائج مطابقة الذكاء المركّب (OCR + براند + قدرة + لون + صورة)
               </span>
               <span className="text-[10px] text-stone-300 font-mono">
-                {matchResults.length} نتيجه
+                {matchResults.length} منتج
               </span>
             </div>
 
+            {/* Threshold Banner 1: > 95% Auto Selected */}
+            {autoSelectedProduct && (
+              <div className="bg-emerald-500 text-white p-3.5 rounded-2xl shadow-lg border border-emerald-600 flex items-center gap-3 animate-bounce">
+                <CheckCircle2 size={24} className="shrink-0 text-emerald-100" />
+                <div>
+                  <div className="font-extrabold text-xs">⚡ تم اختيار المنتج تلقائياً (مطابقة أكبر من 95%)</div>
+                  <div className="text-[11px] font-black text-emerald-100">{autoSelectedProduct.name} ({autoSelectedProduct.sell.toFixed(3)} د.ت)</div>
+                </div>
+              </div>
+            )}
+
+            {/* Threshold Banner 2: 70% - 95% High Confidence Match */}
+            {!autoSelectedProduct && matchResults.length > 0 && topMatchScore >= 70 && topMatchScore <= 95 && (
+              <div className="bg-emerald-50 border border-emerald-300 p-3 rounded-2xl text-emerald-950 flex items-start gap-2 text-xs">
+                <Sparkles size={18} className="text-emerald-600 shrink-0 mt-0.5" />
+                <div>
+                  <strong className="font-extrabold block">✨ أفضل النتائج المطابقة (نسبة تشابه {topMatchScore}%):</strong>
+                  اختر المنتج المناسب مباشرة من القائمة أدناه للبيع، وسيتم حفظ اختيارك محلياً لرفع الدقة في المرات القادمة.
+                </div>
+              </div>
+            )}
+
+            {/* Threshold Banner 3: < 70% Low Confidence Match Request Manual Search */}
+            {!autoSelectedProduct && matchResults.length > 0 && topMatchScore < 70 && (
+              <div className="bg-amber-50 border border-amber-300 p-3 rounded-2xl text-amber-950 flex items-start gap-2 text-xs">
+                <AlertCircle size={18} className="text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <strong className="font-extrabold block">⚠️ نسبة المطابقة أقل من 70% (أعلى نتيجة: {topMatchScore}%):</strong>
+                  لم نتمكن من الجزم بالمنتج بدقة 100%. يرجى اختيار المنتج يدوياً أدناه أو استخدام خانة البحث السريع.
+                </div>
+              </div>
+            )}
+
+            {/* Manual Search Bar when < 70% or to easily locate products */}
+            {matchResults.length > 0 && (
+              <div className="relative">
+                <Search size={14} className="absolute right-3 top-2.5 text-stone-400" />
+                <input 
+                  type="text"
+                  placeholder="🔍 بحث يدوي عن سلعة بالاسم، البراند أو الباركود..."
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  className="w-full bg-stone-50 border border-stone-200 rounded-xl pr-8 pl-3 py-1.5 text-xs font-bold text-stone-800 focus:outline-none focus:border-amber-500"
+                />
+              </div>
+            )}
+
+            {/* List of Matched Items */}
             <div className="flex-1 overflow-y-auto space-y-2 max-h-80 md:max-h-96 pr-1 divide-y divide-stone-100">
               {matchResults.length === 0 ? (
                 <div className="p-8 text-center text-stone-400 space-y-2">
-                  <ImageIcon size={32} className="mx-auto text-stone-300" />
-                  <p className="text-xs font-bold">التقط صورة بالضغط على "📸 التقط الصورة" لعرض تطابق المنتجات فوراً</p>
+                  <ImageIcon size={36} className="mx-auto text-stone-300" />
+                  <p className="text-xs font-bold">التقط صورة لعلبة المنتج لعرض نتائج المطابقة الشاملة فوراً</p>
                 </div>
               ) : (
-                matchResults.map(({ item, confidence, reason }) => (
-                  <div 
-                    key={item.id}
-                    className={`pt-2 pb-1 flex items-center justify-between gap-2 p-2 rounded-xl transition-all ${
-                      confidence >= 55 ? 'bg-emerald-50/80 border border-emerald-200' : 'hover:bg-stone-50'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 overflow-hidden">
-                      {item.imageUrl ? (
-                        <img src={item.imageUrl} alt={item.name} className="w-10 h-10 object-cover rounded-xl border border-stone-200 shrink-0" />
-                      ) : (
-                        <div className="w-10 h-10 bg-amber-50 text-amber-800 rounded-xl flex items-center justify-center font-bold text-base shrink-0 border border-amber-200">
-                          📦
-                        </div>
-                      )}
-                      <div className="truncate">
-                        <h4 className="font-bold text-xs text-stone-900 truncate">{item.name}</h4>
-                        <div className="text-[10px] text-stone-500 flex items-center gap-1.5 flex-wrap">
-                          <span>المتوفر: <strong className={item.qty > 0 ? 'text-emerald-600' : 'text-red-600'}>{item.qty} قطعة</strong></span>
-                          {confidence > 0 ? (
-                            <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-black ${
-                              confidence >= 60 ? 'bg-emerald-600 text-white shadow-xs' : 'bg-amber-100 text-amber-900'
-                            }`}>
-                              تطابق {confidence}% {confidence >= 60 && '🔥'}
-                            </span>
+                filteredResults.map((matchRes) => {
+                  const { item, overallScore, reasons } = matchRes;
+                  const isTopMatch = overallScore === topMatchScore && overallScore >= 70;
+
+                  return (
+                    <div 
+                      key={item.id}
+                      className={`pt-2.5 pb-2 flex flex-col gap-1.5 p-2.5 rounded-2xl transition-all ${
+                        isTopMatch 
+                          ? 'bg-emerald-50/90 border-2 border-emerald-400 shadow-xs' 
+                          : overallScore >= 55 
+                          ? 'bg-amber-50/60 border border-amber-200' 
+                          : 'hover:bg-stone-50 border border-transparent'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2.5 overflow-hidden">
+                          {item.imageUrl ? (
+                            <img src={item.imageUrl} alt={item.name} className="w-11 h-11 object-cover rounded-xl border border-stone-200 shrink-0" />
                           ) : (
-                            <span className="text-[9px] bg-stone-100 text-stone-500 px-1.5 py-0.5 rounded-full">
-                              لا توجد صورة مسجلة
-                            </span>
+                            <div className="w-11 h-11 bg-amber-100 text-amber-900 rounded-xl flex items-center justify-center font-bold text-base shrink-0 border border-amber-200">
+                              📦
+                            </div>
                           )}
+                          <div className="truncate">
+                            <h4 className="font-extrabold text-xs text-stone-900 truncate">{item.name}</h4>
+                            <div className="text-[10px] text-stone-500 flex items-center gap-2 flex-wrap mt-0.5">
+                              <span>الستوك: <strong className={item.qty > 0 ? 'text-emerald-700 font-black' : 'text-red-600'}>{item.qty} قطعة</strong></span>
+                              <span className={`text-[9px] px-2 py-0.5 rounded-full font-black border ${
+                                overallScore >= 85 
+                                  ? 'bg-emerald-600 text-white border-emerald-700 shadow-xs' 
+                                  : overallScore >= 70 
+                                  ? 'bg-emerald-100 text-emerald-900 border-emerald-300' 
+                                  : overallScore >= 50
+                                  ? 'bg-amber-100 text-amber-900 border-amber-300'
+                                  : 'bg-stone-100 text-stone-600 border-stone-200'
+                              }`}>
+                                مطابقة {overallScore}% {overallScore >= 85 && '🔥'}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="font-mono font-black text-xs text-stone-900">
+                            {item.sell.toFixed(3)} <span className="text-[9px]">د.ت</span>
+                          </span>
+
+                          <button 
+                            type="button"
+                            onClick={() => handleUserSelectProduct(item)}
+                            className={`font-black px-3.5 py-1.5 rounded-xl text-xs flex items-center gap-1 shadow-sm cursor-pointer transition-all ${
+                              overallScore >= 70
+                                ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                : 'bg-amber-600 hover:bg-amber-700 text-white'
+                            }`}
+                          >
+                            <Plus size={12} /> بيع 🛒
+                          </button>
                         </div>
                       </div>
-                    </div>
 
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <span className="font-mono font-black text-xs text-stone-900">
-                        {item.sell.toFixed(3)} <span className="text-[9px]">د.ت</span>
-                      </span>
-
-                      {/* If item has no image and capturedImage exists, show quick bind button */}
-                      {capturedImage && !item.imageUrl && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            onUpdateItemImage(item.id, capturedImage);
-                            loadFeaturesFromUrl(capturedImage).then(feats => {
-                              if (feats) setItemFeatureMap(prev => ({ ...prev, [item.id]: feats }));
-                              analyzeCapturedImage(capturedImage);
-                            });
-                          }}
-                          className="bg-emerald-100 hover:bg-emerald-200 text-emerald-900 font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer"
-                          title="حفظ الصورة الملتقطة لهذا المنتج"
-                        >
-                          📸 ربط
-                        </button>
+                      {/* Reasons pills */}
+                      {reasons && reasons.length > 0 && (
+                        <div className="flex flex-wrap gap-1 pt-1 border-t border-stone-200/60">
+                          {reasons.map((r, rIdx) => (
+                            <span key={rIdx} className="text-[10px] font-bold bg-white text-stone-800 border border-stone-200 px-2 py-0.5 rounded-lg">
+                              {r}
+                            </span>
+                          ))}
+                        </div>
                       )}
-
-                      <button 
-                        type="button"
-                        onClick={() => {
-                          onSelectProduct(item);
-                          onClose();
-                        }}
-                        className="bg-amber-600 hover:bg-amber-700 text-white font-extrabold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 shadow-xs cursor-pointer transition-all"
-                      >
-                        <Plus size={12} /> بيع
-                      </button>
                     </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>
+
         </div>
 
         {/* Footer */}
-        <div className="mt-4 pt-3 border-t border-stone-100 flex items-center justify-between text-xs text-stone-500">
-          <span>خوارزمية بصرية محليّة بتقنية الألوان والملامح للتعرف السريع بدون انترنت ⚡</span>
+        <div className="mt-4 pt-3 border-t border-stone-100 flex items-center justify-between text-xs text-stone-500 shrink-0">
+          <span className="flex items-center gap-1">
+            <Cpu size={14} className="text-amber-600" />
+            Tesseract OCR + تحليل بصري + حِفظ القرارات محلياً بدون خوادم مدفوعة 🧠
+          </span>
           <button 
             type="button"
             onClick={onClose}
