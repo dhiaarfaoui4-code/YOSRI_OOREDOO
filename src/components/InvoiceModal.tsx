@@ -16,6 +16,7 @@ export interface InvoiceData {
   date: string;
   isDebt: boolean;
   customerName?: string;
+  downPayment?: number;
 }
 
 interface InvoiceModalProps {
@@ -154,6 +155,18 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({ invoice, onClose }) 
                 <td colSpan={3} className="p-3 text-right text-stone-700 text-sm">المجموع الكلي</td>
                 <td className="p-3 text-left text-red-700 text-sm font-extrabold">{invoice.grandTotal.toFixed(3)} د.ت</td>
               </tr>
+              {invoice.isDebt && invoice.downPayment !== undefined && invoice.downPayment > 0 && (
+                <>
+                  <tr className="text-stone-700 bg-emerald-50/50 text-xs font-bold">
+                    <td colSpan={3} className="p-2 text-right text-emerald-800">الدفعة الأولى (تسبيق نقدي)</td>
+                    <td className="p-2 text-left text-emerald-800 font-extrabold">{invoice.downPayment.toFixed(3)} د.ت</td>
+                  </tr>
+                  <tr className="text-stone-900 bg-rose-50/50 text-xs font-bold">
+                    <td colSpan={3} className="p-2 text-right text-rose-800">المتبقي بالدين</td>
+                    <td className="p-2 text-left text-rose-800 font-extrabold">{Math.max(0, invoice.grandTotal - invoice.downPayment).toFixed(3)} د.ت</td>
+                  </tr>
+                </>
+              )}
             </tbody>
           </table>
 

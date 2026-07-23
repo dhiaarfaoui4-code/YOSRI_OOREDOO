@@ -7,6 +7,7 @@ export interface Item {
   barcodes?: string[];
   barcode?: string; // Legacy fallback
   category?: string; // e.g., 'phone', 'battery', 'speaker', 'bluetooth', 'accessory'
+  imageUrl?: string; // Product photo for visual recognition
 }
 
 export interface Sale {

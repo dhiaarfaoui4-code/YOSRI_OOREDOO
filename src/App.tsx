@@ -1,9 +1,9 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   TrendingUp, Plus, Minus, Search, Trash2, ShieldAlert, CreditCard, 
   History, Settings as SettingsIcon, Package, Phone, FileText, Check, 
   Camera, ShoppingBag, Radio, Wifi, LogOut, CheckCircle, RefreshCw, X,
-  Pencil
+  Pencil, Image as ImageIcon, Sparkles, Zap, CornerDownLeft
 } from 'lucide-react';
 import { 
   Item, Sale, OtherIncome, Debt, CardStockEntry, Expense, 
@@ -19,6 +19,7 @@ import { SvgChart } from './components/SvgChart';
 import { InvoiceModal, InvoiceData } from './components/InvoiceModal';
 import { BarcodeScannerPopup } from './components/BarcodeScannerPopup';
 import { LoginOverlay } from './components/LoginOverlay';
+import { VisualProductRecognitionModal } from './components/VisualProductRecognitionModal';
 
 // Helper to normalize Arabic
 function normalizeArabic(str: string): string {
@@ -31,6 +32,178 @@ function normalizeArabic(str: string): string {
     .replace(/ئ/g, 'ي')
     .replace(/[\u064B-\u0652]/g, '')
     .trim();
+}
+
+// Smart multilingual search normalization
+function smartNormalize(str: string): string {
+  if (!str) return '';
+  let s = str.toLowerCase();
+  s = s.replace(/[أإآا]/g, 'ا')
+       .replace(/[ىي]/g, 'ي')
+       .replace(/ة/g, 'ه')
+       .replace(/ؤ/g, 'و')
+       .replace(/ئ/g, 'ي')
+       .replace(/ڨ/g, 'ق')
+       .replace(/[\u064B-\u0652]/g, '');
+  
+  s = s.replace(/[-_./\\(),+]/g, ' ');
+  return s.trim();
+}
+
+// Phonetic and multilingual synonym groups (Arabic, French, English, Tech Terms)
+const SYNONYM_GROUPS: string[][] = [
+  ['سامسونج', 'سامسونغ', 'samsung', 'سمسونج', 'غالكسي', 'galaxy'],
+  ['ايفون', 'ايقون', 'iphone', 'آيفون', 'ابل', 'apple'],
+  ['شاحن', 'شارجور', 'شارجر', 'charger', 'chargeur', 'شحن', 'charge'],
+  ['سماعة', 'سماعات', 'ecouteur', 'ecouteurs', 'headphone', 'earphone', 'airpods', 'اربودز'],
+  ['بلوتوث', 'bluetooth', 'bt', 'sans fil'],
+  ['كابل', 'كابلات', 'cable', 'cordon', 'سلك'],
+  ['بطارية', 'بطاريات', 'battery', 'pille', 'باتري'],
+  ['غطاء', 'كاش', 'كفر', 'pochette', 'case', 'cover', 'غلاف'],
+  ['بلندور', 'حماية', 'incassable', 'glass', 'protector', 'شاشة', 'انكماش', 'انكاسابل'],
+  ['سبيكر', 'مكبر', 'baffle', 'speaker', 'hautparleur', 'صوت'],
+  ['واط', 'w', 'watt', 'وات'],
+  ['سعة', 'mah', 'ميليامبير'],
+];
+
+function getExpandedTokens(input: string): string[] {
+  const normalized = smartNormalize(input);
+  const rawTokens = normalized.split(/\s+/).filter(Boolean);
+  const expanded: Set<string> = new Set(rawTokens);
+
+  for (const tok of rawTokens) {
+    for (const group of SYNONYM_GROUPS) {
+      if (group.some(syn => {
+        const normSyn = smartNormalize(syn);
+        return normSyn === tok || normSyn.includes(tok) || tok.includes(normSyn);
+      })) {
+        group.forEach(syn => expanded.add(smartNormalize(syn)));
+      }
+    }
+  }
+
+  return Array.from(expanded);
+}
+
+function levenshteinDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  const matrix: number[][] = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+function calculateSmartMatchScore(
+  item: Item,
+  searchQuery: string,
+  salesCountMap: Record<string, number>
+): number {
+  if (!searchQuery.trim()) {
+    const salesCount = salesCountMap[item.id] || 0;
+    return salesCount * 5 + (item.qty > 0 ? 10 : 0);
+  }
+
+  const queryNorm = smartNormalize(searchQuery);
+  const queryTokens = queryNorm.split(/\s+/).filter(Boolean);
+  const nameNorm = smartNormalize(item.name);
+  const categoryNorm = smartNormalize(item.category || '');
+  const barcodesNorm = (item.barcodes || [item.barcode || '']).map(b => smartNormalize(b));
+
+  let score = 0;
+
+  // 1. Barcode Exact Match
+  if (barcodesNorm.some(b => b && (b === queryNorm || b.includes(queryNorm)))) {
+    score += 1000;
+  }
+
+  // 2. Exact Name Match or Prefix
+  if (nameNorm === queryNorm) {
+    score += 500;
+  } else if (nameNorm.startsWith(queryNorm)) {
+    score += 300;
+  } else if (nameNorm.includes(queryNorm)) {
+    score += 200;
+  }
+
+  // 3. Token-by-token matching
+  let matchedTokensCount = 0;
+
+  for (const qTok of queryTokens) {
+    const expandedQToks = getExpandedTokens(qTok);
+    let tokMatched = false;
+
+    for (const exTok of expandedQToks) {
+      if (nameNorm.includes(exTok)) {
+        score += 80;
+        tokMatched = true;
+        break;
+      }
+      if (categoryNorm.includes(exTok)) {
+        score += 40;
+        tokMatched = true;
+        break;
+      }
+    }
+
+    if (!tokMatched) {
+      const nameWords = nameNorm.split(/\s+/);
+      for (const word of nameWords) {
+        if (word.length >= 3 && qTok.length >= 3) {
+          const dist = levenshteinDistance(qTok, word);
+          if (dist <= 1) {
+            score += 50;
+            tokMatched = true;
+            break;
+          } else if (dist <= 2 && (qTok.length >= 5 || word.length >= 5)) {
+            score += 30;
+            tokMatched = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (tokMatched) {
+      matchedTokensCount++;
+    }
+  }
+
+  if (queryTokens.length > 0 && matchedTokensCount === queryTokens.length) {
+    score += 150;
+  }
+
+  if (matchedTokensCount === 0 && score < 200) {
+    return 0;
+  }
+
+  // Popularity / Sales Velocity boost
+  const salesPopularity = salesCountMap[item.id] || 0;
+  score += Math.min(salesPopularity * 10, 100);
+
+  if (item.qty > 0) {
+    score += 20;
+  } else {
+    score -= 50;
+  }
+
+  return score;
 }
 
 // SHA-256 local helper
@@ -99,7 +272,7 @@ export default function App() {
   });
 
   // ---- Form Inputs ----
-  const [newItem, setNewItem] = useState({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory' });
+  const [newItem, setNewItem] = useState({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory', imageUrl: '' });
   const [cardOperator, setCardOperator] = useState('Ooredoo');
   const [cardValue, setCardValue] = useState('1');
   const [cardQty, setCardQty] = useState('');
@@ -154,8 +327,15 @@ export default function App() {
   const [invoiceCustomerName, setInvoiceCustomerName] = useState('');
   const [invoiceCustomerPhone, setInvoiceCustomerPhone] = useState('');
   const [invoiceIsDebt, setInvoiceIsDebt] = useState(false);
+  const [invoiceInitialPayment, setInvoiceInitialPayment] = useState('');
 
   // Searches
+  const sellSearchInputRef = useRef<HTMLInputElement>(null);
+  const [searchSelectedIndex, setSearchSelectedIndex] = useState<number>(-1);
+  const [showVisualRecognitionModal, setShowVisualRecognitionModal] = useState<boolean>(false);
+  const [visualRecognitionMode, setVisualRecognitionMode] = useState<'sell' | 'stock'>('sell');
+  const [targetItemToCapturePhoto, setTargetItemToCapturePhoto] = useState<Item | null>(null);
+
   const [stockSearch, setStockSearch] = useState('');
   const [selectedStockCategory, setSelectedStockCategory] = useState<string>('all');
   const [selectedSellCategory, setSelectedSellCategory] = useState<string>('all');
@@ -421,7 +601,7 @@ export default function App() {
             logAudit('edit', `تحديث ستوك سلعة مكررة: ${name} (+${qtyVal})`);
             loadAllData();
           }
-          setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory' });
+          setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory', imageUrl: '' });
         }
       });
       return;
@@ -434,15 +614,56 @@ export default function App() {
       sell: sellVal,
       qty: qtyVal,
       barcodes: barcodeArray,
-      category: category || 'accessory'
+      category: category || 'accessory',
+      imageUrl: newItem.imageUrl || undefined
     };
 
     const ok = await putWithOutbox(`/items/${item.id}.json`, item);
     if (ok) {
       triggerToast('✅ تم إضافة السلعة الجديدة للمخزن');
       logAudit('edit', `إضافة سلعة جديدة: ${name} (${qtyVal} قطعة)`);
-      setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory' });
+      setNewItem({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory', imageUrl: '' });
       loadAllData();
+    }
+  };
+
+  const handleUpdateItemImage = async (itemId: string, imageUrl: string) => {
+    const target = items.find(i => i.id === itemId);
+    if (!target) return;
+    const updated: Item = { ...target, imageUrl };
+    setItems(prev => prev.map(i => i.id === itemId ? updated : i));
+    const ok = await putWithOutbox(`/items/${itemId}.json`, updated);
+    if (ok) {
+      triggerToast('✅ تم حفظ صورة المنتج بنجاح');
+      logAudit('edit', `تحديث صورة السلعة: ${target.name}`);
+    }
+  };
+
+  const handleAddNewItemWithImage = async (
+    name: string,
+    sellPrice: number,
+    buyPrice: number,
+    qty: number,
+    category: string,
+    imageUrl: string
+  ) => {
+    const newItemObj: Item = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      name,
+      sell: sellPrice,
+      buy: buyPrice,
+      qty,
+      category,
+      imageUrl,
+      barcodes: []
+    };
+
+    setItems(prev => [newItemObj, ...prev]);
+    const ok = await putWithOutbox(`/items/${newItemObj.id}.json`, newItemObj);
+    if (ok) {
+      triggerToast(`✨ تم تسجيل "${name}" بالستوك وإرفاق صورتها فوراً!`);
+      logAudit('edit', `تسجيل سلعة جديدة بالصورة: ${name}`);
+      handleQuickAddItemToCart(newItemObj, 1);
     }
   };
 
@@ -536,6 +757,38 @@ export default function App() {
       loadAllData();
     } else {
       triggerToast('❌ فشل تعديل الفئة، حاول لاحقاً');
+    }
+  };
+
+  const handleEditItemPrice = async (itemId: string, type: 'sell' | 'buy') => {
+    if (currentRole !== 'manager') {
+      return triggerToast('❌ تعديل أسعار الستوك متاح للمدير فقط');
+    }
+    const item = items.find(i => i.id === itemId);
+    if (!item) return;
+
+    const currentVal = type === 'sell' ? item.sell : item.buy;
+    const label = type === 'sell' ? 'سعر البيع' : 'سعر الشراء (التكلفة)';
+    const input = prompt(`تعديل ${label} للسلعة "${item.name}":`, currentVal.toString());
+    if (input === null) return;
+
+    const val = parseFloat(input);
+    if (isNaN(val) || val < 0) {
+      return triggerToast('❌ سعر غير صالح');
+    }
+
+    const updated = {
+      ...item,
+      [type]: val
+    };
+
+    const ok = await putWithOutbox(`/items/${itemId}.json`, updated);
+    if (ok) {
+      triggerToast(`✅ تم تعديل ${label} بنجاح إلى ${val.toFixed(3)} د.ت`);
+      logAudit('edit', `تعديل ${label} لسلعة "${item.name}": ${currentVal} ➔ ${val}`);
+      loadAllData();
+    } else {
+      triggerToast('❌ فشل حفظ السعر الجديد، حاول لاحقاً');
     }
   };
 
@@ -1681,6 +1934,64 @@ export default function App() {
     setCart(prev => prev.filter(c => c.id !== id));
   };
 
+  const handleEditCartLinePrice = (lineId: string) => {
+    const line = cart.find(c => c.id === lineId);
+    if (!line) return;
+    const input = prompt(`تعديل سعر البيع للسلعة "${line.label}" في الفاتورة:`, line.unitPrice.toString());
+    if (input === null) return;
+
+    const val = parseFloat(input);
+    if (isNaN(val) || val < 0) {
+      return triggerToast('❌ سعر غير صالح');
+    }
+
+    setCart(prev => prev.map(c => {
+      if (c.id === lineId) {
+        return {
+          ...c,
+          unitPrice: val,
+          total: val * c.qty
+        };
+      }
+      return c;
+    }));
+    triggerToast(`⚡ تم تعديل سعر "${line.label}" للفاتورة إلى ${val.toFixed(3)} د.ت`);
+  };
+
+  const handleAdjustCartLineQty = (lineId: string, delta: number) => {
+    const line = cart.find(c => c.id === lineId);
+    if (!line) return;
+
+    const newQty = line.qty + delta;
+    if (newQty <= 0) {
+      handleRemoveFromCart(lineId);
+      return;
+    }
+
+    if (line.type === 'item' && line.itemId) {
+      const item = items.find(i => i.id === line.itemId);
+      if (item) {
+        const otherCartQty = cart
+          .filter(c => c.type === 'item' && c.itemId === line.itemId && c.id !== lineId)
+          .reduce((s, c) => s + c.qty, 0);
+        if (newQty + otherCartQty > item.qty) {
+          return triggerToast(`❌ الستوك المتوفر فقط: ${item.qty - otherCartQty}`);
+        }
+      }
+    }
+
+    setCart(prev => prev.map(c => {
+      if (c.id === lineId) {
+        return {
+          ...c,
+          qty: newQty,
+          total: c.unitPrice * newQty
+        };
+      }
+      return c;
+    }));
+  };
+
   const handleFinalizeInvoice = async (showInvoice: boolean) => {
     if (cart.length === 0) return triggerToast('❌ الفاتورة فارغة لتوة');
     if (invoiceIsDebt && !invoiceCustomerName) return triggerToast('❌ يرجى كتابة اسم الحريف لتسجيل الدين');
@@ -1773,6 +2084,7 @@ export default function App() {
       const grandTotal = cart.reduce((s, c) => s + c.total, 0);
 
       if (invoiceIsDebt) {
+        const initialPayVal = Math.min(grandTotal, Math.max(0, parseFloat(invoiceInitialPayment) || 0));
         const debtLines = cart.map(c => ({
           type: c.type,
           itemId: c.itemId || null,
@@ -1790,17 +2102,33 @@ export default function App() {
           note: cart.map(c => c.label).join(' + '),
           lines: debtLines,
           amount: grandTotal,
-          paid: 0,
+          paid: initialPayVal,
           date,
-          status: 'open'
+          status: (initialPayVal >= grandTotal - 0.001) ? 'paid' : 'open'
         };
 
         await putWithOutbox(`/debts/${newDebt.id}.json`, newDebt);
-        logAudit('sale', `فاتورة مبيعات بالدين للحريف ${invoiceCustomerName}: ${grandTotal} د.ت`);
-        triggerToast(`🧾 تم حفظ الفاتورة بالكامل بالدين على ${invoiceCustomerName}`);
+
+        // Record upfront down payment into income/cash register if present
+        if (initialPayVal > 0) {
+          const downPaymentIncome: OtherIncome = {
+            id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+            category: 'debt_payment',
+            label: `دفعة أولى / تسبيق دين - ${invoiceCustomerName} (${cart.map(c => c.label).join(' + ')})`,
+            amount: initialPayVal,
+            commission: initialPayVal,
+            date,
+            debtId: newDebt.id
+          };
+          await putWithOutbox(`/otherIncome/${downPaymentIncome.id}.json`, downPaymentIncome);
+        }
+
+        const remainingDebt = Math.max(0, grandTotal - initialPayVal);
+        logAudit('sale', `فاتورة مبيعات بالدين للحريف ${invoiceCustomerName}: المجموع ${grandTotal} د.ت (تسبيق: ${initialPayVal} د.ت - المتبقي: ${remainingDebt} د.ت)`);
+        triggerToast(`🧾 تم حفظ الدين على ${invoiceCustomerName} (تسبيق: ${initialPayVal.toFixed(3)} د.ت | متبقي: ${remainingDebt.toFixed(3)} د.ت)`);
         
         // Trigger Telegram Notification for debt
-        triggerTelegramDebtNotification(invoiceCustomerName, grandTotal, cart.map(c => c.label).join(' + '), invoiceCustomerPhone || undefined);
+        triggerTelegramDebtNotification(invoiceCustomerName, remainingDebt, `تسبيق: ${initialPayVal.toFixed(3)} د.ت | ${cart.map(c => c.label).join(' + ')}`, invoiceCustomerPhone || undefined);
       } else {
         // Create Sale records for items or OtherIncome records for other services
         for (const line of cart) {
@@ -1838,6 +2166,7 @@ export default function App() {
 
       if (showInvoice) {
         // Set preview invoice modal
+        const initialPayVal = invoiceIsDebt ? Math.min(grandTotal, Math.max(0, parseFloat(invoiceInitialPayment) || 0)) : 0;
         setLastInvoice({
           id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5).toUpperCase(),
           lines: cart.map(c => ({
@@ -1849,7 +2178,8 @@ export default function App() {
           grandTotal,
           date,
           isDebt: invoiceIsDebt,
-          customerName: invoiceCustomerName || undefined
+          customerName: invoiceCustomerName || undefined,
+          downPayment: initialPayVal
         });
       } else {
         setLastInvoice(null);
@@ -1863,6 +2193,7 @@ export default function App() {
       setCart([]);
       setInvoiceCustomerName('');
       setInvoiceCustomerPhone('');
+      setInvoiceInitialPayment('');
       setInvoiceIsDebt(false);
       loadAllData();
     } catch (err) {
@@ -2158,6 +2489,9 @@ export default function App() {
 
       if (addedCount > 0) {
         triggerToast(`🛍️ تم إضافة ${addedCount} سلعة إلى الفاتورة`);
+        if (document.activeElement instanceof HTMLElement) {
+          document.activeElement.blur();
+        }
       }
       if (missingCount > 0) {
         triggerToast(`❌ لم يتم العثور على ${missingCount} من الأكواد الممسوحة`);
@@ -2251,12 +2585,113 @@ export default function App() {
     const matchesCategory = selectedStockCategory === 'all' || cat === selectedStockCategory;
     return matchesSearch && matchesCategory;
   });
-  const sellFilteredItems = items.filter(i => {
-    const matchesSearch = !sellSearch || normalizeArabic(i.name).includes(normalizeArabic(sellSearch));
-    const cat = i.category || 'accessory';
-    const matchesCategory = selectedSellCategory === 'all' || cat === selectedSellCategory;
-    return matchesSearch && matchesCategory;
-  });
+
+  // Calculate popularity map based on sales history
+  const salesCountMap = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const s of sales) {
+      if (s.itemId) {
+        map[s.itemId] = (map[s.itemId] || 0) + (s.qty || 1);
+      }
+    }
+    return map;
+  }, [sales]);
+
+  // Smart Multilingual & Popularity Ranked Items Search for Selling
+  const smartFilteredSellItems = useMemo(() => {
+    if (!sellSearch.trim() && selectedSellCategory === 'all') {
+      return [...items].sort((a, b) => {
+        const popA = salesCountMap[a.id] || 0;
+        const popB = salesCountMap[b.id] || 0;
+        if (popB !== popA) return popB - popA;
+        return b.qty - a.qty;
+      });
+    }
+
+    return items
+      .map(item => {
+        const cat = item.category || 'accessory';
+        if (selectedSellCategory !== 'all' && cat !== selectedSellCategory) {
+          return { item, score: 0 };
+        }
+        const score = calculateSmartMatchScore(item, sellSearch, salesCountMap);
+        return { item, score };
+      })
+      .filter(x => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map(x => x.item);
+  }, [items, sellSearch, selectedSellCategory, salesCountMap]);
+
+  const sellFilteredItems = smartFilteredSellItems;
+
+  // Quick Add Item to Cart & Auto-focus for continuous keyboard workflow
+  const handleQuickAddItemToCart = (item: Item, customQty?: number) => {
+    if (!item) return;
+    const qtyVal = customQty || parseInt(sellQty) || 1;
+    if (qtyVal <= 0) return triggerToast('❌ كمية غير صالحة');
+
+    const cartAlready = cart.filter(c => c.type === 'item' && c.itemId === item.id).reduce((s, c) => s + c.qty, 0);
+    if (qtyVal + cartAlready > item.qty) {
+      return triggerToast(`❌ المخزن غير كافي! المتوفر حالياً: ${item.qty - cartAlready}`);
+    }
+
+    const override = parseFloat(sellPriceOverride);
+    const finalPrice = !isNaN(override) && override >= 0 ? override : item.sell;
+
+    const newLine: CartLine = {
+      id: Math.random().toString(36).slice(2, 9),
+      type: 'item',
+      itemId: item.id,
+      label: item.name,
+      qty: qtyVal,
+      unitPrice: finalPrice,
+      unitBuy: item.buy,
+      total: qtyVal * finalPrice
+    };
+
+    setCart(prev => [...prev, newLine]);
+    setSellQty('1');
+    setSellPriceOverride('');
+    setSellSearch('');
+    setSearchSelectedIndex(-1);
+    setSellItemId(item.id);
+    triggerToast(`⚡ تم إضافة "${item.name}" للفاتورة`);
+
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  };
+
+  // Keyboard navigation on search input
+  const handleSellSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (smartFilteredSellItems.length === 0) return;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setSearchSelectedIndex(prev => Math.min(prev + 1, smartFilteredSellItems.length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setSearchSelectedIndex(prev => Math.max(prev - 1, 0));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      let targetItem: Item | null = null;
+
+      if (searchSelectedIndex >= 0 && searchSelectedIndex < smartFilteredSellItems.length) {
+        targetItem = smartFilteredSellItems[searchSelectedIndex];
+      } else if (smartFilteredSellItems.length === 1) {
+        targetItem = smartFilteredSellItems[0];
+      } else if (smartFilteredSellItems.length > 0) {
+        targetItem = smartFilteredSellItems[0];
+      }
+
+      if (targetItem) {
+        handleQuickAddItemToCart(targetItem);
+      }
+    } else if (e.key === 'Escape') {
+      setSellSearch('');
+      setSearchSelectedIndex(-1);
+    }
+  };
 
   // Filtered History for Manager
   const filteredHistory = useMemo(() => {
@@ -2679,7 +3114,7 @@ export default function App() {
                           </select>
                         </div>
                         <div>
-                          <label className="block text-[11px] text-stone-500 mb-1">الباركود (اختياري)</label>
+                          <label className="block text-[11px] text-stone-500 mb-1">الباركود والصورة (اختياري)</label>
                           <div className="flex gap-1.5">
                             <input 
                               type="text" 
@@ -2692,10 +3127,37 @@ export default function App() {
                               type="button" 
                               onClick={() => setScannerContext('stock')}
                               className="bg-stone-800 text-white p-2.5 rounded-xl cursor-pointer"
+                              title="مسح باركود بالكاميرا"
                             >
                               <Camera size={16} />
                             </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setVisualRecognitionMode('stock');
+                                setTargetItemToCapturePhoto(null);
+                                setShowVisualRecognitionModal(true);
+                              }}
+                              className="bg-amber-600 hover:bg-amber-700 text-white p-2.5 rounded-xl cursor-pointer font-bold text-xs flex items-center gap-1 shrink-0"
+                              title="التقاط صورة للسلعة الجديدة"
+                            >
+                              <Sparkles size={14} />
+                              <span className="hidden sm:inline">صورة</span>
+                            </button>
                           </div>
+                          {newItem.imageUrl && (
+                            <div className="mt-1 flex items-center gap-2 bg-amber-50 p-1.5 rounded-lg border border-amber-200 text-[10px] text-amber-900 font-bold">
+                              <img src={newItem.imageUrl} alt="" className="w-6 h-6 rounded object-cover" />
+                              <span className="truncate">تم إرفاق صورة للسلعة!</span>
+                              <button
+                                type="button"
+                                onClick={() => setNewItem(prev => ({ ...prev, imageUrl: '' }))}
+                                className="mr-auto text-red-600 hover:text-red-800 font-bold"
+                              >
+                                إزالة
+                              </button>
+                            </div>
+                          )}
                         </div>
                       </div>
 
@@ -3081,39 +3543,96 @@ export default function App() {
                     ) : (
                       filteredItems.map((i, idx) => (
                         <div key={idx} className="p-3 bg-stone-50 hover:bg-stone-100/50 border border-stone-100 rounded-xl transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                          <div className="space-y-0.5">
-                            <div className="flex items-center gap-1.5 flex-wrap">
-                              <h4 className="font-bold text-stone-800 text-xs">{i.name}</h4>
-                              <button 
-                                onClick={() => handleEditItemName(i.id)} 
-                                className="p-1 text-stone-400 hover:text-stone-700 transition-colors cursor-pointer mr-0.5"
-                                title="تعديل اسم السلعة"
+                          <div className="flex items-center gap-2.5 overflow-hidden">
+                            {/* Product Image or Fallback Camera Add Button */}
+                            {i.imageUrl ? (
+                              <div className="relative group shrink-0">
+                                <img 
+                                  src={i.imageUrl} 
+                                  alt={i.name} 
+                                  className="w-11 h-11 rounded-xl object-cover border border-stone-200 shadow-2xs" 
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setVisualRecognitionMode('stock');
+                                    setTargetItemToCapturePhoto(i);
+                                    setShowVisualRecognitionModal(true);
+                                  }}
+                                  className="absolute inset-0 bg-black/50 text-white opacity-0 group-hover:opacity-100 flex items-center justify-center rounded-xl transition-opacity cursor-pointer"
+                                  title="تغيير صورة المنتج"
+                                >
+                                  <Camera size={14} />
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setVisualRecognitionMode('stock');
+                                  setTargetItemToCapturePhoto(i);
+                                  setShowVisualRecognitionModal(true);
+                                }}
+                                className="bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300/80 px-2.5 py-2 rounded-xl text-[10px] font-extrabold flex flex-col items-center justify-center gap-0.5 cursor-pointer shrink-0 transition-all shadow-2xs"
+                                title="التقاط صورة للمنتج وإضافته للنظام البصري"
                               >
-                                <Pencil size={11} />
+                                <Camera size={14} className="text-amber-700" />
+                                <span>📸 أضف صورة</span>
                               </button>
-                              {(() => {
-                                const cat = i.category || 'accessory';
-                                const catInfo = CATEGORY_MAP[cat] || CATEGORY_MAP.accessory;
-                                return (
-                                  <span 
-                                    onClick={() => handleEditItemCategory(i.id)}
-                                    className="text-[10px] px-2 py-0.5 rounded-md font-bold flex items-center gap-1 border border-stone-200 bg-white cursor-pointer hover:bg-stone-100 text-stone-600 transition-colors"
-                                    title="تغيير الفئة"
+                            )}
+
+                            <div className="space-y-0.5 min-w-0">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <h4 className="font-bold text-stone-800 text-xs truncate">{i.name}</h4>
+                                <button 
+                                  onClick={() => handleEditItemName(i.id)} 
+                                  className="p-1 text-stone-400 hover:text-stone-700 transition-colors cursor-pointer mr-0.5"
+                                  title="تعديل اسم السلعة"
+                                >
+                                  <Pencil size={11} />
+                                </button>
+                                {(() => {
+                                  const cat = i.category || 'accessory';
+                                  const catInfo = CATEGORY_MAP[cat] || CATEGORY_MAP.accessory;
+                                  return (
+                                    <span 
+                                      onClick={() => handleEditItemCategory(i.id)}
+                                      className="text-[10px] px-2 py-0.5 rounded-md font-bold flex items-center gap-1 border border-stone-200 bg-white cursor-pointer hover:bg-stone-100 text-stone-600 transition-colors"
+                                      title="تغيير الفئة"
+                                    >
+                                      <span>{catInfo.icon}</span>
+                                      <span>{catInfo.label}</span>
+                                    </span>
+                                  );
+                                })()}
+                              </div>
+                              <div className="text-[10px] text-stone-600 flex flex-wrap items-center gap-1.5 mt-1">
+                                {costVisible && currentRole === 'manager' && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleEditItemPrice(i.id, 'buy')}
+                                    className="font-mono text-rose-800 bg-rose-50 hover:bg-rose-100 border border-rose-200/80 px-2 py-0.5 rounded-md font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                                    title="تعديل سعر الشراء"
                                   >
-                                    <span>{catInfo.icon}</span>
-                                    <span>{catInfo.label}</span>
-                                  </span>
-                                );
-                              })()}
-                            </div>
-                            <div className="text-[10px] text-stone-400 flex flex-wrap gap-x-2">
-                              {costVisible && currentRole === 'manager' && (
-                                <span className="font-mono text-rose-700">شراء: {i.buy.toFixed(3)} د.ت</span>
-                              )}
-                              <span className="font-mono text-emerald-700">بيع: {i.sell.toFixed(3)} د.ت</span>
-                              {i.barcodes && i.barcodes.length > 0 && (
-                                <span className="text-stone-500 font-mono">🏷️ {i.barcodes.join(', ')}</span>
-                              )}
+                                    <span>شراء: {i.buy.toFixed(3)} د.ت</span>
+                                    <Pencil size={9} />
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => currentRole === 'manager' ? handleEditItemPrice(i.id, 'sell') : undefined}
+                                  className={`font-mono text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200/80 px-2 py-0.5 rounded-md font-bold flex items-center gap-1 transition-colors ${
+                                    currentRole === 'manager' ? 'cursor-pointer' : 'cursor-default'
+                                  }`}
+                                  title={currentRole === 'manager' ? 'تعديل سعر البيع' : undefined}
+                                >
+                                  <span>بيع: {i.sell.toFixed(3)} د.ت</span>
+                                  {currentRole === 'manager' && <Pencil size={9} />}
+                                </button>
+                                {i.barcodes && i.barcodes.length > 0 && (
+                                  <span className="text-stone-500 font-mono text-[9px] bg-stone-100 px-1.5 py-0.5 rounded">🏷️ {i.barcodes.join(', ')}</span>
+                                )}
+                              </div>
                             </div>
                           </div>
 
@@ -3200,22 +3719,148 @@ export default function App() {
                       {/* Sub-form: Items */}
                       {incomeType === 'item' && (
                         <div className="space-y-3">
-                          <button 
-                            onClick={() => setScannerContext('sell')}
-                            className="w-full bg-stone-800 hover:bg-stone-900 text-white font-bold py-2 px-3 rounded-xl text-xs flex items-center justify-center gap-2 cursor-pointer"
-                          >
-                            <Camera size={14} /> امسح باركود السلعة بالكاميرا
-                          </button>
+                          <div className="grid grid-cols-2 gap-2">
+                            <button 
+                              type="button"
+                              onClick={() => setScannerContext('sell')}
+                              className="bg-stone-800 hover:bg-stone-900 text-white font-bold py-2.5 px-3 rounded-xl text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-xs transition-all"
+                            >
+                              <Camera size={14} /> مسح الباركود
+                            </button>
+                            <button 
+                              type="button"
+                              onClick={() => {
+                                setVisualRecognitionMode('sell');
+                                setTargetItemToCapturePhoto(null);
+                                setShowVisualRecognitionModal(true);
+                              }}
+                              className="bg-amber-600 hover:bg-amber-700 text-white font-extrabold py-2.5 px-3 rounded-xl text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-xs transition-all"
+                            >
+                              <Sparkles size={14} /> 📸 التعرف بالصورة للبيع
+                            </button>
+                          </div>
                           
+                          {/* Smart Instant Keyboard Search */}
                           <div className="relative">
-                            <input 
-                              type="text" 
-                              placeholder="🔍 فتش بالاسم لتسريع البحث..."
-                              value={sellSearch}
-                              onChange={e => setSellSearch(e.target.value)}
-                              className="w-full bg-white border border-stone-200 pl-10 pr-3 py-2 rounded-xl text-xs text-stone-800"
-                            />
-                            <Search className="absolute left-3 top-3 text-stone-400" size={12} />
+                            <label className="block text-[10px] font-extrabold text-stone-700 mb-1 flex items-center justify-between">
+                              <span>⚡ البحث الفوري والسريع (Smart Search)</span>
+                              <span className="text-[9px] text-red-600 bg-red-50 px-1.5 py-0.5 rounded font-mono">يدعم ⌨️ الأسهم + Enter</span>
+                            </label>
+                            <div className="relative">
+                              <input 
+                                ref={sellSearchInputRef}
+                                type="text" 
+                                placeholder="🔍 اكتب أي جزء من اسم السلعة، الماركة، أو المواصفة..."
+                                value={sellSearch}
+                                onChange={e => {
+                                  setSellSearch(e.target.value);
+                                  setSearchSelectedIndex(-1);
+                                }}
+                                onKeyDown={handleSellSearchKeyDown}
+                                className="w-full bg-white border-2 border-stone-200 focus:border-stone-800 pl-9 pr-8 py-2.5 rounded-xl text-xs text-stone-900 font-bold shadow-xs outline-none transition-all"
+                              />
+                              <Search className="absolute left-3 top-3 text-stone-400" size={14} />
+                              {sellSearch && (
+                                <button 
+                                  type="button"
+                                  onClick={() => { setSellSearch(''); setSearchSelectedIndex(-1); }}
+                                  className="absolute right-3 top-3 text-stone-400 hover:text-stone-700"
+                                >
+                                  <X size={14} />
+                                </button>
+                              )}
+                            </div>
+
+                            {/* Smart Auto-Suggest & Live Search Popup */}
+                            {sellSearch.trim().length > 0 && (
+                              <div className="absolute z-30 right-0 left-0 mt-1 bg-white border-2 border-stone-800 rounded-2xl shadow-2xl overflow-hidden max-h-72 overflow-y-auto divide-y divide-stone-100 animate-scale-up">
+                                <div className="bg-stone-900 px-3 py-1.5 flex items-center justify-between text-[10px] font-bold text-white">
+                                  <span className="flex items-center gap-1">
+                                    <Zap size={12} className="text-amber-400 fill-amber-400" />
+                                    نتائج البحث ذكياً ({smartFilteredSellItems.length})
+                                  </span>
+                                  <span className="text-[9px] text-stone-300 font-mono">
+                                    اضغط ⬆️ ⬇️ و Enter للإضافة الفورية ⚡
+                                  </span>
+                                </div>
+
+                                {smartFilteredSellItems.length === 0 ? (
+                                  <div className="p-4 text-center text-xs text-stone-400">
+                                    لا توجد سلع تطابق بحثك "{sellSearch}"
+                                  </div>
+                                ) : (
+                                  smartFilteredSellItems.slice(0, 10).map((item, idx) => {
+                                    const isSelected = idx === searchSelectedIndex;
+                                    const cat = item.category || 'accessory';
+                                    const catInfo = CATEGORY_MAP[cat] || CATEGORY_MAP.accessory;
+                                    const salesCount = salesCountMap[item.id] || 0;
+
+                                    return (
+                                      <div
+                                        key={item.id}
+                                        onClick={() => handleQuickAddItemToCart(item)}
+                                        onMouseEnter={() => setSearchSelectedIndex(idx)}
+                                        className={`p-2.5 flex items-center justify-between gap-2 cursor-pointer transition-colors ${
+                                          isSelected ? 'bg-red-50 border-r-4 border-red-600' : 'hover:bg-stone-50'
+                                        }`}
+                                      >
+                                        <div className="flex items-center gap-2 overflow-hidden">
+                                          {item.imageUrl ? (
+                                            <img src={item.imageUrl} alt="" className="w-8 h-8 rounded-lg object-cover border border-stone-200 shrink-0" />
+                                          ) : (
+                                            <span className="text-base shrink-0">{catInfo.icon}</span>
+                                          )}
+                                          <div className="truncate">
+                                            <div className="flex items-center gap-1.5 flex-wrap">
+                                              <span className="font-bold text-xs text-stone-900 truncate">{item.name}</span>
+                                              {!item.imageUrl && (
+                                                <button
+                                                  type="button"
+                                                  onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    setVisualRecognitionMode('stock');
+                                                    setTargetItemToCapturePhoto(item);
+                                                    setShowVisualRecognitionModal(true);
+                                                  }}
+                                                  className="text-[9px] bg-amber-100 hover:bg-amber-200 text-amber-900 font-bold px-1.5 py-0.5 rounded flex items-center gap-0.5 transition-colors cursor-pointer"
+                                                  title="التقاط صورة لهذه السلعة"
+                                                >
+                                                  <Camera size={10} /> 📸 أضف صورة
+                                                </button>
+                                              )}
+                                              {salesCount > 2 && (
+                                                <span className="text-[9px] bg-amber-100 text-amber-800 font-extrabold px-1.5 py-0.5 rounded-full flex items-center gap-0.5">
+                                                  🔥 الأكثر بيعاً ({salesCount})
+                                                </span>
+                                              )}
+                                            </div>
+                                            <div className="text-[10px] text-stone-500 flex items-center gap-2 mt-0.5">
+                                              <span>المتوفر: <strong className={item.qty > 0 ? 'text-emerald-600' : 'text-red-600'}>{item.qty} قطعة</strong></span>
+                                              {item.barcode && <span className="font-mono text-[9px] bg-stone-100 px-1 rounded">{item.barcode}</span>}
+                                            </div>
+                                          </div>
+                                        </div>
+
+                                        <div className="flex items-center gap-2 shrink-0">
+                                          <span className="font-mono font-extrabold text-xs text-red-700 bg-red-100/50 px-2 py-1 rounded-lg">
+                                            {item.sell.toFixed(3)} <span className="text-[9px]">د.ت</span>
+                                          </span>
+                                          {isSelected ? (
+                                            <span className="bg-stone-900 text-white font-extrabold text-[10px] px-2 py-1 rounded-lg shadow flex items-center gap-1 animate-pulse">
+                                              <CornerDownLeft size={10} /> Enter
+                                            </span>
+                                          ) : (
+                                            <span className="text-stone-400 hover:text-stone-900 p-1">
+                                              <Plus size={14} />
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+                                    );
+                                  })
+                                )}
+                              </div>
+                            )}
                           </div>
 
                            {/* Category filter tabs for selling */}
@@ -3512,22 +4157,55 @@ export default function App() {
                       </div>
                     ) : (
                       cart.map((line, idx) => (
-                        <div key={idx} className="flex justify-between items-start gap-2 p-2 bg-stone-50 rounded-xl border border-stone-100 text-[11px]">
-                          <div className="flex-1">
-                            <div className="font-bold text-stone-800">{line.label}</div>
-                            <div className="text-[10px] text-stone-400">
-                              {line.qty} × {line.unitPrice.toFixed(3)} د.ت
+                        <div key={idx} className="flex justify-between items-center gap-2 p-2.5 bg-stone-50 hover:bg-stone-100/60 rounded-xl border border-stone-200/80 text-[11px] transition-all">
+                          <div className="flex-1 min-w-0">
+                            <div className="font-bold text-stone-900 truncate">{line.label}</div>
+                            <div className="text-[10px] text-stone-500 flex items-center gap-1.5 mt-0.5">
+                              <span>سعر الوحدة:</span>
+                              <button
+                                type="button"
+                                onClick={() => handleEditCartLinePrice(line.id)}
+                                className="font-mono font-black text-amber-900 bg-amber-100 hover:bg-amber-200 px-1.5 py-0.5 rounded border border-amber-300 flex items-center gap-1 cursor-pointer transition-colors"
+                                title="انقر لتعديل سعر هذا المنتج في الفاتورة الحالية"
+                              >
+                                <span>{line.unitPrice.toFixed(3)} د.ت</span>
+                                <Pencil size={9} className="text-amber-800" />
+                              </button>
                             </div>
                           </div>
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono font-bold text-stone-900">
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            <div className="flex items-center gap-1 bg-white border border-stone-200 rounded-lg p-0.5 shadow-2xs">
+                              <button
+                                type="button"
+                                onClick={() => handleAdjustCartLineQty(line.id, -1)}
+                                className="w-5 h-5 flex items-center justify-center text-stone-700 font-extrabold hover:bg-stone-100 rounded cursor-pointer transition-colors"
+                                title="إنقاص الكمية"
+                              >
+                                -
+                              </button>
+                              <span className="font-mono font-bold px-1 text-xs text-stone-900">{line.qty}</span>
+                              <button
+                                type="button"
+                                onClick={() => handleAdjustCartLineQty(line.id, 1)}
+                                className="w-5 h-5 flex items-center justify-center text-stone-700 font-extrabold hover:bg-stone-100 rounded cursor-pointer transition-colors"
+                                title="زيادة الكمية"
+                              >
+                                +
+                              </button>
+                            </div>
+
+                            <span className="font-mono font-black text-stone-900 text-xs min-w-[55px] text-left">
                               {line.total.toFixed(3)}
                             </span>
+
                             <button 
+                              type="button"
                               onClick={() => handleRemoveFromCart(line.id)}
-                              className="text-stone-400 hover:text-red-700 p-0.5 cursor-pointer"
+                              className="text-stone-400 hover:text-red-700 p-1 rounded hover:bg-red-50 cursor-pointer transition-colors"
+                              title="حذف من الفاتورة"
                             >
-                              <X size={12} />
+                              <X size={14} />
                             </button>
                           </div>
                         </div>
@@ -3566,15 +4244,51 @@ export default function App() {
                             className="w-full bg-white border border-stone-200 px-2 py-1.5 rounded-lg text-xs font-mono"
                           />
                         </div>
-                        <label className="flex items-center gap-2 mt-1.5 cursor-pointer">
+                        <label className="flex items-center gap-2 mt-1.5 cursor-pointer select-none">
                           <input 
                             type="checkbox" 
                             checked={invoiceIsDebt}
-                            onChange={e => setInvoiceIsDebt(e.target.checked)}
-                            className="w-4 h-4 text-red-700 focus:ring-red-700"
+                            onChange={e => {
+                              setInvoiceIsDebt(e.target.checked);
+                              if (!e.target.checked) setInvoiceInitialPayment('');
+                            }}
+                            className="w-4 h-4 text-red-700 focus:ring-red-700 rounded"
                           />
-                          <span className="font-bold text-stone-700 text-[10px]">🧾 بيع بالكامل بالدين (الحريف ما خلصش)</span>
+                          <span className="font-bold text-stone-800 text-[11px]">🧾 تسجيل الفاتورة بالدين (مع إمكانية تسبيق)</span>
                         </label>
+
+                        {invoiceIsDebt && (
+                          <div className="mt-2 pt-2 border-t border-amber-200/80 bg-amber-50/60 p-2 rounded-lg space-y-1.5 animate-fade-in">
+                            <label className="block text-[10px] font-bold text-amber-900">
+                              💵 الدفعة الأولى / التسبيق النقدي (إن وجد)
+                            </label>
+                            <div className="relative">
+                              <input 
+                                type="number" 
+                                step="0.1"
+                                min="0"
+                                max={cart.reduce((s, c) => s + c.total, 0)}
+                                placeholder="0.000 (دفعة نقدية أولى)"
+                                value={invoiceInitialPayment}
+                                onChange={e => setInvoiceInitialPayment(e.target.value)}
+                                className="w-full bg-white border border-amber-300 text-amber-950 font-mono font-bold px-2 py-1.5 rounded-lg text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                              />
+                              <span className="absolute left-2 top-1.5 text-[10px] text-amber-800 font-bold">د.ت</span>
+                            </div>
+
+                            {(() => {
+                              const grandTotal = cart.reduce((s, c) => s + c.total, 0);
+                              const down = Math.min(grandTotal, Math.max(0, parseFloat(invoiceInitialPayment) || 0));
+                              const remaining = Math.max(0, grandTotal - down);
+                              return (
+                                <div className="flex justify-between items-center text-[10px] pt-1 px-1 font-bold">
+                                  <span className="text-emerald-700">مدفوع كاش: {down.toFixed(3)} د.ت</span>
+                                  <span className="text-red-700">المتبقي دين: {remaining.toFixed(3)} د.ت</span>
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        )}
                       </div>
 
                       <div className="grid grid-cols-2 gap-2">
@@ -4522,6 +5236,20 @@ export default function App() {
       <InvoiceModal 
         invoice={lastInvoice} 
         onClose={() => setLastInvoice(null)} 
+      />
+
+      <VisualProductRecognitionModal 
+        items={items}
+        isOpen={showVisualRecognitionModal}
+        onClose={() => {
+          setShowVisualRecognitionModal(false);
+          setTargetItemToCapturePhoto(null);
+        }}
+        onSelectProduct={(item) => handleQuickAddItemToCart(item)}
+        onUpdateItemImage={handleUpdateItemImage}
+        onAddNewItemWithImage={handleAddNewItemWithImage}
+        targetItemToUpdate={targetItemToCapturePhoto}
+        mode={visualRecognitionMode}
       />
 
       {scannerContext && (
