@@ -12,7 +12,7 @@ import {
 import {
   ensureAuth, signInManager, resumeManagerSession, logoutManager,
   fetchJsonWithRetry, safeDecrementItemQty, safeIncrementItemQty,
-  putWithOutbox, flushOutbox, dbUrl, verifyManagerPinViaAuth,
+  putWithOutbox, patchWithOutbox, flushOutbox, dbUrl, verifyManagerPinViaAuth,
   updateManagerPinViaAuth
 } from './firebase';
 import { SvgChart } from './components/SvgChart';
@@ -257,6 +257,8 @@ export default function App() {
   const [lastInvoice, setLastInvoice] = useState<InvoiceData | null>(null);
   const [scannerContext, setScannerContext] = useState<string | null>(null); // 'stock' | 'sell' | 'manage-<itemId>'
   const [toastMsg, setToastMsg] = useState<string>('');
+  const [showForfaitBreakdownModal, setShowForfaitBreakdownModal] = useState<boolean>(false);
+  const [forfaitFilterOp, setForfaitFilterOp] = useState<string>('all');
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     title: string;
@@ -365,6 +367,8 @@ export default function App() {
     customerPhone?: string;
   }
   const [cart, setCart] = useState<CartLine[]>([]);
+  const [editingCartLineId, setEditingCartLineId] = useState<string | null>(null);
+  const [editingCartPriceVal, setEditingCartPriceVal] = useState<string>('');
   const [isFinalizing, setIsFinalizing] = useState(false);
   const [chartDayOffset, setChartDayOffset] = useState<number>(0);
 
@@ -393,7 +397,7 @@ export default function App() {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(entry)
-      });
+      }).catch(() => {});
     } catch (e) {}
   };
 
@@ -474,7 +478,30 @@ export default function App() {
       setSales(parseRawWithKeys<Sale>(salesRaw));
       setOtherIncome(parseRawWithKeys<OtherIncome>(otherIncomeRaw));
       setDebts(parseRawWithKeys<Debt>(debtsRaw));
-      setCardStock(parseRawWithKeys<CardStockEntry>(cardStockRaw));
+
+      const parsedCards = parseRawWithKeys<CardStockEntry>(cardStockRaw);
+      const standardCardPairs = [
+        { operator: 'Ooredoo', value: '1' },
+        { operator: 'Ooredoo', value: '5' },
+        { operator: 'Orange', value: '1' },
+        { operator: 'Orange', value: '5' },
+        { operator: 'Tunisie Telecom', value: '1' },
+        { operator: 'Tunisie Telecom', value: '5' }
+      ];
+      const mergedCards = [...parsedCards];
+      for (const std of standardCardPairs) {
+        const exists = mergedCards.some(c => c.operator === std.operator && String(c.value) === String(std.value));
+        if (!exists) {
+          mergedCards.push({
+            id: `std_card_${std.operator.replace(/\s+/g, '')}_${std.value}`,
+            kind: 'recharge',
+            operator: std.operator,
+            value: std.value,
+            qty: 0
+          });
+        }
+      }
+      setCardStock(mergedCards);
       setCashRegister(typeof cashRegisterRaw === 'number' ? cashRegisterRaw : 0);
       setExpenses(parseRawWithKeys<Expense>(expensesRaw));
       setSpareParts(parseRawWithKeys<SparePart>(sparePartsRaw));
@@ -505,7 +532,7 @@ export default function App() {
         setForfaitPlans(defaultPlans);
         // Save back
         defaultPlans.forEach(p => {
-          fetch(dbUrl(`/forfaitPlans/${p.id}.json`), { method: 'PUT', body: JSON.stringify(p) });
+          fetch(dbUrl(`/forfaitPlans/${p.id}.json`), { method: 'PUT', body: JSON.stringify(p) }).catch(() => {});
         });
       } else {
         setForfaitPlans(parseRawWithKeys<ForfaitPlan>(plansRaw));
@@ -1453,9 +1480,10 @@ export default function App() {
     const qtyVal = parseInt(cardQty) || 0;
     if (qtyVal <= 0) return triggerToast('❌ الرجاء إدخال كمية صحيحة');
 
-    const existing = cardStock.find(c => c.operator === cardOperator && c.value === cardValue);
+    const existing = cardStock.find(c => c.operator === cardOperator && String(c.value) === String(cardValue));
     if (existing) {
       const updated = { ...existing, qty: existing.qty + qtyVal };
+      setCardStock(prev => prev.map(c => c.id === existing.id ? updated : c));
       await putWithOutbox(`/cardStock/${existing.id}.json`, updated);
     } else {
       const newCard: CardStockEntry = {
@@ -1465,12 +1493,12 @@ export default function App() {
         value: cardValue,
         qty: qtyVal
       };
+      setCardStock(prev => [...prev, newCard]);
       await putWithOutbox(`/cardStock/${newCard.id}.json`, newCard);
     }
     triggerToast('✅ تم تحديث مخزن بطاقات الشحن');
     logAudit('edit', `إضافة بطاقات شحن لـ ${cardOperator} فئة ${cardValue}: +${qtyVal}`);
     setCardQty('');
-    loadAllData();
   };
 
   const handleEditCardQty = async (id: string) => {
@@ -1482,11 +1510,11 @@ export default function App() {
     if (isNaN(val) || val < 0) return triggerToast('❌ رقم غير صالح');
 
     const updated = { ...card, qty: val };
+    setCardStock(prev => prev.map(c => c.id === id ? updated : c));
     const ok = await putWithOutbox(`/cardStock/${card.id}.json`, updated);
     if (ok) {
       triggerToast('✅ تم تحديث كمية البطاقات');
       logAudit('edit', `تعديل يدوي لستوك بطاقات ${card.operator} فئة ${card.value}: ${card.qty} ← ${val}`);
-      loadAllData();
     }
   };
 
@@ -1497,11 +1525,11 @@ export default function App() {
 
     const newVal = card.qty + delta;
     const updated = { ...card, qty: newVal };
+    setCardStock(prev => prev.map(c => c.id === id ? updated : c));
     const ok = await putWithOutbox(`/cardStock/${card.id}.json`, updated);
     if (ok) {
       triggerToast('✅ تم تحديث كمية البطاقات');
       logAudit('edit', `تعديل سريع لستوك بطاقات ${card.operator} فئة ${card.value}: ${card.qty} ← ${newVal} (${delta > 0 ? '+' : ''}${delta})`);
-      loadAllData();
     } else {
       triggerToast('❌ فشل تعديل الكمية، الرجاء المحاولة مجدداً');
     }
@@ -1512,11 +1540,11 @@ export default function App() {
     if (!card) return;
     if (!await promptAndVerifyPin(`حذف بطاقات الشحن لـ ${card.operator} (${card.value} د.ت)؟`)) return;
 
+    setCardStock(prev => prev.filter(c => c.id !== id));
     const ok = await putWithOutbox(`/cardStock/${id}.json`, null);
     if (ok) {
       triggerToast('✅ تم حذف كارت الشحن من المخزن');
       logAudit('delete', `حذف ستوك كروت شحن: ${card.operator} فئة ${card.value}`);
-      loadAllData();
     } else {
       triggerToast('❌ فشل الحذف، تأكد من الاتصال');
     }
@@ -1676,15 +1704,28 @@ export default function App() {
       if (payAmount > remaining) payAmount = remaining;
     }
 
-    // Fix 3: Linking payment record to debt details
+    // Calculate accurate profit portion for the payment based on debt line buy costs
+    let totalDebtCost = 0;
+    if (debt.lines) {
+      for (const line of debt.lines) {
+        if (line.type === 'item' && line.itemId) {
+          const it = items.find(i => i.id === line.itemId);
+          totalDebtCost += (it?.buy || 0) * (line.qty || 1);
+        }
+      }
+    }
+    const totalDebtAmount = debt.amount || 1;
+    const profitMarginRatio = Math.max(0, (totalDebtAmount - totalDebtCost) / totalDebtAmount);
+    const profitCommission = payAmount * profitMarginRatio;
+
     const incomeEntry: OtherIncome = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       category: 'debt_payment',
-      label: `خلاص دين - ${debt.customerName} (${debt.note})`,
+      label: `خلاص دين - ${debt.customerName} (${debt.note || ''})`,
       amount: payAmount,
-      commission: payAmount,
+      commission: profitCommission,
       date: new Date().toISOString(),
-      debtId: debt.id // Fixed unlinked payment issue
+      debtId: debt.id
     };
 
     const updatedDebt: Debt = {
@@ -1692,6 +1733,10 @@ export default function App() {
       paid: debt.paid + payAmount,
       status: (debt.paid + payAmount >= debt.amount - 0.001) ? 'paid' : 'open'
     };
+
+    // Optimistic local state update
+    setDebts(prev => prev.map(d => d.id === debt.id ? updatedDebt : d));
+    setOtherIncome(prev => [incomeEntry, ...prev]);
 
     const ok1 = await putWithOutbox(`/debts/${debt.id}.json`, updatedDebt);
     const ok2 = await putWithOutbox(`/otherIncome/${incomeEntry.id}.json`, incomeEntry);
@@ -1708,36 +1753,44 @@ export default function App() {
     if (!debt) return;
     if (!await promptAndVerifyPin(`هل ترغب بحذف ملف دين الحريف "${debt.customerName}" نهائياً؟`)) return;
 
-    // Rollback items, recharge cards, and forfait balances to inventory/balances
-    if (debt.lines) {
-      const itemIncrements: Record<string, number> = {};
-      const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
-      const forfaitIncrements: Record<string, number> = {};
+    // 1. Rollback items, recharge cards, and forfait balances to inventory/balances
+    const itemIncrements: Record<string, number> = {};
+    const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
+    const forfaitIncrements: Record<string, number> = {};
 
+    if (debt.lines) {
       for (const line of debt.lines) {
         if (line.type === 'item' && line.itemId) {
           itemIncrements[line.itemId] = (itemIncrements[line.itemId] || 0) + line.qty;
         }
         if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
-          const card = cardStock.find(c => c.operator === line.cardOperator && c.value === line.cardValue);
-          if (card) {
-            if (!cardIncrements[card.id]) {
-              cardIncrements[card.id] = { entry: card, totalQty: 0 };
-            }
-            cardIncrements[card.id].totalQty += line.qty;
+          let card = cardStock.find(c => c.operator === line.cardOperator && String(c.value) === String(line.cardValue));
+          if (!card) {
+            card = {
+              id: `std_card_${line.cardOperator.replace(/\s+/g, '')}_${line.cardValue}`,
+              kind: 'recharge',
+              operator: line.cardOperator,
+              value: String(line.cardValue),
+              qty: 0
+            };
           }
+          if (!cardIncrements[card.id]) {
+            cardIncrements[card.id] = { entry: card, totalQty: 0 };
+          }
+          cardIncrements[card.id].totalQty += line.qty;
         }
         if (line.type === 'forfait' && line.cardOperator) {
           forfaitIncrements[line.cardOperator] = (forfaitIncrements[line.cardOperator] || 0) + (line.total || 0);
         }
       }
 
-      // 1. Rollback items
+      // Rollback items
       for (const itemId of Object.keys(itemIncrements)) {
-        await safeIncrementItemQty(itemId, itemIncrements[itemId]);
+        const localItem = items.find(i => i.id === itemId);
+        await safeIncrementItemQty(itemId, itemIncrements[itemId], localItem?.qty);
       }
 
-      // 2. Rollback recharge cards
+      // Rollback recharge cards
       for (const cardId of Object.keys(cardIncrements)) {
         const { entry, totalQty } = cardIncrements[cardId];
         await putWithOutbox(`/cardStock/${cardId}.json`, {
@@ -1746,7 +1799,7 @@ export default function App() {
         });
       }
 
-      // 3. Rollback forfait balance
+      // Rollback forfait balance
       if (Object.keys(forfaitIncrements).length > 0) {
         const updatedBalance = { ...forfaitBalance };
         for (const op of Object.keys(forfaitIncrements)) {
@@ -1757,7 +1810,43 @@ export default function App() {
       }
     }
 
+    // 2. Clean up any associated down payments or debt repayments for this debt
+    const relatedIncomes = otherIncome.filter(o => o.debtId === id);
+    for (const inc of relatedIncomes) {
+      await putWithOutbox(`/otherIncome/${inc.id}.json`, null);
+    }
+
+    // 3. Delete debt record
     const ok = await putWithOutbox(`/debts/${id}.json`, null);
+
+    // Optimistically update React state immediately
+    setDebts(prev => prev.filter(d => d.id !== id));
+    setOtherIncome(prev => prev.filter(o => o.debtId !== id));
+
+    if (Object.keys(itemIncrements).length > 0) {
+      setItems(prevItems => prevItems.map(item => {
+        const inc = itemIncrements[item.id];
+        return inc ? { ...item, qty: item.qty + inc } : item;
+      }));
+    }
+
+    if (Object.keys(cardIncrements).length > 0) {
+      setCardStock(prevCards => prevCards.map(card => {
+        const inc = cardIncrements[card.id];
+        return inc ? { ...card, qty: card.qty + inc.totalQty } : card;
+      }));
+    }
+
+    if (Object.keys(forfaitIncrements).length > 0) {
+      setForfaitBalance(prev => {
+        const next = { ...prev };
+        for (const op of Object.keys(forfaitIncrements)) {
+          next[op] = (next[op] || 0) + forfaitIncrements[op];
+        }
+        return next;
+      });
+    }
+
     if (ok) {
       triggerToast('✅ تم حذف الدين ورجعت كافة السلع والأرصدة للمستودع');
       logAudit('delete', `حذف ملف دين بالكامل: ${debt.customerName}`);
@@ -1878,9 +1967,19 @@ export default function App() {
     }
 
     else if (incomeType === 'recharge') {
-      const [face, price, margin] = rechargeValOpt.split('|').map(Number);
+      const [face, price] = rechargeValOpt.split('|').map(Number);
       const qtyVal = parseInt(rechargeQty) || 1;
-      if (qtyVal <= 0) return;
+      if (qtyVal <= 0) return triggerToast('❌ كمية غير صالحة');
+
+      const cardEntry = cardStock.find(c => c.operator === rechargeOp && String(c.value) === String(face));
+      const availableStock = cardEntry ? cardEntry.qty : 0;
+      const cartAlready = cart
+        .filter(c => c.type === 'recharge' && c.cardOperator === rechargeOp && String(c.cardValue) === String(face))
+        .reduce((s, c) => s + c.qty, 0);
+
+      if (qtyVal + cartAlready > availableStock) {
+        return triggerToast(`❌ مخزون بطاقات ${rechargeOp} (${face} د.ت) غير كافي! المتوفر بالمخزن: ${Math.max(0, availableStock - cartAlready)} كارت`);
+      }
 
       const override = parseFloat(rechargePriceOverride);
       const finalPrice = !isNaN(override) && override >= 0 ? override : price;
@@ -1977,28 +2076,38 @@ export default function App() {
     setCart(prev => prev.filter(c => c.id !== id));
   };
 
-  const handleEditCartLinePrice = (lineId: string) => {
+  const handleSaveInlinePrice = (lineId: string) => {
     const line = cart.find(c => c.id === lineId);
     if (!line) return;
-    const input = prompt(`تعديل سعر البيع للسلعة "${line.label}" في الفاتورة:`, line.unitPrice.toString());
-    if (input === null) return;
-
-    const val = parseFloat(input);
+    const val = parseFloat(editingCartPriceVal);
     if (isNaN(val) || val < 0) {
-      return triggerToast('❌ سعر غير صالح');
+      triggerToast('❌ سعر غير صالح');
+      return;
     }
 
     setCart(prev => prev.map(c => {
       if (c.id === lineId) {
+        const faceVal = parseFloat(c.cardValue || '0');
+        const newCommission = c.type === 'recharge' && faceVal > 0 ? (val - faceVal) * c.qty : c.commission;
         return {
           ...c,
           unitPrice: val,
-          total: val * c.qty
+          total: val * c.qty,
+          commission: newCommission
         };
       }
       return c;
     }));
+
+    setEditingCartLineId(null);
     triggerToast(`⚡ تم تعديل سعر "${line.label}" للفاتورة إلى ${val.toFixed(3)} د.ت`);
+  };
+
+  const handleEditCartLinePrice = (lineId: string) => {
+    const line = cart.find(c => c.id === lineId);
+    if (!line) return;
+    setEditingCartLineId(lineId);
+    setEditingCartPriceVal(line.unitPrice.toString());
   };
 
   const handleAdjustCartLineQty = (lineId: string, delta: number) => {
@@ -2013,22 +2122,87 @@ export default function App() {
 
     if (line.type === 'item' && line.itemId) {
       const item = items.find(i => i.id === line.itemId);
-      if (item) {
-        const otherCartQty = cart
-          .filter(c => c.type === 'item' && c.itemId === line.itemId && c.id !== lineId)
-          .reduce((s, c) => s + c.qty, 0);
-        if (newQty + otherCartQty > item.qty) {
-          return triggerToast(`❌ الستوك المتوفر فقط: ${item.qty - otherCartQty}`);
-        }
+      const availableStock = item ? item.qty : 0;
+      const otherCartQty = cart
+        .filter(c => c.type === 'item' && c.itemId === line.itemId && c.id !== lineId)
+        .reduce((s, c) => s + c.qty, 0);
+      if (newQty + otherCartQty > availableStock) {
+        return triggerToast(`❌ الستوك المتوفر فقط: ${Math.max(0, availableStock - otherCartQty)} قطعة`);
+      }
+    }
+
+    if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
+      const cardEntry = cardStock.find(c => c.operator === line.cardOperator && String(c.value) === String(line.cardValue));
+      const availableStock = cardEntry ? cardEntry.qty : 0;
+      const otherCartQty = cart
+        .filter(c => c.type === 'recharge' && c.cardOperator === line.cardOperator && String(c.cardValue) === String(line.cardValue) && c.id !== lineId)
+        .reduce((s, c) => s + c.qty, 0);
+      if (newQty + otherCartQty > availableStock) {
+        return triggerToast(`❌ مخزون بطاقات الشحن المتوفر فقط: ${Math.max(0, availableStock - otherCartQty)} كارت`);
       }
     }
 
     setCart(prev => prev.map(c => {
       if (c.id === lineId) {
+        const faceVal = parseFloat(c.cardValue || '0');
+        const newCommission = c.type === 'recharge' && faceVal > 0 ? (c.unitPrice - faceVal) * newQty : c.commission;
         return {
           ...c,
           qty: newQty,
-          total: c.unitPrice * newQty
+          total: c.unitPrice * newQty,
+          commission: newCommission
+        };
+      }
+      return c;
+    }));
+  };
+
+  const handleEditCartLineQtyExact = (lineId: string) => {
+    const line = cart.find(c => c.id === lineId);
+    if (!line) return;
+    const input = prompt(`تعديل الكمية لـ "${line.label}" في الفاتورة:`, line.qty.toString());
+    if (input === null) return;
+    const val = parseInt(input, 10);
+    if (isNaN(val) || val <= 0) {
+      if (val === 0) {
+        handleRemoveFromCart(lineId);
+      } else {
+        triggerToast('❌ كمية غير صالحة');
+      }
+      return;
+    }
+
+    if (line.type === 'item' && line.itemId) {
+      const item = items.find(i => i.id === line.itemId);
+      const availableStock = item ? item.qty : 0;
+      const otherCartQty = cart
+        .filter(c => c.type === 'item' && c.itemId === line.itemId && c.id !== lineId)
+        .reduce((s, c) => s + c.qty, 0);
+      if (val + otherCartQty > availableStock) {
+        return triggerToast(`❌ الستوك المتوفر فقط: ${Math.max(0, availableStock - otherCartQty)} قطعة`);
+      }
+    }
+
+    if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
+      const cardEntry = cardStock.find(c => c.operator === line.cardOperator && String(c.value) === String(line.cardValue));
+      const availableStock = cardEntry ? cardEntry.qty : 0;
+      const otherCartQty = cart
+        .filter(c => c.type === 'recharge' && c.cardOperator === line.cardOperator && String(c.cardValue) === String(line.cardValue) && c.id !== lineId)
+        .reduce((s, c) => s + c.qty, 0);
+      if (val + otherCartQty > availableStock) {
+        return triggerToast(`❌ مخزون بطاقات الشحن المتوفر فقط: ${Math.max(0, availableStock - otherCartQty)} كارت`);
+      }
+    }
+
+    setCart(prev => prev.map(c => {
+      if (c.id === lineId) {
+        const faceVal = parseFloat(c.cardValue || '0');
+        const newCommission = c.type === 'recharge' && faceVal > 0 ? (c.unitPrice - faceVal) * val : c.commission;
+        return {
+          ...c,
+          qty: val,
+          total: c.unitPrice * val,
+          commission: newCommission
         };
       }
       return c;
@@ -2058,7 +2232,8 @@ export default function App() {
       let stockError = '';
 
       for (const group of uniqueItemsToDecrement) {
-        const res = await safeDecrementItemQty(group.itemId, group.qty);
+        const localItem = items.find(i => i.id === group.itemId);
+        const res = await safeDecrementItemQty(group.itemId, group.qty, localItem?.qty);
         if (res.success) {
           successList.push({ itemId: group.itemId, amt: group.qty });
         } else {
@@ -2072,33 +2247,75 @@ export default function App() {
       // Rollback if any error occurred
       if (stockError) {
         for (const item of successList) {
-          await safeIncrementItemQty(item.itemId, item.amt);
+          const localItem = items.find(i => i.id === item.itemId);
+          await safeIncrementItemQty(item.itemId, item.amt, localItem?.qty);
         }
         setIsFinalizing(false);
         return triggerToast(stockError);
       }
 
-      // Group card stock depletions by cardStock entry ID
+      // Optimistically update item quantities in local React state immediately
+      if (Object.keys(itemQtyMap).length > 0) {
+        setItems(prevItems => prevItems.map(item => {
+          const dec = itemQtyMap[item.id];
+          return dec ? { ...item, qty: Math.max(0, item.qty - dec.qty) } : item;
+        }));
+      }
+
+      // Group card stock depletions by cardStock entry ID & validate stock
       const cardStockDepletions: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
       for (const line of cart) {
         if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
-          const entry = cardStock.find(c => c.operator === line.cardOperator && c.value === line.cardValue);
-          if (entry) {
-            if (!cardStockDepletions[entry.id]) {
-              cardStockDepletions[entry.id] = { entry, totalQty: 0 };
-            }
-            cardStockDepletions[entry.id].totalQty += line.qty;
+          let entry = cardStock.find(c => c.operator === line.cardOperator && String(c.value) === String(line.cardValue));
+          if (!entry) {
+            entry = {
+              id: `std_card_${line.cardOperator.replace(/\s+/g, '')}_${line.cardValue}`,
+              kind: 'recharge',
+              operator: line.cardOperator,
+              value: String(line.cardValue),
+              qty: 0
+            };
           }
+          if (!cardStockDepletions[entry.id]) {
+            cardStockDepletions[entry.id] = { entry, totalQty: 0 };
+          }
+          cardStockDepletions[entry.id].totalQty += line.qty;
         }
+      }
+
+      let cardStockError = '';
+      for (const key of Object.keys(cardStockDepletions)) {
+        const { entry, totalQty } = cardStockDepletions[key];
+        if (entry.qty < totalQty) {
+          cardStockError = `❌ مخزون بطاقات ${entry.operator} (${entry.value} د.ت) غير كافي بالمخزن! المتوفر: ${entry.qty} | المطلوب: ${totalQty}`;
+          break;
+        }
+      }
+
+      if (cardStockError) {
+        for (const item of successList) {
+          const localItem = items.find(i => i.id === item.itemId);
+          await safeIncrementItemQty(item.itemId, item.amt, localItem?.qty);
+        }
+        setIsFinalizing(false);
+        return triggerToast(cardStockError);
       }
 
       // Apply card stock depletions
       for (const entryId of Object.keys(cardStockDepletions)) {
         const { entry, totalQty } = cardStockDepletions[entryId];
+        const newQty = Math.max(0, entry.qty - totalQty);
         await putWithOutbox(`/cardStock/${entry.id}.json`, {
           ...entry,
-          qty: Math.max(0, entry.qty - totalQty)
+          qty: newQty
         });
+      }
+
+      if (Object.keys(cardStockDepletions).length > 0) {
+        setCardStock(prevCards => prevCards.map(card => {
+          const dep = cardStockDepletions[card.id];
+          return dep ? { ...card, qty: Math.max(0, card.qty - dep.totalQty) } : card;
+        }));
       }
 
       // Group forfait depletions by operator
@@ -2121,6 +2338,14 @@ export default function App() {
           updatedBalance[op] = Math.max(0, curBal - forfaitDepletions[op]);
         }
         await putWithOutbox('/forfaitBalance.json', updatedBalance);
+
+        setForfaitBalance(prev => {
+          const next = { ...prev };
+          for (const op of Object.keys(forfaitDepletions)) {
+            next[op] = Math.max(0, (next[op] || 0) - forfaitDepletions[op]);
+          }
+          return next;
+        });
       }
 
       const date = new Date().toISOString();
@@ -2150,19 +2375,26 @@ export default function App() {
           status: (initialPayVal >= grandTotal - 0.001) ? 'paid' : 'open'
         };
 
+        setDebts(prev => [newDebt, ...prev]);
         await putWithOutbox(`/debts/${newDebt.id}.json`, newDebt);
 
         // Record upfront down payment into income/cash register if present
         if (initialPayVal > 0) {
+          // Calculate down payment profit ratio
+          const totalDebtCost = cart.reduce((s, c) => s + ((c.unitBuy || 0) * (c.qty || 1)), 0);
+          const profitRatio = grandTotal > 0 ? Math.max(0, (grandTotal - totalDebtCost) / grandTotal) : 1;
+          const downPaymentCommission = initialPayVal * profitRatio;
+
           const downPaymentIncome: OtherIncome = {
             id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
             category: 'debt_payment',
             label: `دفعة أولى / تسبيق دين - ${invoiceCustomerName} (${cart.map(c => c.label).join(' + ')})`,
             amount: initialPayVal,
-            commission: initialPayVal,
+            commission: downPaymentCommission,
             date,
             debtId: newDebt.id
           };
+          setOtherIncome(prev => [downPaymentIncome, ...prev]);
           await putWithOutbox(`/otherIncome/${downPaymentIncome.id}.json`, downPaymentIncome);
         }
 
@@ -2174,6 +2406,9 @@ export default function App() {
         triggerTelegramDebtNotification(invoiceCustomerName, remainingDebt, `تسبيق: ${initialPayVal.toFixed(3)} د.ت | ${cart.map(c => c.label).join(' + ')}`, invoiceCustomerPhone || undefined);
       } else {
         // Create Sale records for items or OtherIncome records for other services
+        const createdSales: Sale[] = [];
+        const createdIncomes: OtherIncome[] = [];
+
         for (const line of cart) {
           const rId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6) + Math.floor(Math.random() * 100);
           if (line.type === 'item') {
@@ -2187,6 +2422,7 @@ export default function App() {
               total: line.total,
               date
             };
+            createdSales.push(sale);
             await putWithOutbox(`/sales/${sale.id}.json`, sale);
           } else {
             const income: OtherIncome = {
@@ -2200,9 +2436,14 @@ export default function App() {
               cardValue: line.cardValue || null,
               qty: line.qty || null
             };
+            createdIncomes.push(income);
             await putWithOutbox(`/otherIncome/${income.id}.json`, income);
           }
         }
+
+        if (createdSales.length > 0) setSales(prev => [...createdSales, ...prev]);
+        if (createdIncomes.length > 0) setOtherIncome(prev => [...createdIncomes, ...prev]);
+
         logAudit('sale', `فاتورة بيع نقدية جديدة: ${grandTotal} د.ت`);
         triggerToast('✅ تم تسجيل المبيعات النقدية وتحديث الخزينة');
       }
@@ -2265,9 +2506,12 @@ export default function App() {
           const record = sales.find(s => s.id === id);
           if (record) {
             if (record.itemId) {
-              await safeIncrementItemQty(record.itemId, record.qty);
+              const localItem = items.find(i => i.id === record.itemId);
+              await safeIncrementItemQty(record.itemId, record.qty, localItem?.qty);
+              setItems(prev => prev.map(item => item.id === record.itemId ? { ...item, qty: item.qty + record.qty } : item));
             }
           }
+          setSales(prev => prev.filter(s => s.id !== id));
           const ok = await putWithOutbox(`/sales/${id}.json`, null);
           if (ok) {
             triggerToast('✅ تم إلغاء البيع وإعادة الستوك');
@@ -2280,18 +2524,33 @@ export default function App() {
           const record = otherIncome.find(o => o.id === id);
           if (record) {
             // Rollback recharge
-            if (record.category === 'recharge' && record.cardOperator && record.cardValue) {
-              const card = cardStock.find(c => c.operator === record.cardOperator && c.value === record.cardValue);
+            if ((record.category === 'recharge' || record.category === 'card') && record.cardOperator && record.cardValue) {
+              const restoreQty = record.qty || 1;
+              const card = cardStock.find(c => c.operator === record.cardOperator && String(c.value) === String(record.cardValue));
               if (card) {
-                await putWithOutbox(`/cardStock/${card.id}.json`, { ...card, qty: card.qty + (record.qty || 1) });
+                const updated = { ...card, qty: card.qty + restoreQty };
+                await putWithOutbox(`/cardStock/${card.id}.json`, updated);
+                setCardStock(prev => prev.map(c => c.id === card.id ? updated : c));
+              } else {
+                const newCard: CardStockEntry = {
+                  id: `std_card_${record.cardOperator.replace(/\s+/g, '')}_${record.cardValue}`,
+                  kind: 'recharge',
+                  operator: record.cardOperator,
+                  value: String(record.cardValue),
+                  qty: restoreQty
+                };
+                await putWithOutbox(`/cardStock/${newCard.id}.json`, newCard);
+                setCardStock(prev => [...prev, newCard]);
               }
             }
             // Rollback forfait balance
             if (record.category === 'forfait' && record.cardOperator) {
               const curBal = forfaitBalance[record.cardOperator] || 0;
               await putWithOutbox('/forfaitBalance.json', { ...forfaitBalance, [record.cardOperator]: curBal + record.amount });
+              setForfaitBalance(prev => ({ ...prev, [record.cardOperator!]: (prev[record.cardOperator!] || 0) + record.amount }));
             }
           }
+          setOtherIncome(prev => prev.filter(o => o.id !== id));
           const ok = await putWithOutbox(`/otherIncome/${id}.json`, null);
           if (ok) {
             triggerToast('✅ تم إلغاء وحذف المدخول بنجاح');
@@ -2404,13 +2663,19 @@ export default function App() {
     
     // Also save hash to RTDB /pin.json as backup/offline verification
     const nextH = await sha256Hex(nextTrimmed);
-    const res = await fetch(dbUrl('/pin.json'), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(nextH)
-    });
+    let resOk = false;
+    try {
+      const res = await fetch(dbUrl('/pin.json'), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(nextH)
+      });
+      resOk = res.ok;
+    } catch (e) {
+      resOk = false;
+    }
 
-    if (updateAuthSuccess || res.ok) {
+    if (updateAuthSuccess || resOk) {
       setManagerPin(nextH);
       triggerToast('✅ تم تغيير رمز المدير السري بنجاح');
       logAudit('pin', 'تحديث وتغيير رمز المرور السري للمدير');
@@ -2829,15 +3094,26 @@ export default function App() {
           </div>
           <div className="flex items-center gap-3.5">
             <div className="flex flex-col items-center sm:items-end gap-1.5">
-              <span className={`text-[10px] px-3 py-1 rounded-full font-extrabold flex items-center gap-1.5 border ${
+              <span className={`text-[10px] px-3 py-1 rounded-full font-extrabold flex items-center gap-1.5 border transition-all ${
                 connectionStatus === 'connected' 
-                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
-                  : 'bg-amber-500/10 text-amber-400 border-amber-500/20 animate-pulse'
+                  ? 'bg-emerald-950/80 text-emerald-300 border-emerald-500/50 shadow-xs' 
+                  : connectionStatus === 'checking'
+                  ? 'bg-amber-950/80 text-amber-300 border-amber-500/50 animate-pulse'
+                  : 'bg-rose-950/80 text-rose-300 border-rose-500/50'
               }`}>
-                <span className={`w-1.5 h-1.5 rounded-full ${
-                  connectionStatus === 'connected' ? 'bg-emerald-400' : 'bg-amber-400 animate-ping'
+                <span className={`w-2 h-2 rounded-full ${
+                  connectionStatus === 'connected' 
+                    ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]' 
+                    : connectionStatus === 'checking'
+                    ? 'bg-amber-400 animate-ping'
+                    : 'bg-rose-500'
                 }`} />
-                {connectionStatus === 'connected' ? 'مزامنة نشطة' : 'جاري الاتصال...'}
+                {connectionStatus === 'connected' 
+                  ? 'مزامنة نشطة 🟢' 
+                  : connectionStatus === 'checking'
+                  ? 'جاري المزامنة...'
+                  : 'غير متصل (أوفلاين) 🔴'
+                }
               </span>
               {currentRole && (
                 <button 
@@ -2986,10 +3262,23 @@ export default function App() {
                     <span className="text-xs font-bold text-emerald-800">🛍️ مبيعات السلع والمنتجات</span>
                     <div className="font-mono text-xl font-black text-emerald-700 mt-1">{totalSales.toFixed(3)} د.ت</div>
                   </div>
-                  <div className="bg-blue-50/80 border border-blue-200 p-4 rounded-2xl text-center shadow-xs">
-                    <span className="text-xs font-bold text-blue-800">🌐 إجمالي مبيعات الفورفي</span>
-                    <div className="font-mono text-xl font-black text-blue-700 mt-1">{totalForfaitSales.toFixed(3)} د.ت</div>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowForfaitBreakdownModal(true)}
+                    className="bg-blue-50/80 border border-blue-200 hover:border-blue-400 p-4 rounded-2xl text-center shadow-xs cursor-pointer transition-all hover:bg-blue-100/90 hover:scale-[1.02] group relative flex flex-col justify-between"
+                    title="انقر لعرض تفاصيل مبيعات كل مشغل"
+                  >
+                    <div className="flex items-center justify-center gap-1.5 text-xs font-bold text-blue-900">
+                      <span>🌐 إجمالي مبيعات الفورفي</span>
+                      <span className="text-[9px] bg-blue-200/90 text-blue-950 px-1.5 py-0.5 rounded-md font-extrabold group-hover:bg-blue-600 group-hover:text-white transition-colors">
+                        تفاصيل 🔍
+                      </span>
+                    </div>
+                    <div className="font-mono text-xl font-black text-blue-700 my-0.5">{totalForfaitSales.toFixed(3)} د.ت</div>
+                    <div className="text-[10px] text-blue-600 font-bold underline underline-offset-2 opacity-90 group-hover:opacity-100">
+                      انقر لرؤية المبيعات حسب المشغل
+                    </div>
+                  </button>
                   <div className="bg-amber-50/80 border border-amber-200 p-4 rounded-2xl text-center shadow-xs">
                     <span className="text-xs font-bold text-amber-800">📶 إجمالي بطاقات الشحن</span>
                     <div className="font-mono text-xl font-black text-amber-700 mt-1">{totalRechargeSales.toFixed(3)} د.ت</div>
@@ -3999,51 +4288,88 @@ export default function App() {
                       )}
 
                       {/* Sub-form: Recharge cards */}
-                      {incomeType === 'recharge' && (
-                        <div className="space-y-3">
-                          <div className="grid grid-cols-2 gap-2">
-                            <div>
-                              <label className="block text-[10px] text-stone-500 mb-0.5">المشغل</label>
-                              <select value={rechargeOp} onChange={e => setRechargeOp(e.target.value)} className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800">
-                                <option value="Ooredoo">Ooredoo</option>
-                                <option value="Orange">Orange</option>
-                                <option value="Tunisie Telecom">Tunisie Telecom</option>
-                              </select>
+                      {incomeType === 'recharge' && (() => {
+                        const [face] = rechargeValOpt.split('|').map(Number);
+                        const cardEntry = cardStock.find(c => c.operator === rechargeOp && String(c.value) === String(face));
+                        const available = cardEntry ? cardEntry.qty : 0;
+                        return (
+                          <div className="space-y-3">
+                            {/* Live Card Stock Badge */}
+                            <div className={`p-3 rounded-xl border text-xs flex justify-between items-center transition-all ${
+                              available > 3
+                                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                                : available > 0
+                                ? 'bg-amber-50 border-amber-200 text-amber-800'
+                                : 'bg-rose-50 border-rose-200 text-rose-800'
+                            }`}>
+                              <div className="flex items-center gap-2">
+                                <span className="text-base">📶</span>
+                                <div>
+                                  <div className="font-bold">المخزون الحالي لبطاقات {rechargeOp} ({face} د.ت):</div>
+                                  <div className="text-xs font-mono font-black mt-0.5">
+                                    {available > 0 ? `✅ متوفر بالمخزن: ${available} قطعة` : '❌ المخزن فارغ (0 قطعة)'}
+                                  </div>
+                                </div>
+                              </div>
+                              {currentRole === 'manager' && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setCardOperator(rechargeOp);
+                                    setCardValue(String(face));
+                                    setCurrentTab('stock');
+                                  }}
+                                  className="text-[10px] font-bold bg-white border border-stone-300 px-2.5 py-1.5 rounded-lg hover:bg-stone-50 cursor-pointer shadow-2xs text-stone-800 shrink-0"
+                                >
+                                  ➕ شحن/تزويد
+                                </button>
+                              )}
                             </div>
-                            <div>
-                              <label className="block text-[10px] text-stone-500 mb-0.5">الفئة والقيمة</label>
-                              <select value={rechargeValOpt} onChange={e => setRechargeValOpt(e.target.value)} className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800">
-                                <option value="1|1.3|0.3">1 د.ت (سعر البيع: 1.300 د.ت)</option>
-                                <option value="5|5.8|0.8">5 د.ت (سعر البيع: 5.800 د.ت)</option>
-                              </select>
-                            </div>
-                          </div>
 
-                          <div className="grid grid-cols-2 gap-2">
-                            <div>
-                              <label className="block text-[10px] text-stone-500 mb-0.5">الكمية المباعة</label>
-                              <input 
-                                type="number" 
-                                min="1"
-                                value={rechargeQty}
-                                onChange={e => setRechargeQty(e.target.value)}
-                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
-                              />
+                            <div className="grid grid-cols-2 gap-2">
+                              <div>
+                                <label className="block text-[10px] text-stone-500 mb-0.5">المشغل</label>
+                                <select value={rechargeOp} onChange={e => setRechargeOp(e.target.value)} className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-bold">
+                                  <option value="Ooredoo">Ooredoo</option>
+                                  <option value="Orange">Orange</option>
+                                  <option value="Tunisie Telecom">Tunisie Telecom</option>
+                                </select>
+                              </div>
+                              <div>
+                                <label className="block text-[10px] text-stone-500 mb-0.5">الفئة والقيمة</label>
+                                <select value={rechargeValOpt} onChange={e => setRechargeValOpt(e.target.value)} className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-bold">
+                                  <option value="1|1.3|0.3">1 د.ت (سعر البيع: 1.300 د.ت)</option>
+                                  <option value="5|5.8|0.8">5 د.ت (سعر البيع: 5.800 د.ت)</option>
+                                </select>
+                              </div>
                             </div>
-                            <div>
-                              <label className="block text-[10px] text-stone-500 mb-0.5">تعديل سعر الكارت (اختياري)</label>
-                              <input 
-                                type="number" 
-                                step="0.001"
-                                placeholder="السعر الافتراضي"
-                                value={rechargePriceOverride}
-                                onChange={e => setRechargePriceOverride(e.target.value)}
-                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
-                              />
+
+                            <div className="grid grid-cols-2 gap-2">
+                              <div>
+                                <label className="block text-[10px] text-stone-500 mb-0.5">الكمية المباعة</label>
+                                <input 
+                                  type="number" 
+                                  min="1"
+                                  value={rechargeQty}
+                                  onChange={e => setRechargeQty(e.target.value)}
+                                  className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono font-bold"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[10px] text-stone-500 mb-0.5">تعديل سعر الكارت (اختياري)</label>
+                                <input 
+                                  type="number" 
+                                  step="0.001"
+                                  placeholder="السعر الافتراضي"
+                                  value={rechargePriceOverride}
+                                  onChange={e => setRechargePriceOverride(e.target.value)}
+                                  className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
+                                />
+                              </div>
                             </div>
                           </div>
-                        </div>
-                      )}
+                        );
+                      })()}
 
                       {/* Sub-form: Forfait */}
                       {incomeType === 'forfait' && (
@@ -4213,56 +4539,106 @@ export default function App() {
                       </div>
                     ) : (
                       cart.map((line, idx) => (
-                        <div key={idx} className="flex justify-between items-center gap-2 p-2.5 bg-stone-50 hover:bg-stone-100/60 rounded-xl border border-stone-200/80 text-[11px] transition-all">
-                          <div className="flex-1 min-w-0">
-                            <div className="font-bold text-stone-900 truncate">{line.label}</div>
-                            <div className="text-[10px] text-stone-500 flex items-center gap-1.5 mt-0.5">
-                              <span>سعر الوحدة:</span>
-                              <button
-                                type="button"
-                                onClick={() => handleEditCartLinePrice(line.id)}
-                                className="font-mono font-black text-amber-900 bg-amber-100 hover:bg-amber-200 px-1.5 py-0.5 rounded border border-amber-300 flex items-center gap-1 cursor-pointer transition-colors"
-                                title="انقر لتعديل سعر هذا المنتج في الفاتورة الحالية"
-                              >
-                                <span>{line.unitPrice.toFixed(3)} د.ت</span>
-                                <Pencil size={9} className="text-amber-800" />
-                              </button>
+                        <div key={idx} className="p-3 bg-stone-50 hover:bg-stone-100/60 rounded-xl border border-stone-200/80 text-[11px] transition-all space-y-2">
+                          {/* Row 1: Item Label & Delete Button */}
+                          <div className="flex justify-between items-start gap-2">
+                            <div className="font-bold text-stone-900 text-xs leading-snug flex-1 break-words">
+                              {line.label}
                             </div>
-                          </div>
-
-                          <div className="flex items-center gap-2 shrink-0">
-                            <div className="flex items-center gap-1 bg-white border border-stone-200 rounded-lg p-0.5 shadow-2xs">
-                              <button
-                                type="button"
-                                onClick={() => handleAdjustCartLineQty(line.id, -1)}
-                                className="w-5 h-5 flex items-center justify-center text-stone-700 font-extrabold hover:bg-stone-100 rounded cursor-pointer transition-colors"
-                                title="إنقاص الكمية"
-                              >
-                                -
-                              </button>
-                              <span className="font-mono font-bold px-1 text-xs text-stone-900">{line.qty}</span>
-                              <button
-                                type="button"
-                                onClick={() => handleAdjustCartLineQty(line.id, 1)}
-                                className="w-5 h-5 flex items-center justify-center text-stone-700 font-extrabold hover:bg-stone-100 rounded cursor-pointer transition-colors"
-                                title="زيادة الكمية"
-                              >
-                                +
-                              </button>
-                            </div>
-
-                            <span className="font-mono font-black text-stone-900 text-xs min-w-[55px] text-left">
-                              {line.total.toFixed(3)}
-                            </span>
-
                             <button 
                               type="button"
                               onClick={() => handleRemoveFromCart(line.id)}
-                              className="text-stone-400 hover:text-red-700 p-1 rounded hover:bg-red-50 cursor-pointer transition-colors"
+                              className="text-stone-400 hover:text-red-700 p-1 rounded hover:bg-red-50 cursor-pointer transition-colors shrink-0"
                               title="حذف من الفاتورة"
                             >
                               <X size={14} />
                             </button>
+                          </div>
+
+                          {/* Row 2: Price Editing & Quantity Stepper & Line Total */}
+                          <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-stone-200/50 flex-wrap sm:flex-nowrap">
+                            {/* Price Editing Section */}
+                            <div className="flex items-center gap-1 shrink-0">
+                              {editingCartLineId === line.id ? (
+                                <form 
+                                  onSubmit={(e) => {
+                                    e.preventDefault();
+                                    handleSaveInlinePrice(line.id);
+                                  }}
+                                  className="flex items-center gap-1 bg-amber-50 p-1 rounded-lg border border-amber-300"
+                                >
+                                  <span className="text-[10px] text-amber-900 font-bold shrink-0">السعر:</span>
+                                  <input
+                                    type="number"
+                                    step="0.001"
+                                    min="0"
+                                    value={editingCartPriceVal}
+                                    onChange={(e) => setEditingCartPriceVal(e.target.value)}
+                                    autoFocus
+                                    className="w-16 px-1.5 py-0.5 bg-white border border-amber-400 rounded text-xs font-mono font-bold text-amber-900 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                                  />
+                                  <button
+                                    type="submit"
+                                    className="bg-emerald-600 hover:bg-emerald-700 text-white p-1 rounded text-[10px] font-bold cursor-pointer transition-colors"
+                                    title="حفظ السعر الجديد"
+                                  >
+                                    <Check size={12} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingCartLineId(null)}
+                                    className="bg-stone-200 hover:bg-stone-300 text-stone-700 p-1 rounded text-[10px] font-bold cursor-pointer transition-colors"
+                                    title="إلغاء"
+                                  >
+                                    <X size={12} />
+                                  </button>
+                                </form>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => handleEditCartLinePrice(line.id)}
+                                  className="font-mono font-bold text-amber-900 bg-amber-100/90 hover:bg-amber-200 px-2 py-0.5 rounded-lg border border-amber-300 flex items-center gap-1 cursor-pointer transition-colors text-[11px]"
+                                  title="انقر لتعديل سعر هذا المنتج في الفاتورة الحالية"
+                                >
+                                  <span>{line.unitPrice.toFixed(3)} د.ت</span>
+                                  <Pencil size={10} className="text-amber-800 shrink-0" />
+                                </button>
+                              )}
+                            </div>
+
+                            {/* Right side: Quantity Controls & Line Total */}
+                            <div className="flex items-center gap-2 shrink-0 ms-auto">
+                              <div className="flex items-center gap-1 bg-white border border-stone-200 rounded-lg p-0.5 shadow-2xs">
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdjustCartLineQty(line.id, -1)}
+                                  className="w-5 h-5 flex items-center justify-center text-stone-700 font-extrabold hover:bg-stone-100 rounded cursor-pointer transition-colors"
+                                  title="إنقاص الكمية"
+                                >
+                                  -
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleEditCartLineQtyExact(line.id)}
+                                  className="font-mono font-extrabold px-1.5 text-xs text-stone-900 hover:text-amber-700 hover:bg-stone-100 rounded cursor-pointer transition-colors"
+                                  title="انقر لتحديد الكمية بالضبط"
+                                >
+                                  {line.qty}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdjustCartLineQty(line.id, 1)}
+                                  className="w-5 h-5 flex items-center justify-center text-stone-700 font-extrabold hover:bg-stone-100 rounded cursor-pointer transition-colors"
+                                  title="زيادة الكمية"
+                                >
+                                  +
+                                </button>
+                              </div>
+
+                              <span className="font-mono font-black text-stone-900 text-xs min-w-[50px] text-left">
+                                {line.total.toFixed(3)} د.ت
+                              </span>
+                            </div>
                           </div>
                         </div>
                       ))
@@ -5322,6 +5698,227 @@ export default function App() {
           onScan={handleBarcodeScanned} 
           onClose={() => setScannerContext(null)} 
         />
+      )}
+
+      {/* Forfait Breakdown Modal */}
+      {showForfaitBreakdownModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 z-50 animate-fade-in font-sans" dir="rtl">
+          <div className="bg-white rounded-3xl border border-stone-200 p-5 sm:p-6 w-full max-w-2xl shadow-2xl animate-scale-up text-right max-h-[90vh] flex flex-col">
+            {/* Header */}
+            <div className="flex items-center justify-between pb-4 border-b border-stone-100">
+              <div className="flex items-center gap-2.5">
+                <span className="p-2.5 bg-blue-100 text-blue-700 rounded-2xl text-xl">🌐</span>
+                <div>
+                  <h3 className="font-extrabold text-stone-900 text-base sm:text-lg">
+                    توزيع مبيعات شحن الفورفاي حسب المشغل
+                  </h3>
+                  <p className="text-stone-500 text-xs">
+                    تفاصيل مبيعات باقات الإنترنت والإنترنت للهواتف
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowForfaitBreakdownModal(false)}
+                className="text-stone-400 hover:text-stone-700 p-2 rounded-xl hover:bg-stone-100 transition-colors cursor-pointer text-xl font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="overflow-y-auto py-4 space-y-5 flex-1 pr-1">
+              {/* Total Banner */}
+              <div className="bg-gradient-to-r from-blue-600 to-indigo-700 text-white p-4 rounded-2xl shadow-md flex items-center justify-between">
+                <div>
+                  <span className="text-xs text-blue-100 font-bold block">إجمالي مبيعات الفورفي الكلية</span>
+                  <span className="font-mono text-2xl font-black">{totalForfaitSales.toFixed(3)} د.ت</span>
+                </div>
+                <div className="text-left bg-white/10 px-3.5 py-1.5 rounded-xl border border-white/20">
+                  <span className="text-[11px] text-blue-100 block">إجمالي العمليات</span>
+                  <span className="font-mono font-bold text-sm">{otherIncome.filter(o => o.category === 'forfait').length} عملية</span>
+                </div>
+              </div>
+
+              {/* Breakdown Grid by Operator */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {/* Ooredoo */}
+                {(() => {
+                  const opSales = otherIncome
+                    .filter(o => o.category === 'forfait' && (o.cardOperator === 'Ooredoo' || (!o.cardOperator && o.label.includes('Ooredoo'))))
+                    .reduce((s, c) => s + c.amount, 0);
+                  const opCount = otherIncome
+                    .filter(o => o.category === 'forfait' && (o.cardOperator === 'Ooredoo' || (!o.cardOperator && o.label.includes('Ooredoo'))))
+                    .length;
+                  const pct = totalForfaitSales > 0 ? ((opSales / totalForfaitSales) * 100).toFixed(1) : '0';
+
+                  return (
+                    <div className="bg-red-50/70 border-2 border-red-200 p-3.5 rounded-2xl relative overflow-hidden flex flex-col justify-between shadow-xs">
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="font-extrabold text-red-950 text-sm flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full bg-red-600 inline-block shadow-xs"></span>
+                          أوريدو (Ooredoo)
+                        </span>
+                        <span className="text-[10px] font-extrabold bg-red-200/80 text-red-900 px-2 py-0.5 rounded-full">
+                          {pct}%
+                        </span>
+                      </div>
+                      <div className="font-mono text-xl font-black text-red-700 my-1">
+                        {opSales.toFixed(3)} <span className="text-xs">د.ت</span>
+                      </div>
+                      <div className="flex justify-between items-center text-[11px] text-stone-600 mt-2 pt-2 border-t border-red-200/60 font-medium">
+                        <span>العمليات: <b>{opCount}</b></span>
+                        <span className="text-[10px] text-red-800 font-mono">رصيد: {forfaitBalance.Ooredoo?.toFixed(3) || '0.000'}</span>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Orange */}
+                {(() => {
+                  const opSales = otherIncome
+                    .filter(o => o.category === 'forfait' && (o.cardOperator === 'Orange' || (!o.cardOperator && o.label.includes('Orange'))))
+                    .reduce((s, c) => s + c.amount, 0);
+                  const opCount = otherIncome
+                    .filter(o => o.category === 'forfait' && (o.cardOperator === 'Orange' || (!o.cardOperator && o.label.includes('Orange'))))
+                    .length;
+                  const pct = totalForfaitSales > 0 ? ((opSales / totalForfaitSales) * 100).toFixed(1) : '0';
+
+                  return (
+                    <div className="bg-orange-50/70 border-2 border-orange-200 p-3.5 rounded-2xl relative overflow-hidden flex flex-col justify-between shadow-xs">
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="font-extrabold text-orange-950 text-sm flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full bg-orange-500 inline-block shadow-xs"></span>
+                          أورنج (Orange)
+                        </span>
+                        <span className="text-[10px] font-extrabold bg-orange-200/80 text-orange-900 px-2 py-0.5 rounded-full">
+                          {pct}%
+                        </span>
+                      </div>
+                      <div className="font-mono text-xl font-black text-orange-700 my-1">
+                        {opSales.toFixed(3)} <span className="text-xs">د.ت</span>
+                      </div>
+                      <div className="flex justify-between items-center text-[11px] text-stone-600 mt-2 pt-2 border-t border-orange-200/60 font-medium">
+                        <span>العمليات: <b>{opCount}</b></span>
+                        <span className="text-[10px] text-orange-800 font-mono">رصيد: {forfaitBalance.Orange?.toFixed(3) || '0.000'}</span>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Tunisie Telecom */}
+                {(() => {
+                  const opSales = otherIncome
+                    .filter(o => o.category === 'forfait' && (o.cardOperator === 'Tunisie Telecom' || (!o.cardOperator && (o.label.includes('Telecom') || o.label.includes('اتصالات')))))
+                    .reduce((s, c) => s + c.amount, 0);
+                  const opCount = otherIncome
+                    .filter(o => o.category === 'forfait' && (o.cardOperator === 'Tunisie Telecom' || (!o.cardOperator && (o.label.includes('Telecom') || o.label.includes('اتصالات')))))
+                    .length;
+                  const pct = totalForfaitSales > 0 ? ((opSales / totalForfaitSales) * 100).toFixed(1) : '0';
+
+                  return (
+                    <div className="bg-sky-50/70 border-2 border-sky-200 p-3.5 rounded-2xl relative overflow-hidden flex flex-col justify-between shadow-xs">
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="font-extrabold text-sky-950 text-sm flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full bg-sky-600 inline-block shadow-xs"></span>
+                          اتصالات تونس
+                        </span>
+                        <span className="text-[10px] font-extrabold bg-sky-200/80 text-sky-900 px-2 py-0.5 rounded-full">
+                          {pct}%
+                        </span>
+                      </div>
+                      <div className="font-mono text-xl font-black text-sky-700 my-1">
+                        {opSales.toFixed(3)} <span className="text-xs">د.ت</span>
+                      </div>
+                      <div className="flex justify-between items-center text-[11px] text-stone-600 mt-2 pt-2 border-t border-sky-200/60 font-medium">
+                        <span>العمليات: <b>{opCount}</b></span>
+                        <span className="text-[10px] text-sky-800 font-mono">رصيد: {forfaitBalance['Tunisie Telecom']?.toFixed(3) || '0.000'}</span>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              {/* Detailed Transactions List */}
+              <div className="bg-stone-50 rounded-2xl p-4 border border-stone-200">
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                  <h4 className="font-bold text-stone-800 text-xs flex items-center gap-2">
+                    📜 سجل عمليات الفورفي المسجلة
+                  </h4>
+                  <div className="flex items-center gap-1 flex-wrap">
+                    {['all', 'Ooredoo', 'Orange', 'Tunisie Telecom'].map(op => (
+                      <button
+                        key={op}
+                        type="button"
+                        onClick={() => setForfaitFilterOp(op)}
+                        className={`text-[10px] px-2.5 py-1 rounded-lg font-bold transition-colors cursor-pointer ${
+                          forfaitFilterOp === op
+                            ? 'bg-blue-600 text-white shadow-xs'
+                            : 'bg-white text-stone-600 border border-stone-200 hover:bg-stone-100'
+                        }`}
+                      >
+                        {op === 'all' ? 'الكل' : op === 'Tunisie Telecom' ? 'اتصالات تونس' : op}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="max-h-56 overflow-y-auto space-y-2 pr-1">
+                  {otherIncome
+                    .filter(o => o.category === 'forfait')
+                    .filter(o => {
+                      if (forfaitFilterOp === 'all') return true;
+                      const op = o.cardOperator || (o.label.includes('Ooredoo') ? 'Ooredoo' : o.label.includes('Orange') ? 'Orange' : 'Tunisie Telecom');
+                      return op === forfaitFilterOp;
+                    })
+                    .length === 0 ? (
+                      <div className="text-center py-6 text-stone-400 text-xs">
+                        لا توجد عمليات فورفي مسجلة لهذا المشغل
+                      </div>
+                    ) : (
+                      otherIncome
+                        .filter(o => o.category === 'forfait')
+                        .filter(o => {
+                          if (forfaitFilterOp === 'all') return true;
+                          const op = o.cardOperator || (o.label.includes('Ooredoo') ? 'Ooredoo' : o.label.includes('Orange') ? 'Orange' : 'Tunisie Telecom');
+                          return op === forfaitFilterOp;
+                        })
+                        .slice(0, 40)
+                        .map(entry => {
+                          const opName = entry.cardOperator || (entry.label.includes('Ooredoo') ? 'Ooredoo' : entry.label.includes('Orange') ? 'Orange' : 'Tunisie Telecom');
+                          return (
+                            <div key={entry.id} className="bg-white p-2.5 rounded-xl border border-stone-200 flex items-center justify-between text-xs hover:border-blue-300 transition-colors">
+                              <div>
+                                <div className="font-bold text-stone-800 flex items-center gap-1.5">
+                                  <span className={`w-2 h-2 rounded-full ${
+                                    opName === 'Ooredoo' ? 'bg-red-500' : opName === 'Orange' ? 'bg-orange-500' : 'bg-sky-500'
+                                  }`} />
+                                  {entry.label}
+                                </div>
+                                <div className="text-[10px] text-stone-400 mt-0.5 font-mono">
+                                  {entry.date ? new Date(entry.date).toLocaleString('ar-TN') : ''}
+                                </div>
+                              </div>
+                              <div className="text-left font-mono">
+                                <div className="font-black text-blue-700">{entry.amount.toFixed(3)} د.ت</div>
+                              </div>
+                            </div>
+                          );
+                        })
+                    )
+                  }
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-3 border-t border-stone-100 flex justify-end">
+              <button
+                onClick={() => setShowForfaitBreakdownModal(false)}
+                className="bg-stone-900 hover:bg-stone-800 text-white font-bold px-6 py-2.5 rounded-xl text-xs cursor-pointer transition-colors shadow-md"
+              >
+                إغلاق
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Custom Confirmation Modal Dialog */}

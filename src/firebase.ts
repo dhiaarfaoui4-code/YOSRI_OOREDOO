@@ -187,20 +187,47 @@ export async function fetchJsonWithRetry(path: string, tries = 3): Promise<any> 
   throw lastErr;
 }
 
-// ---- Optimistic Concurrency Control (Fix 1: CORS ETag Fallback for Chrome) ----
-export async function safeDecrementItemQty(itemId: string, amount: number, maxRetries = 6): Promise<{ success: boolean; newQty?: number; reason?: string; available?: number }> {
+// ---- Optimistic Concurrency Control with Offline Outbox Fallback ----
+export async function safeDecrementItemQty(
+  itemId: string, 
+  amount: number, 
+  fallbackCurrentQty?: number, 
+  maxRetries = 6
+): Promise<{ success: boolean; newQty?: number; reason?: string; available?: number }> {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     let currentQty: any, etag: string | null = null;
     try {
       const getRes = await fetch(dbUrl('/items/' + itemId + '/qty.json'), {
         headers: { 'X-Firebase-ETag': 'true' }
       });
-      etag = getRes.headers.get('ETag');
-      currentQty = await getRes.json();
+      if (getRes.ok) {
+        etag = getRes.headers.get('ETag');
+        currentQty = await getRes.json();
+      } else {
+        throw new Error('HTTP ' + getRes.status);
+      }
     } catch (e) {
+      // Offline/Network error fallback using local state quantity if provided
+      if (typeof fallbackCurrentQty === 'number') {
+        if (fallbackCurrentQty < amount) {
+          return { success: false, reason: 'insufficient', available: fallbackCurrentQty };
+        }
+        const newQty = fallbackCurrentQty - amount;
+        putWithOutbox('/items/' + itemId + '/qty.json', newQty);
+        return { success: true, newQty };
+      }
       return { success: false, reason: 'network' };
     }
     if (typeof currentQty !== 'number') {
+      // Fallback if item quantity key wasn't initialized
+      if (typeof fallbackCurrentQty === 'number') {
+        if (fallbackCurrentQty < amount) {
+          return { success: false, reason: 'insufficient', available: fallbackCurrentQty };
+        }
+        const newQty = fallbackCurrentQty - amount;
+        putWithOutbox('/items/' + itemId + '/qty.json', newQty);
+        return { success: true, newQty };
+      }
       return { success: false, reason: 'notfound' };
     }
     if (currentQty < amount) {
@@ -209,7 +236,6 @@ export async function safeDecrementItemQty(itemId: string, amount: number, maxRe
     const newQty = currentQty - amount;
     
     try {
-      // Fix 1: If ETag is null or not exposed (due to Chrome CORS settings), perform standard PUT as fallback
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (etag) {
         headers['if-match'] = etag;
@@ -224,27 +250,52 @@ export async function safeDecrementItemQty(itemId: string, amount: number, maxRe
       if (putRes.status === 200) {
         return { success: true, newQty };
       }
-      // If status is 412, someone modified it in between, loop again
     } catch (e) {
-      return { success: false, reason: 'network' };
+      putWithOutbox('/items/' + itemId + '/qty.json', newQty);
+      return { success: true, newQty };
     }
+  }
+  // Conflict retry fallback
+  if (typeof fallbackCurrentQty === 'number' && fallbackCurrentQty >= amount) {
+    const newQty = fallbackCurrentQty - amount;
+    putWithOutbox('/items/' + itemId + '/qty.json', newQty);
+    return { success: true, newQty };
   }
   return { success: false, reason: 'conflict' };
 }
 
-export async function safeIncrementItemQty(itemId: string, amount: number, maxRetries = 6): Promise<{ success: boolean; newQty?: number; reason?: string }> {
+export async function safeIncrementItemQty(
+  itemId: string, 
+  amount: number, 
+  fallbackCurrentQty?: number, 
+  maxRetries = 6
+): Promise<{ success: boolean; newQty?: number; reason?: string }> {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     let currentQty: any, etag: string | null = null;
     try {
       const getRes = await fetch(dbUrl('/items/' + itemId + '/qty.json'), {
         headers: { 'X-Firebase-ETag': 'true' }
       });
-      etag = getRes.headers.get('ETag');
-      currentQty = await getRes.json();
+      if (getRes.ok) {
+        etag = getRes.headers.get('ETag');
+        currentQty = await getRes.json();
+      } else {
+        throw new Error('HTTP ' + getRes.status);
+      }
     } catch (e) {
+      if (typeof fallbackCurrentQty === 'number') {
+        const newQty = fallbackCurrentQty + amount;
+        putWithOutbox('/items/' + itemId + '/qty.json', newQty);
+        return { success: true, newQty };
+      }
       return { success: false, reason: 'network' };
     }
     if (typeof currentQty !== 'number') {
+      if (typeof fallbackCurrentQty === 'number') {
+        const newQty = fallbackCurrentQty + amount;
+        putWithOutbox('/items/' + itemId + '/qty.json', newQty);
+        return { success: true, newQty };
+      }
       return { success: false, reason: 'notfound' };
     }
     const newQty = currentQty + amount;
@@ -263,8 +314,14 @@ export async function safeIncrementItemQty(itemId: string, amount: number, maxRe
         return { success: true, newQty };
       }
     } catch (e) {
-      return { success: false, reason: 'network' };
+      putWithOutbox('/items/' + itemId + '/qty.json', newQty);
+      return { success: true, newQty };
     }
+  }
+  if (typeof fallbackCurrentQty === 'number') {
+    const newQty = fallbackCurrentQty + amount;
+    putWithOutbox('/items/' + itemId + '/qty.json', newQty);
+    return { success: true, newQty };
   }
   return { success: false, reason: 'conflict' };
 }
@@ -274,6 +331,7 @@ export interface OutboxEntry {
   id: string;
   path: string;
   payload: any;
+  method?: 'PUT' | 'PATCH';
   createdAt: number;
 }
 
@@ -292,10 +350,10 @@ export function saveOutboxList(list: OutboxEntry[]) {
   } catch (e) {}
 }
 
-export function addToOutbox(path: string, payload: any): string {
+export function addToOutbox(path: string, payload: any, method: 'PUT' | 'PATCH' = 'PUT'): string {
   const list = loadOutbox();
   const entryId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  list.push({ id: entryId, path, payload, createdAt: Date.now() });
+  list.push({ id: entryId, path, payload, method, createdAt: Date.now() });
   // Max 500 entries to prevent memory leak
   while (list.length > 500) list.shift();
   saveOutboxList(list);
@@ -306,10 +364,10 @@ export function removeFromOutbox(entryId: string) {
   saveOutboxList(loadOutbox().filter(e => e.id !== entryId));
 }
 
-export async function tryPutRemote(path: string, payload: any): Promise<boolean> {
+export async function tryPutRemote(path: string, payload: any, method: 'PUT' | 'PATCH' = 'PUT'): Promise<boolean> {
   try {
     const r = await fetch(dbUrl(path), {
-      method: 'PUT',
+      method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
@@ -320,8 +378,15 @@ export async function tryPutRemote(path: string, payload: any): Promise<boolean>
 }
 
 export async function putWithOutbox(path: string, payload: any): Promise<boolean> {
-  const entryId = addToOutbox(path, payload);
-  const ok = await tryPutRemote(path, payload);
+  const entryId = addToOutbox(path, payload, 'PUT');
+  const ok = await tryPutRemote(path, payload, 'PUT');
+  if (ok) removeFromOutbox(entryId);
+  return ok;
+}
+
+export async function patchWithOutbox(path: string, payload: any): Promise<boolean> {
+  const entryId = addToOutbox(path, payload, 'PATCH');
+  const ok = await tryPutRemote(path, payload, 'PATCH');
   if (ok) removeFromOutbox(entryId);
   return ok;
 }
@@ -331,7 +396,7 @@ export async function flushOutbox(onSuccess?: (count: number) => void): Promise<
   if (list.length === 0) return;
   let sentCount = 0;
   for (const entry of list) {
-    const ok = await tryPutRemote(entry.path, entry.payload);
+    const ok = await tryPutRemote(entry.path, entry.payload, entry.method || 'PUT');
     if (ok) {
       removeFromOutbox(entry.id);
       sentCount++;

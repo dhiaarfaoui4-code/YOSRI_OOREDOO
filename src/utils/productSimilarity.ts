@@ -39,8 +39,22 @@ const KEYWORD_MAP: Record<string, string> = {
   'اوبو': 'oppo',
   'فيفو': 'vivo',
   'ديفيا': 'devia',
+  'بوروفون': 'borofone',
+  'لدنيو': 'ldnio',
 
-  // Categories & Item Types
+  // Connectors & Accessories Specs
+  'طيبسي': 'typec',
+  'تيبسي': 'typec',
+  'تايبسي': 'typec',
+  'تايب سي': 'typec',
+  'type-c': 'typec',
+  'type c': 'typec',
+  'usbc': 'typec',
+  'usb-c': 'typec',
+  'لايتنينج': 'lightning',
+  'لايتنينغ': 'lightning',
+  'ميكرو': 'micro',
+  'مايكرو': 'micro',
   'شاحن': 'charger',
   'شارجور': 'charger',
   'chargeur': 'charger',
@@ -297,7 +311,8 @@ export function getVisualOcrLearnedModifier(ocrText: string, itemId: string): nu
     const key = `${normOcr}||${itemId}`;
     const count = data[key] || 0;
     if (count > 0) {
-      return Math.min(30, count * 15);
+      // Direct confirmed link gives instant high boost (up to +60%)
+      return Math.min(60, 30 + count * 15);
     }
   } catch {
     return 0;
@@ -330,69 +345,97 @@ export function calculateMultiFactorMatch(
   const normOcr = normalizeText(ocrText);
   const normItemName = normalizeText(existingItem.name);
 
-  // 1. OCR Text Token Set Similarity
-  let ocrTokenSim = 0;
-  if (normOcr.length > 0) {
-    ocrTokenSim = tokenSetSimilarity(ocrText, existingItem.name);
-    const levSim = levenshteinSimilarity(normOcr, normItemName);
-    
-    if (ocrTokenSim > 0.4 || levSim > 0.4) {
-      const subScore = Math.round(Math.max(ocrTokenSim, levSim) * 40);
-      score += subScore;
-      reasons.push(`✓ قراءة النصوص من العلبة (OCR) متطابقة (${Math.round(Math.max(ocrTokenSim, levSim) * 100)}%)`);
+  // 1. Barcode check in OCR text
+  const existBarcodes = existingItem.barcodes || (existingItem.barcode ? [existingItem.barcode] : []);
+  if (existBarcodes.length > 0 && normOcr) {
+    const matchedBarcode = existBarcodes.find(b => b.trim() && normOcr.includes(b.trim()));
+    if (matchedBarcode) {
+      score += 90;
+      reasons.push(`✓ الباركود (${matchedBarcode}) مطابق في علبة المنتج!`);
     }
   }
 
-  // 2. Brand Matching (OCR vs DB Item)
+  // 2. Canonical Token Overlap Matching (Arabic <-> English/French keywords)
+  const itemCanonical = extractCanonicalTokens(existingItem.name);
+  const ocrCanonical = extractCanonicalTokens(ocrText);
+
+  if (itemCanonical.length > 0 && ocrCanonical.length > 0) {
+    let canonicalMatches = 0;
+    itemCanonical.forEach(tok => {
+      if (ocrCanonical.includes(tok) || normOcr.includes(tok)) {
+        canonicalMatches++;
+      }
+    });
+
+    if (canonicalMatches > 0) {
+      const matchRatio = canonicalMatches / itemCanonical.length;
+      const tokScore = Math.round(matchRatio * 50);
+      score += tokScore;
+      reasons.push(`✓ تطابق الكلمات المفتاحية (${canonicalMatches}/${itemCanonical.length})`);
+    }
+  }
+
+  // 3. OCR Text String Similarity
+  if (normOcr.length > 0) {
+    const ocrTokenSim = tokenSetSimilarity(ocrText, existingItem.name);
+    const levSim = levenshteinSimilarity(normOcr, normItemName);
+    
+    if (ocrTokenSim > 0.3 || levSim > 0.3) {
+      const subScore = Math.round(Math.max(ocrTokenSim, levSim) * 35);
+      score += subScore;
+    }
+  }
+
+  // 4. Brand Matching (OCR vs DB Item)
   const ocrBrand = extractBrand(ocrText);
   const itemBrand = extractBrand(existingItem.name);
 
   if (ocrBrand && itemBrand) {
     if (ocrBrand === itemBrand) {
-      score += 25;
-      reasons.push(`✓ البراند متطابق (${ocrBrand.toUpperCase()})`);
+      score += 30;
+      reasons.push(`✓ الماركة / البراند متطابقة (${ocrBrand.toUpperCase()})`);
     } else {
-      score -= 30; // Brand mismatch is a strong negative
+      score -= 35; // Brand mismatch is a strong negative
     }
   } else if (itemBrand && normOcr.includes(itemBrand)) {
-    score += 20;
+    score += 25;
     reasons.push(`✓ تم رصد ماركة ${itemBrand.toUpperCase()} في العلبة`);
   }
 
-  // 3. Model Matching (e.g. A54, S23, Pro Max, Note 10)
+  // 5. Model Matching (e.g. A54, S23, Pro Max, Note 10, TA800)
   const ocrModels = extractModelTokens(ocrText);
   const itemModels = extractModelTokens(existingItem.name);
 
   if (ocrModels.length > 0 && itemModels.length > 0) {
     const common = ocrModels.filter(m => itemModels.includes(m));
     if (common.length > 0) {
-      score += 25;
+      score += 30;
       reasons.push(`✓ الموديل متطابق (${common.join(', ')})`);
     }
   }
 
-  // 4. Power & Capacity Specs Matching (e.g. 25W, 45W, 128GB, 20000mAh)
+  // 6. Power & Capacity Specs Matching (e.g. 25W, 45W, 128GB, 20000mAh)
   const ocrSpecs = extractSpecs(ocrText);
   const itemSpecs = extractSpecs(existingItem.name);
 
   if (ocrSpecs.length > 0 && itemSpecs.length > 0) {
     const commonSpecs = ocrSpecs.filter(s => itemSpecs.includes(s));
     if (commonSpecs.length > 0) {
-      score += 25;
+      score += 30;
       reasons.push(`✓ السعة / القدرة متطابقة (${commonSpecs.join(', ').toUpperCase()})`);
     } else {
-      score -= 25; // Conflict in power/capacity
+      score -= 30; // Conflict in power/capacity
     }
   } else if (itemSpecs.length > 0 && ocrText) {
     // Check if any spec number appears in ocr text
     const foundSpec = itemSpecs.find(s => normOcr.includes(s));
     if (foundSpec) {
-      score += 15;
+      score += 20;
       reasons.push(`✓ تم رصد القدرة/المواصفة ${foundSpec.toUpperCase()} في العلبة`);
     }
   }
 
-  // 5. Color Matching
+  // 7. Color Matching
   const ocrColor = extractColor(ocrText);
   const itemColor = extractColor(existingItem.name);
 
@@ -405,20 +448,33 @@ export function calculateMultiFactorMatch(
     }
   }
 
-  // 6. Visual Image Feature Component
+  // 8. Visual Image Feature Matching Component
   if (existingItem.imageUrl && visualScore > 0) {
-    const visualContrib = Math.round(visualScore * 0.35);
-    score += visualContrib;
-    if (visualScore >= 50) {
-      reasons.push(`✓ تطابق الصورة مع مخزن صور السلعة (${visualScore}%)`);
+    if (visualScore >= 70) {
+      // High visual similarity: use visualScore as direct baseline score
+      score = Math.max(score, visualScore);
+      if (visualScore >= 80) {
+        reasons.unshift(`📸 مطابقة بصرية ممتازة بالبصمة والألوان والشكل (${visualScore}%)`);
+      } else {
+        reasons.unshift(`📸 تشابه بصري قوي (${visualScore}%)`);
+      }
+    } else {
+      const visualContrib = Math.round(visualScore * 0.85);
+      score = Math.max(score, visualContrib);
+      if (visualScore >= 40) {
+        reasons.push(`📸 تشابه بصري متوسط (${visualScore}%)`);
+      }
     }
+  } else if (!existingItem.imageUrl && normOcr.length > 0) {
+    // If item has no image in DB, add base credit for OCR text match
+    score += 10;
   }
 
-  // 7. Local User Correction / Learning Memory Boost
+  // 9. Local User Correction / Learning Memory Boost
   const learnedModifier = getVisualOcrLearnedModifier(ocrText, existingItem.id);
   if (learnedModifier > 0) {
     score += learnedModifier;
-    reasons.push(`🧠 تعلّم محلي: قمت باختيار هذا المنتج سابقاً للنص المكتوب (+${learnedModifier}%)`);
+    reasons.push(`🧠 ربط محلي محفوظ: اخترت هذا المنتج سابقاً (+${learnedModifier}%)`);
   }
 
   const finalScore = Math.min(100, Math.max(0, Math.round(score)));
