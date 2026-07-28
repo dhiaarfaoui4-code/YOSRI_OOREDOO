@@ -12,6 +12,7 @@ import {
 import {
   ensureAuth, signInManager, resumeManagerSession, logoutManager,
   fetchJsonWithRetry, safeDecrementItemQty, safeIncrementItemQty,
+  safeDecrementCardQty, safeIncrementCardQty,
   putWithOutbox, patchWithOutbox, flushOutbox, dbUrl, verifyManagerPinViaAuth,
   updateManagerPinViaAuth
 } from './firebase';
@@ -233,6 +234,14 @@ function parseRawWithKeys<T>(rawObj: any): T[] {
     };
   });
 }
+
+export const normalizeOpName = (op?: string | null): string => {
+  const t = (op || '').trim();
+  if (/ooredoo/i.test(t)) return 'Ooredoo';
+  if (/orange/i.test(t)) return 'Orange';
+  if (/telecom|اتصالات/i.test(t)) return 'Tunisie Telecom';
+  return t || 'Ooredoo';
+};
 
 export default function App() {
   // ---- Core States ----
@@ -480,6 +489,19 @@ export default function App() {
       setDebts(parseRawWithKeys<Debt>(debtsRaw));
 
       const parsedCards = parseRawWithKeys<CardStockEntry>(cardStockRaw);
+      
+      // Group card stock by normalized operator and face value
+      const cardGroups: Record<string, CardStockEntry[]> = {};
+      for (const card of parsedCards) {
+        const normOp = normalizeOpName(card.operator);
+        const normVal = String(card.value).trim();
+        const groupKey = `${normOp}_${normVal}`;
+        if (!cardGroups[groupKey]) {
+          cardGroups[groupKey] = [];
+        }
+        cardGroups[groupKey].push(card);
+      }
+
       const standardCardPairs = [
         { operator: 'Ooredoo', value: '1' },
         { operator: 'Ooredoo', value: '5' },
@@ -488,20 +510,58 @@ export default function App() {
         { operator: 'Tunisie Telecom', value: '1' },
         { operator: 'Tunisie Telecom', value: '5' }
       ];
-      const mergedCards = [...parsedCards];
+
       for (const std of standardCardPairs) {
-        const exists = mergedCards.some(c => c.operator === std.operator && String(c.value) === String(std.value));
-        if (!exists) {
-          mergedCards.push({
-            id: `std_card_${std.operator.replace(/\s+/g, '')}_${std.value}`,
-            kind: 'recharge',
-            operator: std.operator,
-            value: std.value,
-            qty: 0
-          });
+        const groupKey = `${std.operator}_${std.value}`;
+        if (!cardGroups[groupKey]) {
+          cardGroups[groupKey] = [];
         }
       }
-      setCardStock(mergedCards);
+
+      const consolidatedCards: CardStockEntry[] = [];
+      for (const groupKey of Object.keys(cardGroups)) {
+        const entries = cardGroups[groupKey];
+        const [op, val] = groupKey.split('_');
+        const canonicalId = `std_card_${op.replace(/\s+/g, '')}_${val}`;
+
+        if (entries.length === 0) {
+          consolidatedCards.push({
+            id: canonicalId,
+            kind: 'recharge',
+            operator: op,
+            value: val,
+            qty: 0
+          });
+        } else if (entries.length === 1) {
+          const single = entries[0];
+          consolidatedCards.push({
+            ...single,
+            operator: op,
+            value: val
+          });
+        } else {
+          // Merge duplicates and clean up Firebase DB
+          const totalSum = entries.reduce((s, c) => s + (c.qty || 0), 0);
+          const canonicalEntry = entries.find(e => e.id === canonicalId) || entries[0];
+          const updatedCanonical: CardStockEntry = {
+            ...canonicalEntry,
+            id: canonicalEntry.id,
+            kind: 'recharge',
+            operator: op,
+            value: val,
+            qty: totalSum
+          };
+          consolidatedCards.push(updatedCanonical);
+
+          putWithOutbox(`/cardStock/${canonicalEntry.id}.json`, updatedCanonical);
+          for (const dup of entries) {
+            if (dup.id !== canonicalEntry.id) {
+              putWithOutbox(`/cardStock/${dup.id}.json`, null);
+            }
+          }
+        }
+      }
+      setCardStock(consolidatedCards);
       setCashRegister(typeof cashRegisterRaw === 'number' ? cashRegisterRaw : 0);
       setExpenses(parseRawWithKeys<Expense>(expensesRaw));
       setSpareParts(parseRawWithKeys<SparePart>(sparePartsRaw));
@@ -1480,24 +1540,28 @@ export default function App() {
     const qtyVal = parseInt(cardQty) || 0;
     if (qtyVal <= 0) return triggerToast('❌ الرجاء إدخال كمية صحيحة');
 
-    const existing = cardStock.find(c => c.operator === cardOperator && String(c.value) === String(cardValue));
+    const normOp = normalizeOpName(cardOperator);
+    const normVal = String(cardValue).trim();
+    const existing = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
+
     if (existing) {
-      const updated = { ...existing, qty: existing.qty + qtyVal };
-      setCardStock(prev => prev.map(c => c.id === existing.id ? updated : c));
-      await putWithOutbox(`/cardStock/${existing.id}.json`, updated);
+      const res = await safeIncrementCardQty(existing.id, qtyVal, existing.qty);
+      const newQty = res.newQty !== undefined ? res.newQty : existing.qty + qtyVal;
+      setCardStock(prev => prev.map(c => c.id === existing.id ? { ...c, qty: newQty } : c));
     } else {
+      const canonicalId = `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`;
       const newCard: CardStockEntry = {
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        id: canonicalId,
         kind: 'recharge',
-        operator: cardOperator,
-        value: cardValue,
+        operator: normOp,
+        value: normVal,
         qty: qtyVal
       };
       setCardStock(prev => [...prev, newCard]);
       await putWithOutbox(`/cardStock/${newCard.id}.json`, newCard);
     }
     triggerToast('✅ تم تحديث مخزن بطاقات الشحن');
-    logAudit('edit', `إضافة بطاقات شحن لـ ${cardOperator} فئة ${cardValue}: +${qtyVal}`);
+    logAudit('edit', `إضافة بطاقات شحن لـ ${normOp} فئة ${normVal}: +${qtyVal}`);
     setCardQty('');
   };
 
@@ -1523,15 +1587,19 @@ export default function App() {
     if (!card) return;
     if (delta < 0 && card.qty <= 0) return triggerToast('❌ المخزن فارغ بالفعل');
 
-    const newVal = card.qty + delta;
-    const updated = { ...card, qty: newVal };
-    setCardStock(prev => prev.map(c => c.id === id ? updated : c));
-    const ok = await putWithOutbox(`/cardStock/${card.id}.json`, updated);
-    if (ok) {
+    if (delta > 0) {
+      const res = await safeIncrementCardQty(card.id, delta, card.qty);
+      const newQty = res.newQty !== undefined ? res.newQty : card.qty + delta;
+      setCardStock(prev => prev.map(c => c.id === id ? { ...c, qty: newQty } : c));
       triggerToast('✅ تم تحديث كمية البطاقات');
-      logAudit('edit', `تعديل سريع لستوك بطاقات ${card.operator} فئة ${card.value}: ${card.qty} ← ${newVal} (${delta > 0 ? '+' : ''}${delta})`);
+      logAudit('edit', `تعديل سريع لستوك بطاقات ${card.operator} فئة ${card.value}: ${card.qty} ← ${newQty} (+${delta})`);
     } else {
-      triggerToast('❌ فشل تعديل الكمية، الرجاء المحاولة مجدداً');
+      const absDelta = Math.abs(delta);
+      const res = await safeDecrementCardQty(card.id, absDelta, card.qty);
+      const newQty = res.newQty !== undefined ? res.newQty : Math.max(0, card.qty - absDelta);
+      setCardStock(prev => prev.map(c => c.id === id ? { ...c, qty: newQty } : c));
+      triggerToast('✅ تم تحديث كمية البطاقات');
+      logAudit('edit', `تعديل سريع لستوك بطاقات ${card.operator} فئة ${card.value}: ${card.qty} ← ${newQty} (-${absDelta})`);
     }
   };
 
@@ -1764,20 +1832,22 @@ export default function App() {
           itemIncrements[line.itemId] = (itemIncrements[line.itemId] || 0) + line.qty;
         }
         if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
-          let card = cardStock.find(c => c.operator === line.cardOperator && String(c.value) === String(line.cardValue));
+          const normOp = normalizeOpName(line.cardOperator);
+          const normVal = String(line.cardValue).trim();
+          let card = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
           if (!card) {
             card = {
-              id: `std_card_${line.cardOperator.replace(/\s+/g, '')}_${line.cardValue}`,
+              id: `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`,
               kind: 'recharge',
-              operator: line.cardOperator,
-              value: String(line.cardValue),
+              operator: normOp,
+              value: normVal,
               qty: 0
             };
           }
           if (!cardIncrements[card.id]) {
             cardIncrements[card.id] = { entry: card, totalQty: 0 };
           }
-          cardIncrements[card.id].totalQty += line.qty;
+          cardIncrements[card.id].totalQty += (line.qty || 1);
         }
         if (line.type === 'forfait' && line.cardOperator) {
           forfaitIncrements[line.cardOperator] = (forfaitIncrements[line.cardOperator] || 0) + (line.total || 0);
@@ -1790,13 +1860,10 @@ export default function App() {
         await safeIncrementItemQty(itemId, itemIncrements[itemId], localItem?.qty);
       }
 
-      // Rollback recharge cards
+      // Rollback recharge cards atomically
       for (const cardId of Object.keys(cardIncrements)) {
         const { entry, totalQty } = cardIncrements[cardId];
-        await putWithOutbox(`/cardStock/${cardId}.json`, {
-          ...entry,
-          qty: entry.qty + totalQty
-        });
+        await safeIncrementCardQty(cardId, totalQty, entry.qty);
       }
 
       // Rollback forfait balance
@@ -1971,14 +2038,16 @@ export default function App() {
       const qtyVal = parseInt(rechargeQty) || 1;
       if (qtyVal <= 0) return triggerToast('❌ كمية غير صالحة');
 
-      const cardEntry = cardStock.find(c => c.operator === rechargeOp && String(c.value) === String(face));
+      const normOp = normalizeOpName(rechargeOp);
+      const normVal = String(face).trim();
+      const cardEntry = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
       const availableStock = cardEntry ? cardEntry.qty : 0;
       const cartAlready = cart
-        .filter(c => c.type === 'recharge' && c.cardOperator === rechargeOp && String(c.cardValue) === String(face))
+        .filter(c => c.type === 'recharge' && normalizeOpName(c.cardOperator) === normOp && String(c.cardValue).trim() === normVal)
         .reduce((s, c) => s + c.qty, 0);
 
       if (qtyVal + cartAlready > availableStock) {
-        return triggerToast(`❌ مخزون بطاقات ${rechargeOp} (${face} د.ت) غير كافي! المتوفر بالمخزن: ${Math.max(0, availableStock - cartAlready)} كارت`);
+        return triggerToast(`❌ مخزون بطاقات ${normOp} (${normVal} د.ت) غير كافي! المتوفر بالمخزن: ${Math.max(0, availableStock - cartAlready)} كارت`);
       }
 
       const override = parseFloat(rechargePriceOverride);
@@ -1989,13 +2058,13 @@ export default function App() {
       const newLine: CartLine = {
         id: Math.random().toString(36).slice(2, 9),
         type: 'recharge',
-        label: `شحن بطاقة ${rechargeOp} فئة ${face} د.ت`,
+        label: `شحن بطاقة ${normOp} فئة ${normVal} د.ت`,
         qty: qtyVal,
         unitPrice: finalPrice,
         total: finalTotal,
         commission: finalCommission,
-        cardOperator: rechargeOp,
-        cardValue: String(face)
+        cardOperator: normOp,
+        cardValue: normVal
       };
       setCart(prev => [...prev, newLine]);
       setRechargeQty('1');
@@ -2132,10 +2201,12 @@ export default function App() {
     }
 
     if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
-      const cardEntry = cardStock.find(c => c.operator === line.cardOperator && String(c.value) === String(line.cardValue));
+      const normOp = normalizeOpName(line.cardOperator);
+      const normVal = String(line.cardValue).trim();
+      const cardEntry = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
       const availableStock = cardEntry ? cardEntry.qty : 0;
       const otherCartQty = cart
-        .filter(c => c.type === 'recharge' && c.cardOperator === line.cardOperator && String(c.cardValue) === String(line.cardValue) && c.id !== lineId)
+        .filter(c => c.type === 'recharge' && normalizeOpName(c.cardOperator) === normOp && String(c.cardValue).trim() === normVal && c.id !== lineId)
         .reduce((s, c) => s + c.qty, 0);
       if (newQty + otherCartQty > availableStock) {
         return triggerToast(`❌ مخزون بطاقات الشحن المتوفر فقط: ${Math.max(0, availableStock - otherCartQty)} كارت`);
@@ -2184,10 +2255,12 @@ export default function App() {
     }
 
     if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
-      const cardEntry = cardStock.find(c => c.operator === line.cardOperator && String(c.value) === String(line.cardValue));
+      const normOp = normalizeOpName(line.cardOperator);
+      const normVal = String(line.cardValue).trim();
+      const cardEntry = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
       const availableStock = cardEntry ? cardEntry.qty : 0;
       const otherCartQty = cart
-        .filter(c => c.type === 'recharge' && c.cardOperator === line.cardOperator && String(c.cardValue) === String(line.cardValue) && c.id !== lineId)
+        .filter(c => c.type === 'recharge' && normalizeOpName(c.cardOperator) === normOp && String(c.cardValue).trim() === normVal && c.id !== lineId)
         .reduce((s, c) => s + c.qty, 0);
       if (val + otherCartQty > availableStock) {
         return triggerToast(`❌ مخزون بطاقات الشحن المتوفر فقط: ${Math.max(0, availableStock - otherCartQty)} كارت`);
@@ -2266,55 +2339,61 @@ export default function App() {
       const cardStockDepletions: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
       for (const line of cart) {
         if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
-          let entry = cardStock.find(c => c.operator === line.cardOperator && String(c.value) === String(line.cardValue));
+          const normOp = normalizeOpName(line.cardOperator);
+          const normVal = String(line.cardValue).trim();
+          let entry = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
           if (!entry) {
             entry = {
-              id: `std_card_${line.cardOperator.replace(/\s+/g, '')}_${line.cardValue}`,
+              id: `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`,
               kind: 'recharge',
-              operator: line.cardOperator,
-              value: String(line.cardValue),
+              operator: normOp,
+              value: normVal,
               qty: 0
             };
           }
           if (!cardStockDepletions[entry.id]) {
             cardStockDepletions[entry.id] = { entry, totalQty: 0 };
           }
-          cardStockDepletions[entry.id].totalQty += line.qty;
+          cardStockDepletions[entry.id].totalQty += (line.qty || 1);
         }
       }
 
       let cardStockError = '';
-      for (const key of Object.keys(cardStockDepletions)) {
-        const { entry, totalQty } = cardStockDepletions[key];
-        if (entry.qty < totalQty) {
-          cardStockError = `❌ مخزون بطاقات ${entry.operator} (${entry.value} د.ت) غير كافي بالمخزن! المتوفر: ${entry.qty} | المطلوب: ${totalQty}`;
+      const successfulCardDecrements: { cardId: string; totalQty: number }[] = [];
+
+      for (const entryId of Object.keys(cardStockDepletions)) {
+        const { entry, totalQty } = cardStockDepletions[entryId];
+        const res = await safeDecrementCardQty(entry.id, totalQty, entry.qty);
+        if (res.success) {
+          successfulCardDecrements.push({ cardId: entry.id, totalQty });
+        } else {
+          cardStockError = res.reason === 'insufficient'
+            ? `❌ مخزون بطاقات ${entry.operator} (${entry.value} د.ت) غير كافي بالمخزن! المتوفر: ${res.available || 0}`
+            : `❌ فشل تحديث مخزن بطاقات ${entry.operator} بسبب تداخل بالشبكة`;
           break;
         }
       }
 
       if (cardStockError) {
+        // Rollback items
         for (const item of successList) {
           const localItem = items.find(i => i.id === item.itemId);
           await safeIncrementItemQty(item.itemId, item.amt, localItem?.qty);
+        }
+        // Rollback cards
+        for (const dec of successfulCardDecrements) {
+          const localCard = cardStock.find(c => c.id === dec.cardId);
+          await safeIncrementCardQty(dec.cardId, dec.totalQty, localCard?.qty);
         }
         setIsFinalizing(false);
         return triggerToast(cardStockError);
       }
 
-      // Apply card stock depletions
-      for (const entryId of Object.keys(cardStockDepletions)) {
-        const { entry, totalQty } = cardStockDepletions[entryId];
-        const newQty = Math.max(0, entry.qty - totalQty);
-        await putWithOutbox(`/cardStock/${entry.id}.json`, {
-          ...entry,
-          qty: newQty
-        });
-      }
-
-      if (Object.keys(cardStockDepletions).length > 0) {
+      // Optimistically update cardStock in React state
+      if (successfulCardDecrements.length > 0) {
         setCardStock(prevCards => prevCards.map(card => {
-          const dep = cardStockDepletions[card.id];
-          return dep ? { ...card, qty: Math.max(0, card.qty - dep.totalQty) } : card;
+          const dec = successfulCardDecrements.find(d => d.cardId === card.id);
+          return dec ? { ...card, qty: Math.max(0, card.qty - dec.totalQty) } : card;
         }));
       }
 
@@ -2526,17 +2605,20 @@ export default function App() {
             // Rollback recharge
             if ((record.category === 'recharge' || record.category === 'card') && record.cardOperator && record.cardValue) {
               const restoreQty = record.qty || 1;
-              const card = cardStock.find(c => c.operator === record.cardOperator && String(c.value) === String(record.cardValue));
+              const normOp = normalizeOpName(record.cardOperator);
+              const normVal = String(record.cardValue).trim();
+              const card = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
               if (card) {
-                const updated = { ...card, qty: card.qty + restoreQty };
-                await putWithOutbox(`/cardStock/${card.id}.json`, updated);
-                setCardStock(prev => prev.map(c => c.id === card.id ? updated : c));
+                const res = await safeIncrementCardQty(card.id, restoreQty, card.qty);
+                const newQty = res.newQty !== undefined ? res.newQty : card.qty + restoreQty;
+                setCardStock(prev => prev.map(c => c.id === card.id ? { ...c, qty: newQty } : c));
               } else {
+                const canonicalId = `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`;
                 const newCard: CardStockEntry = {
-                  id: `std_card_${record.cardOperator.replace(/\s+/g, '')}_${record.cardValue}`,
+                  id: canonicalId,
                   kind: 'recharge',
-                  operator: record.cardOperator,
-                  value: String(record.cardValue),
+                  operator: normOp,
+                  value: normVal,
                   qty: restoreQty
                 };
                 await putWithOutbox(`/cardStock/${newCard.id}.json`, newCard);

@@ -326,6 +326,139 @@ export async function safeIncrementItemQty(
   return { success: false, reason: 'conflict' };
 }
 
+export async function safeDecrementCardQty(
+  cardId: string, 
+  amount: number, 
+  fallbackCurrentQty?: number, 
+  maxRetries = 6
+): Promise<{ success: boolean; newQty?: number; reason?: string; available?: number }> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    let currentQty: any, etag: string | null = null;
+    try {
+      const getRes = await fetch(dbUrl('/cardStock/' + cardId + '/qty.json'), {
+        headers: { 'X-Firebase-ETag': 'true' }
+      });
+      if (getRes.ok) {
+        etag = getRes.headers.get('ETag');
+        currentQty = await getRes.json();
+      } else {
+        throw new Error('HTTP ' + getRes.status);
+      }
+    } catch (e) {
+      if (typeof fallbackCurrentQty === 'number') {
+        if (fallbackCurrentQty < amount) {
+          return { success: false, reason: 'insufficient', available: fallbackCurrentQty };
+        }
+        const newQty = fallbackCurrentQty - amount;
+        putWithOutbox('/cardStock/' + cardId + '/qty.json', newQty);
+        return { success: true, newQty };
+      }
+      return { success: false, reason: 'network' };
+    }
+    if (typeof currentQty !== 'number') {
+      if (typeof fallbackCurrentQty === 'number') {
+        if (fallbackCurrentQty < amount) {
+          return { success: false, reason: 'insufficient', available: fallbackCurrentQty };
+        }
+        const newQty = fallbackCurrentQty - amount;
+        putWithOutbox('/cardStock/' + cardId + '/qty.json', newQty);
+        return { success: true, newQty };
+      }
+      return { success: false, reason: 'notfound' };
+    }
+    if (currentQty < amount) {
+      return { success: false, reason: 'insufficient', available: currentQty };
+    }
+    const newQty = currentQty - amount;
+    
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (etag) {
+        headers['if-match'] = etag;
+      }
+      const putRes = await fetch(dbUrl('/cardStock/' + cardId + '/qty.json'), {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify(newQty)
+      });
+      if (putRes.status === 200) {
+        return { success: true, newQty };
+      }
+    } catch (e) {
+      putWithOutbox('/cardStock/' + cardId + '/qty.json', newQty);
+      return { success: true, newQty };
+    }
+  }
+  if (typeof fallbackCurrentQty === 'number' && fallbackCurrentQty >= amount) {
+    const newQty = fallbackCurrentQty - amount;
+    putWithOutbox('/cardStock/' + cardId + '/qty.json', newQty);
+    return { success: true, newQty };
+  }
+  return { success: false, reason: 'conflict' };
+}
+
+export async function safeIncrementCardQty(
+  cardId: string, 
+  amount: number, 
+  fallbackCurrentQty?: number, 
+  maxRetries = 6
+): Promise<{ success: boolean; newQty?: number; reason?: string }> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    let currentQty: any, etag: string | null = null;
+    try {
+      const getRes = await fetch(dbUrl('/cardStock/' + cardId + '/qty.json'), {
+        headers: { 'X-Firebase-ETag': 'true' }
+      });
+      if (getRes.ok) {
+        etag = getRes.headers.get('ETag');
+        currentQty = await getRes.json();
+      } else {
+        throw new Error('HTTP ' + getRes.status);
+      }
+    } catch (e) {
+      if (typeof fallbackCurrentQty === 'number') {
+        const newQty = fallbackCurrentQty + amount;
+        putWithOutbox('/cardStock/' + cardId + '/qty.json', newQty);
+        return { success: true, newQty };
+      }
+      return { success: false, reason: 'network' };
+    }
+    if (typeof currentQty !== 'number') {
+      if (typeof fallbackCurrentQty === 'number') {
+        const newQty = fallbackCurrentQty + amount;
+        putWithOutbox('/cardStock/' + cardId + '/qty.json', newQty);
+        return { success: true, newQty };
+      }
+      return { success: false, reason: 'notfound' };
+    }
+    const newQty = currentQty + amount;
+    
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (etag) {
+        headers['if-match'] = etag;
+      }
+      const putRes = await fetch(dbUrl('/cardStock/' + cardId + '/qty.json'), {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify(newQty)
+      });
+      if (putRes.status === 200) {
+        return { success: true, newQty };
+      }
+    } catch (e) {
+      putWithOutbox('/cardStock/' + cardId + '/qty.json', newQty);
+      return { success: true, newQty };
+    }
+  }
+  if (typeof fallbackCurrentQty === 'number') {
+    const newQty = fallbackCurrentQty + amount;
+    putWithOutbox('/cardStock/' + cardId + '/qty.json', newQty);
+    return { success: true, newQty };
+  }
+  return { success: false, reason: 'conflict' };
+}
+
 // ---- Offline Outbox Queue ----
 export interface OutboxEntry {
   id: string;
