@@ -13,6 +13,7 @@ import {
   ensureAuth, signInManager, resumeManagerSession, logoutManager,
   fetchJsonWithRetry, safeDecrementItemQty, safeIncrementItemQty,
   safeDecrementCardQty, safeIncrementCardQty,
+  safeDecrementPhotoStock, safeIncrementPhotoStock,
   putWithOutbox, patchWithOutbox, flushOutbox, dbUrl, verifyManagerPinViaAuth,
   updateManagerPinViaAuth
 } from './firebase';
@@ -254,6 +255,8 @@ export default function App() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [forfaitPlans, setForfaitPlans] = useState<ForfaitPlan[]>([]);
   const [forfaitBalance, setForfaitBalance] = useState<ForfaitBalance>({ Ooredoo: 0, Orange: 0, 'Tunisie Telecom': 0 });
+  const [photoPaperStock, setPhotoPaperStock] = useState<number>(0);
+  const [photoStockInput, setPhotoStockInput] = useState<string>('');
   const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
   const [managerPin, setManagerPin] = useState<string>(''); // SHA256 string
   const [currentRole, setCurrentRole] = useState<AppRole | null>(null);
@@ -359,6 +362,7 @@ export default function App() {
   const [historySearch, setHistorySearch] = useState('');
   const [historyCategory, setHistoryCategory] = useState<'all' | 'item' | 'recharge' | 'forfait' | 'photo' | 'service'>('all');
   const [historyDateFilter, setHistoryDateFilter] = useState<'all' | 'today' | 'yesterday' | '7days' | '30days'>('all');
+  const [dashboardDateFilter, setDashboardDateFilter] = useState<'today' | 'yesterday' | '7days' | '30days' | 'all'>('today');
 
   // Cart
   interface CartLine {
@@ -470,6 +474,7 @@ export default function App() {
         fetchJsonWithRetry('/expenses.json').catch(() => null),
         fetchJsonWithRetry('/forfaitPlans.json').catch(() => null),
         fetchJsonWithRetry('/forfaitBalance.json').catch(() => null),
+        fetchJsonWithRetry('/photoPaperStock.json').catch(() => 0),
         fetchJsonWithRetry('/auditLog.json').catch(() => null),
         fetchJsonWithRetry('/pin.json').catch(() => '1234'),
         fetchJsonWithRetry('/whatsappConfig.json').catch(() => null),
@@ -479,7 +484,7 @@ export default function App() {
 
       const [
         itemsRaw, salesRaw, otherIncomeRaw, debtsRaw, cardStockRaw,
-        cashRegisterRaw, expensesRaw, plansRaw, balanceRaw, auditRaw, pinRaw, whatsappConfigRaw,
+        cashRegisterRaw, expensesRaw, plansRaw, balanceRaw, photoPaperStockRaw, auditRaw, pinRaw, whatsappConfigRaw,
         sparePartsRaw, telegramConfigRaw
       ] = results;
 
@@ -599,6 +604,7 @@ export default function App() {
       }
 
       setForfaitBalance(balanceRaw ? { Ooredoo: 0, Orange: 0, 'Tunisie Telecom': 0, ...balanceRaw } : { Ooredoo: 0, Orange: 0, 'Tunisie Telecom': 0 });
+      setPhotoPaperStock(typeof photoPaperStockRaw === 'number' ? photoPaperStockRaw : 0);
 
       // Handle legacy raw PIN hashing
       const finalPin = typeof pinRaw === 'object' ? (pinRaw.owner || '1234') : pinRaw;
@@ -1653,6 +1659,48 @@ export default function App() {
     }
   };
 
+  // ---- 3.5 Photo paper stock management ----
+  const handleAddPhotoStock = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const addVal = parseInt(photoStockInput) || 0;
+    if (addVal <= 0) return triggerToast('❌ الرجاء إدخال كمية صحيحة');
+    const res = await safeIncrementPhotoStock(addVal, photoPaperStock);
+    const newQty = res.newQty !== undefined ? res.newQty : photoPaperStock + addVal;
+    setPhotoPaperStock(newQty);
+    setPhotoStockInput('');
+    triggerToast('✅ تم تحديث مخزون ورق الصور الشمسية');
+    logAudit('edit', `إضافة كمية لورق الصور الشمسية (رولو): +${addVal} صورة (المجموع الجديد: ${newQty})`);
+  };
+
+  const handleEditPhotoStock = async () => {
+    const valStr = prompt('أدخل العدد الكلي المتبقي لصور رولو ورق الصور:', photoPaperStock.toString());
+    if (valStr === null) return;
+    const newQty = parseInt(valStr);
+    if (isNaN(newQty) || newQty < 0) return triggerToast('❌ كمية غير صالحة');
+    await putWithOutbox('/photoPaperStock.json', newQty);
+    setPhotoPaperStock(newQty);
+    triggerToast('✅ تم تعديل مخزون ورق الصور');
+    logAudit('edit', `تعديل مخزون ورق الصور الشمسية الدقيق: ${photoPaperStock} ← ${newQty} صورة`);
+  };
+
+  const handleQuickAdjustPhotoStock = async (delta: number) => {
+    if (delta < 0 && photoPaperStock <= 0) return triggerToast('❌ المخزون فارغ بالفعل');
+    if (delta > 0) {
+      const res = await safeIncrementPhotoStock(delta, photoPaperStock);
+      const newQty = res.newQty !== undefined ? res.newQty : photoPaperStock + delta;
+      setPhotoPaperStock(newQty);
+      triggerToast('✅ تم تحديث مخزون ورق الصور');
+      logAudit('edit', `تعديل سريع لمخزون ورق الصور: ${photoPaperStock} ← ${newQty} (+${delta})`);
+    } else {
+      const absDelta = Math.abs(delta);
+      const res = await safeDecrementPhotoStock(absDelta, photoPaperStock);
+      const newQty = res.newQty !== undefined ? res.newQty : Math.max(0, photoPaperStock - absDelta);
+      setPhotoPaperStock(newQty);
+      triggerToast('✅ تم تحديث مخزون ورق الصور');
+      logAudit('edit', `تعديل سريع لمخزون ورق الصور: ${photoPaperStock} ← ${newQty} (-${absDelta})`);
+    }
+  };
+
   const handleAddForfaitPlan = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newPlanName) return triggerToast('❌ أدخل اسم الباقة');
@@ -1825,6 +1873,7 @@ export default function App() {
     const itemIncrements: Record<string, number> = {};
     const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
     const forfaitIncrements: Record<string, number> = {};
+    let photoIncrement = 0;
 
     if (debt.lines) {
       for (const line of debt.lines) {
@@ -1852,6 +1901,9 @@ export default function App() {
         if (line.type === 'forfait' && line.cardOperator) {
           forfaitIncrements[line.cardOperator] = (forfaitIncrements[line.cardOperator] || 0) + (line.total || 0);
         }
+        if (line.type === 'photo') {
+          photoIncrement += (line.qty || 1);
+        }
       }
 
       // Rollback items
@@ -1874,6 +1926,12 @@ export default function App() {
           updatedBalance[op] = curBal + forfaitIncrements[op];
         }
         await putWithOutbox('/forfaitBalance.json', updatedBalance);
+      }
+
+      // Rollback photo paper stock
+      if (photoIncrement > 0) {
+        await safeIncrementPhotoStock(photoIncrement, photoPaperStock);
+        setPhotoPaperStock(prev => prev + photoIncrement);
       }
     }
 
@@ -2100,15 +2158,22 @@ export default function App() {
     else if (incomeType === 'photo') {
       const desc = photoDesc.trim() || 'صور شمسية';
       const qtyVal = parseInt(photoQty) || 1;
+      if (qtyVal <= 0) return triggerToast('❌ أدخل كمية صور صحيحة');
       const amtVal = parseFloat(photoAmount) || 0;
       if (amtVal <= 0) return triggerToast('❌ أدخل مبلغ الخدمة');
 
+      const photoInCart = cart.filter(c => c.type === 'photo').reduce((s, c) => s + c.qty, 0);
+      if (qtyVal + photoInCart > photoPaperStock) {
+        return triggerToast(`❌ مخزون ورق الصور (الرولو) غير كافي! المتوفر بالمخزن: ${Math.max(0, photoPaperStock - photoInCart)} صورة`);
+      }
+
+      const unitP = amtVal / qtyVal;
       const newLine: CartLine = {
         id: Math.random().toString(36).slice(2, 9),
         type: 'photo',
-        label: `${desc} × ${qtyVal}`,
-        qty: 1,
-        unitPrice: amtVal,
+        label: `${desc} (${qtyVal} صورة)`,
+        qty: qtyVal,
+        unitPrice: unitP,
         total: amtVal,
         commission: amtVal
       };
@@ -2213,6 +2278,15 @@ export default function App() {
       }
     }
 
+    if (line.type === 'photo') {
+      const otherCartQty = cart
+        .filter(c => c.type === 'photo' && c.id !== lineId)
+        .reduce((s, c) => s + c.qty, 0);
+      if (newQty + otherCartQty > photoPaperStock) {
+        return triggerToast(`❌ مخزون ورق الصور (الرولو) المتوفر فقط: ${Math.max(0, photoPaperStock - otherCartQty)} صورة`);
+      }
+    }
+
     setCart(prev => prev.map(c => {
       if (c.id === lineId) {
         const faceVal = parseFloat(c.cardValue || '0');
@@ -2264,6 +2338,15 @@ export default function App() {
         .reduce((s, c) => s + c.qty, 0);
       if (val + otherCartQty > availableStock) {
         return triggerToast(`❌ مخزون بطاقات الشحن المتوفر فقط: ${Math.max(0, availableStock - otherCartQty)} كارت`);
+      }
+    }
+
+    if (line.type === 'photo') {
+      const otherCartQty = cart
+        .filter(c => c.type === 'photo' && c.id !== lineId)
+        .reduce((s, c) => s + c.qty, 0);
+      if (val + otherCartQty > photoPaperStock) {
+        return triggerToast(`❌ مخزون ورق الصور (الرولو) المتوفر فقط: ${Math.max(0, photoPaperStock - otherCartQty)} صورة`);
       }
     }
 
@@ -2425,6 +2508,38 @@ export default function App() {
           }
           return next;
         });
+      }
+
+      // Photo Paper Stock depletion
+      const totalPhotosInCart = cart.filter(c => c.type === 'photo').reduce((s, c) => s + (c.qty || 1), 0);
+      let photoStockError = '';
+
+      if (totalPhotosInCart > 0) {
+        const res = await safeDecrementPhotoStock(totalPhotosInCart, photoPaperStock);
+        if (!res.success) {
+          photoStockError = res.reason === 'insufficient'
+            ? `❌ مخزون ورق الصور (الرولو) غير كافي بالمخزن! المتوفر: ${res.available || 0} صورة`
+            : `❌ فشل تحديث مخزون ورق الصور بسبب تداخل بالشبكة`;
+        }
+      }
+
+      if (photoStockError) {
+        // Rollback items
+        for (const item of successList) {
+          const localItem = items.find(i => i.id === item.itemId);
+          await safeIncrementItemQty(item.itemId, item.amt, localItem?.qty);
+        }
+        // Rollback cards
+        for (const dec of successfulCardDecrements) {
+          const localCard = cardStock.find(c => c.id === dec.cardId);
+          await safeIncrementCardQty(dec.cardId, dec.totalQty, localCard?.qty);
+        }
+        setIsFinalizing(false);
+        return triggerToast(photoStockError);
+      }
+
+      if (totalPhotosInCart > 0) {
+        setPhotoPaperStock(prev => Math.max(0, prev - totalPhotosInCart));
       }
 
       const date = new Date().toISOString();
@@ -2630,6 +2745,13 @@ export default function App() {
               const curBal = forfaitBalance[record.cardOperator] || 0;
               await putWithOutbox('/forfaitBalance.json', { ...forfaitBalance, [record.cardOperator]: curBal + record.amount });
               setForfaitBalance(prev => ({ ...prev, [record.cardOperator!]: (prev[record.cardOperator!] || 0) + record.amount }));
+            }
+            // Rollback photo paper stock
+            if (record.category === 'photo') {
+              const restoreQty = record.qty || 1;
+              const res = await safeIncrementPhotoStock(restoreQty, photoPaperStock);
+              const newQty = res.newQty !== undefined ? res.newQty : photoPaperStock + restoreQty;
+              setPhotoPaperStock(newQty);
             }
           }
           setOtherIncome(prev => prev.filter(o => o.id !== id));
@@ -2928,22 +3050,91 @@ export default function App() {
   };
 
   // ---- 9. Dashboard Financial Calculations ----
-  const totalSales = sales.reduce((s, c) => s + c.total, 0);
-  const totalForfaitSales = otherIncome.filter(o => o.category === 'forfait').reduce((s, c) => s + c.amount, 0);
-  const totalRechargeSales = otherIncome.filter(o => o.category === 'recharge').reduce((s, c) => s + c.amount, 0);
-  const totalServicesAndOthers = otherIncome.filter(o => o.category !== 'forfait' && o.category !== 'recharge').reduce((s, c) => s + c.amount, 0);
-  const totalOther = otherIncome.reduce((s, c) => s + c.amount, 0);
-  const totalExpenses = expenses.reduce((s, c) => s + c.amount, 0);
+  const filteredDashboardData = useMemo(() => {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000;
+    const startOf7Days = startOfToday - 6 * 24 * 60 * 60 * 1000;
+    const startOf30Days = startOfToday - 29 * 24 * 60 * 60 * 1000;
+
+    const inRange = (dateStr: string) => {
+      if (!dateStr) return false;
+      const t = new Date(dateStr).getTime();
+      if (dashboardDateFilter === 'today') return t >= startOfToday;
+      if (dashboardDateFilter === 'yesterday') return t >= startOfYesterday && t < startOfToday;
+      if (dashboardDateFilter === '7days') return t >= startOf7Days;
+      if (dashboardDateFilter === '30days') return t >= startOf30Days;
+      return true; // 'all'
+    };
+
+    const dSales = sales.filter(s => inRange(s.date));
+    const dOther = otherIncome.filter(o => inRange(o.date));
+    const dExpenses = expenses.filter(e => inRange(e.date));
+
+    const totalSalesVal = dSales.reduce((s, c) => s + c.total, 0);
+    const totalForfaitSalesVal = dOther.filter(o => o.category === 'forfait').reduce((s, c) => s + c.amount, 0);
+    const totalRechargeSalesVal = dOther.filter(o => o.category === 'recharge').reduce((s, c) => s + c.amount, 0);
+    const totalPhotoSalesVal = dOther.filter(o => o.category === 'photo').reduce((s, c) => s + c.amount, 0);
+    const totalServiceSalesVal = dOther.filter(o => o.category === 'service').reduce((s, c) => s + c.amount, 0);
+    const totalDebtPaymentSalesVal = dOther.filter(o => o.category === 'debt_payment').reduce((s, c) => s + c.amount, 0);
+    
+    const totalServicesAndOthersVal = dOther.filter(o => o.category !== 'forfait' && o.category !== 'recharge').reduce((s, c) => s + c.amount, 0);
+    const totalOtherVal = dOther.reduce((s, c) => s + c.amount, 0);
+    const totalExpensesVal = dExpenses.reduce((s, c) => s + c.amount, 0);
+
+    // Profit calculations for selected period
+    const totalBuyCostOfSalesVal = dSales.reduce((s, c) => s + ((c.unitBuy || 0) * c.qty), 0);
+    const totalItemProfitsVal = totalSalesVal - totalBuyCostOfSalesVal;
+    const totalOtherProfitsVal = dOther.reduce((s, c) => s + (c.commission || 0), 0);
+    const netProfitVal = totalItemProfitsVal + totalOtherProfitsVal - totalExpensesVal;
+
+    const totalCashInflow = totalSalesVal + totalOtherVal;
+    
+    // Expected Cash in register:
+    // If 'today' or 'all': starting cash + cash received - expenses
+    // If past period (yesterday / 7days / 30days): total cash inflow - expenses for that period
+    const expectedCashInHandVal = (dashboardDateFilter === 'today' || dashboardDateFilter === 'all')
+      ? cashRegister + totalCashInflow - totalExpensesVal
+      : totalCashInflow - totalExpensesVal;
+
+    return {
+      dSales,
+      dOther,
+      dExpenses,
+      totalSales: totalSalesVal,
+      totalForfaitSales: totalForfaitSalesVal,
+      totalRechargeSales: totalRechargeSalesVal,
+      totalPhotoSales: totalPhotoSalesVal,
+      totalServiceSales: totalServiceSalesVal,
+      totalDebtPaymentSales: totalDebtPaymentSalesVal,
+      totalServicesAndOthers: totalServicesAndOthersVal,
+      totalOther: totalOtherVal,
+      totalExpenses: totalExpensesVal,
+      totalCashInflow,
+      totalBuyCostOfSales: totalBuyCostOfSalesVal,
+      netProfit: netProfitVal,
+      expectedCashInHand: expectedCashInHandVal
+    };
+  }, [sales, otherIncome, expenses, cashRegister, dashboardDateFilter]);
+
+  const {
+    dOther,
+    totalSales,
+    totalForfaitSales,
+    totalRechargeSales,
+    totalPhotoSales,
+    totalServiceSales,
+    totalDebtPaymentSales,
+    totalServicesAndOthers,
+    totalOther,
+    totalExpenses,
+    totalCashInflow,
+    totalBuyCostOfSales,
+    netProfit,
+    expectedCashInHand
+  } = filteredDashboardData;
+
   const totalOwed = debts.filter(d => d.status === 'open').reduce((s, d) => s + (d.amount - d.paid), 0);
-
-  // Profit calculations
-  const totalBuyCostOfSales = sales.reduce((s, c) => s + ((c.unitBuy || 0) * c.qty), 0);
-  const totalItemProfits = totalSales - totalBuyCostOfSales;
-  const totalOtherProfits = otherIncome.reduce((s, c) => s + (c.commission || 0), 0);
-  const netProfit = totalItemProfits + totalOtherProfits - totalExpenses;
-
-  // Expected Cash register cash
-  const expectedCashInHand = cashRegister + totalSales + totalOther - totalExpenses;
 
   // Render variables
   const openDebts = debts.filter(d => d.status === 'open' && (!debtSearch || normalizeArabic(d.customerName).includes(normalizeArabic(debtSearch))));
@@ -3338,6 +3529,36 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Date Filter Bar for Dashboard */}
+                <div className="bg-white rounded-2xl border border-stone-200 p-3 shadow-xs flex flex-col sm:flex-row items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-xs font-extrabold text-stone-800">
+                    <span className="p-1.5 bg-red-100 text-red-700 rounded-xl">📊</span>
+                    <span>فترة حسابات لوحة التحكم:</span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5 w-full sm:w-auto">
+                    {[
+                      { id: 'today', label: '📅 اليوم (Aujourd\'hui)' },
+                      { id: 'yesterday', label: '⏮️ أمس' },
+                      { id: '7days', label: '🗓️ آخر 7 أيام' },
+                      { id: '30days', label: '📆 آخر 30 يوم' },
+                      { id: 'all', label: '♾️ كل التواريخ' },
+                    ].map(tab => (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => setDashboardDateFilter(tab.id as any)}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer select-none ${
+                          dashboardDateFilter === tab.id
+                            ? 'bg-red-700 text-white shadow-xs scale-105'
+                            : 'bg-stone-100 hover:bg-stone-200 text-stone-700'
+                        }`}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 {/* Dashboard Stats Panel */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                   <div className="bg-emerald-50/80 border border-emerald-200 p-4 rounded-2xl text-center shadow-xs">
@@ -3372,17 +3593,35 @@ export default function App() {
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  <div className="bg-stone-900 text-stone-100 p-4 rounded-2xl text-center border border-stone-800 shadow-md">
-                    <span className="text-xs text-amber-400 font-bold">💰 الكاش المتوقع بالصندوق (الآن)</span>
-                    <div className="font-mono text-2xl font-black text-amber-400 mt-1">{expectedCashInHand.toFixed(3)} د.ت</div>
+                  <div className="bg-stone-900 text-stone-100 p-4 rounded-2xl border border-stone-800 shadow-md flex flex-col justify-between">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs text-amber-400 font-bold">
+                        💰 الكاش المتوقع بالدرج ({dashboardDateFilter === 'today' ? 'اليوم' : dashboardDateFilter === 'yesterday' ? 'أمس' : dashboardDateFilter === '7days' ? '7 أيام' : dashboardDateFilter === '30days' ? '30 يوم' : 'الكل'})
+                      </span>
+                      <span className="text-[10px] bg-amber-400/20 text-amber-300 px-2 py-0.5 rounded-md font-bold">
+                        {dashboardDateFilter === 'today' ? 'مطابقة الكاسة' : 'صافي التدفق'}
+                      </span>
+                    </div>
+                    <div className="font-mono text-2xl font-black text-amber-400 my-1 text-center">{expectedCashInHand.toFixed(3)} د.ت</div>
+                    <div className="text-[10px] text-stone-300 border-t border-stone-800 pt-1.5 mt-1 font-mono text-center dir-ltr">
+                      {dashboardDateFilter === 'today' || dashboardDateFilter === 'all'
+                        ? `(بداية: ${cashRegister.toFixed(3)} + مداخيل: ${totalCashInflow.toFixed(3)} - مصاريف: ${totalExpenses.toFixed(3)})`
+                        : `(مداخيل الفترة: ${totalCashInflow.toFixed(3)} - مصاريف: ${totalExpenses.toFixed(3)})`}
+                    </div>
                   </div>
-                  <div className="bg-rose-50/80 border border-rose-200 p-4 rounded-2xl text-center">
-                    <span className="text-xs text-rose-800 font-bold">💸 المصاريف الكلية</span>
+                  <div className="bg-rose-50/80 border border-rose-200 p-4 rounded-2xl text-center flex flex-col justify-between">
+                    <span className="text-xs text-rose-800 font-bold">💸 المصاريف المسجلة</span>
                     <div className="font-mono text-2xl font-black text-rose-700 mt-1">{totalExpenses.toFixed(3)} د.ت</div>
+                    <div className="text-[10px] text-rose-600 font-medium border-t border-rose-200/60 pt-1 mt-1">
+                      عدد المصاريف: {filteredDashboardData.dExpenses.length} عملية
+                    </div>
                   </div>
-                  <div className="bg-orange-50/80 border border-orange-200 p-4 rounded-2xl text-center">
+                  <div className="bg-orange-50/80 border border-orange-200 p-4 rounded-2xl text-center flex flex-col justify-between">
                     <span className="text-xs text-orange-800 font-bold">📑 إجمالي الديون القائمة</span>
                     <div className="font-mono text-2xl font-black text-orange-700 mt-1">{totalOwed.toFixed(3)} د.ت</div>
+                    <div className="text-[10px] text-orange-600 font-medium border-t border-orange-200/60 pt-1 mt-1">
+                      الديون غير الخالصة لجميع الحرفاء
+                    </div>
                   </div>
                 </div>
 
@@ -3798,7 +4037,109 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Section D: Forfait plan Catalog list */}
+                {/* Section D: Photo Paper Stock Management */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {currentRole === 'manager' && (
+                    <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
+                      <h3 className="font-extrabold text-stone-800 text-xs mb-3 flex items-center gap-2">
+                        <span>🪪 تسجيل وتزويد رولو ورق الصور الشمسية</span>
+                      </h3>
+                      <form onSubmit={handleAddPhotoStock} className="space-y-3">
+                        <div>
+                          <label className="block text-[10px] text-stone-500 mb-1">عدد الصور المضافة للرولو</label>
+                          <input 
+                            type="number" 
+                            placeholder="مثلاً: 100 أو 200"
+                            value={photoStockInput}
+                            onChange={e => setPhotoStockInput(e.target.value)}
+                            className="w-full bg-stone-50 border border-stone-200 px-3 py-2.5 rounded-xl text-xs text-stone-800 font-mono"
+                          />
+                        </div>
+                        <button type="submit" className="w-full bg-purple-700 hover:bg-purple-800 text-white font-bold py-2.5 rounded-xl text-xs cursor-pointer shadow-xs transition-all">
+                          ➕ إضافة الكمية لرولو الصور
+                        </button>
+                      </form>
+                    </div>
+                  )}
+
+                  <div className={`bg-white rounded-2xl border border-stone-200 p-5 shadow-xs ${currentRole !== 'manager' ? 'col-span-1 md:col-span-2' : ''}`}>
+                    <h3 className="font-extrabold text-stone-800 text-xs mb-3 flex items-center justify-between">
+                      <span>📊 مخزون رولو ورق الصور الحالية</span>
+                      <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-mono font-bold ${
+                        photoPaperStock <= 10 ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'
+                      }`}>
+                        {photoPaperStock <= 10 ? '⚠️ مخزون منخفض' : '✅ متوفر'}
+                      </span>
+                    </h3>
+                    <div className="p-4 bg-purple-50/50 rounded-2xl border border-purple-100 flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center font-bold text-lg">
+                          🪪
+                        </div>
+                        <div>
+                          <div className="font-extrabold text-stone-800 text-xs">ورق الصور الشمسية (رولو)</div>
+                          <div className="text-[10px] text-stone-500">الكمية الإجمالية المتبقية للطباعة</div>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {currentRole === 'manager' ? (
+                          <div className="flex items-center gap-1">
+                            <button 
+                              type="button"
+                              onClick={() => handleQuickAdjustPhotoStock(-10)}
+                              className="px-2 py-1 rounded-lg bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 font-bold font-mono text-[10px] cursor-pointer"
+                              title="إنقاص 10 صور"
+                            >
+                              -10
+                            </button>
+                            <button 
+                              type="button"
+                              onClick={() => handleQuickAdjustPhotoStock(-1)}
+                              className="w-7 h-7 rounded-full bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                              title="إنقاص 1 صورة"
+                            >
+                              -
+                            </button>
+                            <button 
+                              type="button"
+                              onClick={handleEditPhotoStock}
+                              className={`px-3 py-1.5 rounded-xl font-black font-mono text-xs cursor-pointer shadow-2xs ${
+                                photoPaperStock <= 10 ? 'bg-rose-600 text-white' : 'bg-purple-700 text-white'
+                              }`}
+                              title="اضغط لتعديل الرقم مباشرة"
+                            >
+                              {photoPaperStock} صورة
+                            </button>
+                            <button 
+                              type="button"
+                              onClick={() => handleQuickAdjustPhotoStock(1)}
+                              className="w-7 h-7 rounded-full bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                              title="زيادة 1 صورة"
+                            >
+                              +
+                            </button>
+                            <button 
+                              type="button"
+                              onClick={() => handleQuickAdjustPhotoStock(10)}
+                              className="px-2 py-1 rounded-lg bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 font-bold font-mono text-[10px] cursor-pointer"
+                              title="زيادة 10 صور"
+                            >
+                              +10
+                            </button>
+                          </div>
+                        ) : (
+                          <span className={`px-3 py-1.5 rounded-xl font-black font-mono text-xs ${
+                            photoPaperStock <= 10 ? 'bg-rose-100 text-rose-800' : 'bg-purple-100 text-purple-900'
+                          }`}>
+                            {photoPaperStock} صورة
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Section E: Forfait plan Catalog list */}
                 <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
                   <h3 className="font-extrabold text-stone-800 text-xs mb-3">📋 كتالوغ باقات الأنترنت (نفس الأسعار للكل)</h3>
                   
@@ -4515,36 +4856,53 @@ export default function App() {
 
                       {/* Sub-form: Photo */}
                       {incomeType === 'photo' && (
-                        <div className="grid grid-cols-3 gap-2">
-                          <div className="col-span-1">
-                            <label className="block text-[10px] text-stone-500 mb-0.5">نوع الصور</label>
-                            <input 
-                              type="text" 
-                              placeholder="صور بطاقة تعريف..."
-                              value={photoDesc}
-                              onChange={e => setPhotoDesc(e.target.value)}
-                              className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
-                            />
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between p-2.5 rounded-xl bg-purple-50 border border-purple-100 text-xs">
+                            <div className="flex items-center gap-1.5 font-bold text-purple-950">
+                              <span>🪪 رولو ورق الصور المتبقي بالمخزن:</span>
+                              <span className={`font-mono font-black px-2 py-0.5 rounded-lg text-xs ${
+                                photoPaperStock <= 0 ? 'bg-rose-600 text-white' : photoPaperStock <= 10 ? 'bg-amber-500 text-white' : 'bg-purple-700 text-white'
+                              }`}>
+                                {photoPaperStock} صورة
+                              </span>
+                            </div>
+                            {photoPaperStock <= 0 && (
+                              <span className="text-[11px] font-bold text-rose-600 animate-pulse">⚠️ الرولو فارغ! يرجى إبلاغ المدير للتزويد</span>
+                            )}
                           </div>
-                          <div>
-                            <label className="block text-[10px] text-stone-500 mb-0.5">عدد الحرفاء</label>
-                            <input 
-                              type="number" 
-                              value={photoQty}
-                              onChange={e => setPhotoQty(e.target.value)}
-                              className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-[10px] text-stone-500 mb-0.5">المبلغ المطلوب</label>
-                            <input 
-                              type="number" 
-                              step="0.001"
-                              placeholder="0.000"
-                              value={photoAmount}
-                              onChange={e => setPhotoAmount(e.target.value)}
-                              className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
-                            />
+                          <div className="grid grid-cols-3 gap-2">
+                            <div className="col-span-1">
+                              <label className="block text-[10px] text-stone-500 mb-0.5">نوع الصور</label>
+                              <input 
+                                type="text" 
+                                placeholder="صور بطاقة تعريف..."
+                                value={photoDesc}
+                                onChange={e => setPhotoDesc(e.target.value)}
+                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] text-stone-700 mb-0.5 font-bold">عدد الصور (الكمية)</label>
+                              <input 
+                                type="number" 
+                                min="1"
+                                placeholder="1"
+                                value={photoQty}
+                                onChange={e => setPhotoQty(e.target.value)}
+                                className="w-full bg-white border border-purple-300 focus:border-purple-600 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono font-bold"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] text-stone-500 mb-0.5">المبلغ النهائي (د.ت)</label>
+                              <input 
+                                type="number" 
+                                step="0.001"
+                                placeholder="0.000"
+                                value={photoAmount}
+                                onChange={e => setPhotoAmount(e.target.value)}
+                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
+                              />
+                            </div>
                           </div>
                         </div>
                       )}
@@ -5811,12 +6169,12 @@ export default function App() {
               {/* Total Banner */}
               <div className="bg-gradient-to-r from-blue-600 to-indigo-700 text-white p-4 rounded-2xl shadow-md flex items-center justify-between">
                 <div>
-                  <span className="text-xs text-blue-100 font-bold block">إجمالي مبيعات الفورفي الكلية</span>
+                  <span className="text-xs text-blue-100 font-bold block">إجمالي مبيعات الفورفي للفترة المحددة</span>
                   <span className="font-mono text-2xl font-black">{totalForfaitSales.toFixed(3)} د.ت</span>
                 </div>
                 <div className="text-left bg-white/10 px-3.5 py-1.5 rounded-xl border border-white/20">
                   <span className="text-[11px] text-blue-100 block">إجمالي العمليات</span>
-                  <span className="font-mono font-bold text-sm">{otherIncome.filter(o => o.category === 'forfait').length} عملية</span>
+                  <span className="font-mono font-bold text-sm">{dOther.filter(o => o.category === 'forfait').length} عملية</span>
                 </div>
               </div>
 
@@ -5824,10 +6182,10 @@ export default function App() {
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 {/* Ooredoo */}
                 {(() => {
-                  const opSales = otherIncome
+                  const opSales = dOther
                     .filter(o => o.category === 'forfait' && (o.cardOperator === 'Ooredoo' || (!o.cardOperator && o.label.includes('Ooredoo'))))
                     .reduce((s, c) => s + c.amount, 0);
-                  const opCount = otherIncome
+                  const opCount = dOther
                     .filter(o => o.category === 'forfait' && (o.cardOperator === 'Ooredoo' || (!o.cardOperator && o.label.includes('Ooredoo'))))
                     .length;
                   const pct = totalForfaitSales > 0 ? ((opSales / totalForfaitSales) * 100).toFixed(1) : '0';
@@ -5856,10 +6214,10 @@ export default function App() {
 
                 {/* Orange */}
                 {(() => {
-                  const opSales = otherIncome
+                  const opSales = dOther
                     .filter(o => o.category === 'forfait' && (o.cardOperator === 'Orange' || (!o.cardOperator && o.label.includes('Orange'))))
                     .reduce((s, c) => s + c.amount, 0);
-                  const opCount = otherIncome
+                  const opCount = dOther
                     .filter(o => o.category === 'forfait' && (o.cardOperator === 'Orange' || (!o.cardOperator && o.label.includes('Orange'))))
                     .length;
                   const pct = totalForfaitSales > 0 ? ((opSales / totalForfaitSales) * 100).toFixed(1) : '0';
@@ -5888,10 +6246,10 @@ export default function App() {
 
                 {/* Tunisie Telecom */}
                 {(() => {
-                  const opSales = otherIncome
+                  const opSales = dOther
                     .filter(o => o.category === 'forfait' && (o.cardOperator === 'Tunisie Telecom' || (!o.cardOperator && (o.label.includes('Telecom') || o.label.includes('اتصالات')))))
                     .reduce((s, c) => s + c.amount, 0);
-                  const opCount = otherIncome
+                  const opCount = dOther
                     .filter(o => o.category === 'forfait' && (o.cardOperator === 'Tunisie Telecom' || (!o.cardOperator && (o.label.includes('Telecom') || o.label.includes('اتصالات')))))
                     .length;
                   const pct = totalForfaitSales > 0 ? ((opSales / totalForfaitSales) * 100).toFixed(1) : '0';
