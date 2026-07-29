@@ -399,23 +399,9 @@ export default function App() {
     setTimeout(() => setToastMsg(''), 2200);
   };
 
-  // Log Audit trail to server (fire and forget)
-  const logAudit = async (action: string, label: string) => {
-    const entry: AuditLogEntry = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      action,
-      label,
-      user: currentRole === 'manager' ? '🔑 مدير' : '🧑‍💼 بائع',
-      date: new Date().toISOString()
-    };
-    setAuditLog(prev => [entry, ...prev]);
-    try {
-      fetch(dbUrl(`/auditLog/${entry.id}.json`), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(entry)
-      }).catch(() => {});
-    } catch (e) {}
+  // Log Audit trail (no-op since Audit Log tab is disabled)
+  const logAudit = async (_action: string, _label: string) => {
+    // Disabled to save Firebase database storage
   };
 
   // First initialization load
@@ -479,7 +465,7 @@ export default function App() {
         fetchJsonWithRetry('/forfaitPlans.json').catch(() => null),
         fetchJsonWithRetry('/forfaitBalance.json').catch(() => null),
         fetchJsonWithRetry('/photoPaperStock.json').catch(() => 0),
-        fetchJsonWithRetry('/auditLog.json').catch(() => null),
+        Promise.resolve(null),
         fetchJsonWithRetry('/pin.json').catch(() => '1234'),
         fetchJsonWithRetry('/whatsappConfig.json').catch(() => null),
         fetchJsonWithRetry('/spareParts.json').catch(() => null),
@@ -5941,56 +5927,7 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Audit Logs list */}
-                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
-                  <h3 className="font-extrabold text-stone-800 text-xs mb-3">📋 سجل العمليات الحساسة والأمان (Audit Log)</h3>
-                  
-                  <div className="relative mb-3">
-                    <input 
-                      type="text" 
-                      placeholder="🔍 ابحث في سجل العمليات..."
-                      value={auditLogSearch}
-                      onChange={e => setAuditLogSearch(e.target.value)}
-                      className="w-full bg-stone-50 border border-stone-200 pl-10 pr-3 py-2 rounded-xl text-xs"
-                    />
-                    <Search className="absolute left-3 top-3 text-stone-400" size={13} />
-                  </div>
 
-                  {(() => {
-                    const filteredAudit = auditLog.filter(a => !auditLogSearch || normalizeArabic(a.label + ' ' + a.user).includes(normalizeArabic(auditLogSearch)));
-                    return (
-                      <>
-                        <div className="space-y-2 max-h-72 overflow-y-auto">
-                          {filteredAudit.slice(0, auditLimit).map((log, idx) => (
-                            <div key={idx} className="p-2.5 bg-stone-50 rounded-xl border border-stone-100 flex justify-between items-start text-[10px]">
-                              <div>
-                                <span className="font-bold text-stone-800">{log.label}</span>
-                                <div className="text-stone-400 mt-0.5">منفذ العملية: {log.user}</div>
-                              </div>
-                              <span className="text-stone-400 font-mono">{new Date(log.date).toLocaleString('fr-TN')}</span>
-                            </div>
-                          ))}
-                        </div>
-                        {filteredAudit.length > auditLimit && (
-                          <div className="mt-3 flex gap-2 justify-center">
-                            <button 
-                              onClick={() => setAuditLimit(prev => prev + 50)}
-                              className="bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold px-3 py-1.5 rounded-lg text-[10px] cursor-pointer"
-                            >
-                              عرض المزيد (+50 عملية أمنية) 🔄
-                            </button>
-                            <button 
-                              onClick={() => setAuditLimit(filteredAudit.length)}
-                              className="bg-stone-800 text-white font-bold px-3 py-1.5 rounded-lg text-[10px] cursor-pointer"
-                            >
-                              عرض الكل ({filteredAudit.length})
-                            </button>
-                          </div>
-                        )}
-                      </>
-                    );
-                  })()}
-                </div>
 
               </div>
             )}
