@@ -7,7 +7,7 @@ import {
 } from 'lucide-react';
 import { 
   Item, Sale, OtherIncome, Debt, CardStockEntry, Expense, 
-  ForfaitPlan, ForfaitBalance, AuditLogEntry, AppTab, AppRole, SparePart 
+  ForfaitPlan, ForfaitBalance, AuditLogEntry, AppTab, AppRole, SparePart, ShiftLog 
 } from './types';
 import {
   ensureAuth, signInManager, resumeManagerSession, logoutManager,
@@ -23,6 +23,7 @@ import { BarcodeScannerPopup } from './components/BarcodeScannerPopup';
 import { LoginOverlay } from './components/LoginOverlay';
 import { VisualProductRecognitionModal } from './components/VisualProductRecognitionModal';
 import { DuplicateProductModal } from './components/DuplicateProductModal';
+import { ShiftHandoverModal } from './components/ShiftHandoverModal';
 import { findSimilarProducts, recordLearningDecision, SimilarityResult } from './utils/productSimilarity';
 
 // Helper to normalize Arabic
@@ -252,6 +253,10 @@ export default function App() {
   const [debts, setDebts] = useState<Debt[]>([]);
   const [cardStock, setCardStock] = useState<CardStockEntry[]>([]);
   const [cashRegister, setCashRegister] = useState<number>(0);
+  const [lastCashResetTimestamp, setLastCashResetTimestamp] = useState<string | null>(null);
+  const [shiftLogs, setShiftLogs] = useState<ShiftLog[]>([]);
+  const [showShiftHandoverModal, setShowShiftHandoverModal] = useState<boolean>(false);
+  const [dashboardDateFilter, setDashboardDateFilter] = useState<'shift' | 'today' | 'yesterday' | '7days' | '30days' | 'all'>('shift');
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [forfaitPlans, setForfaitPlans] = useState<ForfaitPlan[]>([]);
   const [forfaitBalance, setForfaitBalance] = useState<ForfaitBalance>({ Ooredoo: 0, Orange: 0, 'Tunisie Telecom': 0 });
@@ -362,7 +367,6 @@ export default function App() {
   const [historySearch, setHistorySearch] = useState('');
   const [historyCategory, setHistoryCategory] = useState<'all' | 'item' | 'recharge' | 'forfait' | 'photo' | 'service'>('all');
   const [historyDateFilter, setHistoryDateFilter] = useState<'all' | 'today' | 'yesterday' | '7days' | '30days'>('all');
-  const [dashboardDateFilter, setDashboardDateFilter] = useState<'today' | 'yesterday' | '7days' | '30days' | 'all'>('today');
 
   // Cart
   interface CartLine {
@@ -479,14 +483,21 @@ export default function App() {
         fetchJsonWithRetry('/pin.json').catch(() => '1234'),
         fetchJsonWithRetry('/whatsappConfig.json').catch(() => null),
         fetchJsonWithRetry('/spareParts.json').catch(() => null),
-        fetchJsonWithRetry('/telegramConfig.json').catch(() => null)
+        fetchJsonWithRetry('/telegramConfig.json').catch(() => null),
+        fetchJsonWithRetry('/lastCashResetTimestamp.json').catch(() => null),
+        fetchJsonWithRetry('/shiftLogs.json').catch(() => null)
       ]);
 
       const [
         itemsRaw, salesRaw, otherIncomeRaw, debtsRaw, cardStockRaw,
         cashRegisterRaw, expensesRaw, plansRaw, balanceRaw, photoPaperStockRaw, auditRaw, pinRaw, whatsappConfigRaw,
-        sparePartsRaw, telegramConfigRaw
+        sparePartsRaw, telegramConfigRaw, lastResetRaw, shiftLogsRaw
       ] = results;
+
+      if (typeof lastResetRaw === 'string') {
+        setLastCashResetTimestamp(lastResetRaw);
+      }
+      setShiftLogs(parseRawWithKeys<ShiftLog>(shiftLogsRaw));
 
       setItems(parseRawWithKeys<Item>(itemsRaw));
       setSales(parseRawWithKeys<Sale>(salesRaw));
@@ -1419,6 +1430,234 @@ export default function App() {
     } catch (err: any) {
       console.error('Error generating PDF report:', err);
       triggerToast('❌ خطأ أثناء توليد تقرير PDF');
+      return null;
+    }
+  };
+
+  const generateShiftReportPDF = async (
+    shiftData: {
+      sellerName: string;
+      startingCash: number;
+      salesTotal: number;
+      otherIncomeTotal: number;
+      expensesTotal: number;
+      expectedCash: number;
+      actualCash: number;
+      cashWithdrawn: number;
+      newStartingCash: number;
+      notes: string;
+    },
+    shiftSales: Sale[],
+    shiftOtherIncome: OtherIncome[]
+  ) => {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1240;
+      canvas.height = 1754;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, 1240, 1754);
+
+      // Top bar
+      ctx.fillStyle = '#D97706'; // Amber-600
+      ctx.fillRect(0, 0, 1240, 25);
+
+      // Header Title
+      ctx.fillStyle = '#1C1917';
+      ctx.font = 'bold 32px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.direction = 'rtl';
+      ctx.textAlign = 'right';
+      ctx.fillText('📋 تقرير تسليم الوردية وتصفير الكاسة', 1140, 95);
+
+      ctx.fillStyle = '#78716C';
+      ctx.font = '18px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.fillText('نظام إدارة مبيعات Yosri GSM - متصل بالخادم السحابي', 1140, 135);
+
+      // Divider line
+      ctx.strokeStyle = '#E7E5E4';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(100, 165);
+      ctx.lineTo(1140, 165);
+      ctx.stroke();
+
+      // Metadata
+      ctx.fillStyle = '#44403C';
+      ctx.font = 'bold 16px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(`📅 تاريخ التصفير: ${new Date().toLocaleString('ar-TN')}`, 1140, 205);
+      ctx.fillText(`👤 الوردية / البائع: ${shiftData.sellerName || 'غير مسمى'}`, 1140, 240);
+
+      ctx.textAlign = 'left';
+      const reportId = `SHIFT-${Date.now().toString(36).toUpperCase()}`;
+      ctx.fillText(`🔑 معرّف التقرير: #${reportId}`, 100, 205);
+
+      ctx.beginPath();
+      ctx.moveTo(100, 275);
+      ctx.lineTo(1140, 275);
+      ctx.stroke();
+
+      // Cards
+      const drawCard = (cx: number, cy: number, cw: number, ch: number, title: string, value: string, color: string) => {
+        ctx.fillStyle = '#FAFAF9';
+        ctx.fillRect(cx, cy, cw, ch);
+        ctx.strokeStyle = '#E7E5E4';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(cx, cy, cw, ch);
+
+        ctx.fillStyle = color;
+        ctx.fillRect(cx, cy, cw, 6);
+
+        ctx.fillStyle = '#78716C';
+        ctx.font = 'bold 14px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.direction = 'rtl';
+        ctx.textAlign = 'center';
+        ctx.fillText(title, cx + cw / 2, cy + 35);
+
+        ctx.fillStyle = '#1C1917';
+        ctx.font = 'bold 22px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.fillText(value, cx + cw / 2, cy + 78);
+      };
+
+      const totalRevenue = shiftData.salesTotal + shiftData.otherIncomeTotal;
+      const diff = shiftData.actualCash - shiftData.expectedCash;
+      const diffStr = diff === 0 ? 'مطابقة (0.000)' : `${diff > 0 ? '+' : ''}${diff.toFixed(3)} د.ت`;
+
+      drawCard(800, 310, 340, 110, '💵 مداخيل الوردية الكلية', `${totalRevenue.toFixed(3)} د.ت`, '#059669');
+      drawCard(450, 310, 340, 110, '💸 مصاريف الوردية', `${shiftData.expensesTotal.toFixed(3)} د.ت`, '#DC2626');
+      drawCard(100, 310, 340, 110, '🏦 الصافي المسحوب للخزنة', `${shiftData.cashWithdrawn.toFixed(3)} د.ت`, '#2563EB');
+
+      drawCard(800, 435, 340, 110, '💰 الكاش المفترض بالدرج', `${shiftData.expectedCash.toFixed(3)} د.ت`, '#D97706');
+      drawCard(450, 435, 340, 110, '💵 الكاش الفعلي المحسوب', `${shiftData.actualCash.toFixed(3)} د.ت`, '#1C1917');
+      drawCard(100, 435, 340, 110, '⚖️ الفارق / المطابقة', diffStr, diff === 0 ? '#059669' : diff < 0 ? '#DC2626' : '#2563EB');
+
+      // Table Header
+      ctx.fillStyle = '#1C1917';
+      ctx.font = 'bold 20px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.direction = 'rtl';
+      ctx.textAlign = 'right';
+      ctx.fillText('📋 كشف عمليات الوردية الممسوحة من السحابة:', 1140, 580);
+
+      const tableY = 605;
+      ctx.fillStyle = '#1C1917';
+      ctx.fillRect(100, tableY, 1040, 40);
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 15px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.direction = 'rtl';
+      ctx.textAlign = 'center';
+
+      ctx.fillText('م', 1115, tableY + 25);
+      ctx.fillText('الوقت', 990, tableY + 25);
+      ctx.fillText('البيان / تفاصيل العملية', 670, tableY + 25);
+      ctx.fillText('الكمية', 410, tableY + 25);
+      ctx.fillText('السعر', 310, tableY + 25);
+      ctx.fillText('الإجمالي', 175, tableY + 25);
+
+      const allRows = [
+        ...shiftSales.map(s => ({
+          date: s.date,
+          label: s.itemName,
+          qty: s.qty,
+          price: s.unitPrice,
+          total: s.total
+        })),
+        ...shiftOtherIncome.map(o => ({
+          date: o.date,
+          label: `${o.category === 'forfait_replenish' ? 'شحن رصيد فورفي' : o.category === 'card' ? 'بيع كارت شحن' : 'خدمة أخرى'}: ${o.label}`,
+          qty: o.qty || 1,
+          price: o.amount / (o.qty || 1),
+          total: o.amount
+        }))
+      ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+      let currentY = tableY + 40;
+      const rowsToShow = allRows.slice(0, 22);
+
+      rowsToShow.forEach((row, idx) => {
+        ctx.fillStyle = idx % 2 === 0 ? '#FAFAF9' : '#FFFFFF';
+        ctx.fillRect(100, currentY, 1040, 36);
+
+        ctx.strokeStyle = '#F5F5F4';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(100, currentY, 1040, 36);
+
+        ctx.fillStyle = '#44403C';
+        ctx.font = '14px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.direction = 'rtl';
+        ctx.textAlign = 'center';
+
+        ctx.fillText(String(idx + 1), 1115, currentY + 23);
+
+        const timeStr = new Date(row.date).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        ctx.fillText(timeStr, 990, currentY + 23);
+
+        ctx.textAlign = 'right';
+        let lbl = row.label || '';
+        if (lbl.length > 42) lbl = lbl.slice(0, 39) + '...';
+        ctx.fillText(lbl, 870, currentY + 23);
+
+        ctx.textAlign = 'center';
+        ctx.fillText(String(row.qty), 410, currentY + 23);
+        ctx.fillText(row.price.toFixed(3), 310, currentY + 23);
+
+        ctx.fillStyle = '#1C1917';
+        ctx.font = 'bold 14px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.fillText(row.total.toFixed(3), 175, currentY + 23);
+
+        currentY += 36;
+      });
+
+      if (allRows.length > 22) {
+        ctx.fillStyle = '#78716C';
+        ctx.font = 'italic 13px "Segoe UI", Tahoma, Arial, sans-serif';
+        ctx.direction = 'rtl';
+        ctx.textAlign = 'center';
+        ctx.fillText(`💡 ولقد تم تصفير ومسح ${allRows.length - 22} عملية إضافية من السحابة وتوثيقها بهذا التقرير.`, 620, currentY + 25);
+      }
+
+      // Footer
+      ctx.strokeStyle = '#E7E5E4';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(100, 1630, 1040, 60);
+
+      ctx.fillStyle = '#78716C';
+      ctx.font = '13px "Segoe UI", Tahoma, Arial, sans-serif';
+      ctx.direction = 'rtl';
+      ctx.textAlign = 'center';
+      ctx.fillText('🛡️ تم تصفير الكاسة وتوثيق حسابات الوردية بنجاح مع مسح السجلات من الفايربيز لتوفير المساحة المجانية.', 620, 1655);
+      ctx.fillText('متجر Yosri GSM - العنوان: تبر، الكاف | هاتف: 41 444 355 | متصل بالخادم السحابي لـ Yosri GSM', 620, 1675);
+
+      const { jsPDF } = await import('jspdf');
+      const pdf = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
+      const imgData = canvas.toDataURL('image/png');
+      pdf.addImage(imgData, 'PNG', 0, 0, 210, 297);
+
+      const filename = `shift_report_${new Date().toISOString().split('T')[0]}_${reportId}.pdf`;
+      pdf.save(filename);
+
+      if (telegramConfig.enabled && telegramConfig.botToken && telegramConfig.chatId) {
+        const pdfBase64 = pdf.output('datauristring');
+        const caption = `📋 <b>تقرير تسليم الوردية وتصفير الكاسة (#${reportId})</b>\n\n` +
+          `• <b>الوردية/البائع:</b> ${shiftData.sellerName}\n` +
+          `• <b>مداخيل الوردية:</b> ${totalRevenue.toFixed(3)} د.ت\n` +
+          `• <b>مصاريف الوردية:</b> ${shiftData.expensesTotal.toFixed(3)} د.ت\n` +
+          `• <b>الكاش المفترض بالدرج:</b> ${shiftData.expectedCash.toFixed(3)} د.ت\n` +
+          `• <b>الكاش الفعلي بالدرج:</b> ${shiftData.actualCash.toFixed(3)} د.ت\n` +
+          `• <b>الفارق:</b> ${diffStr}\n` +
+          `• <b>المسحوب للخزنة:</b> <code>${shiftData.cashWithdrawn.toFixed(3)}</code> د.ت\n` +
+          `• <b>كاش بداية الوردية الجديدة:</b> ${shiftData.newStartingCash.toFixed(3)} د.ت\n\n` +
+          `<i>تم مسح مبيعات الوردية من الفايربيز وإرسال التقرير لتلغرام بنجاح.</i>`;
+
+        triggerToast('📤 جاري إرسال تقرير الوردية PDF لتلغرام...');
+        await sendTelegramPDF(pdfBase64, filename, caption);
+      }
+
+      return pdf;
+    } catch (err: any) {
+      console.error('Error generating shift PDF report:', err);
       return null;
     }
   };
@@ -3050,6 +3289,93 @@ export default function App() {
   };
 
   // ---- 9. Dashboard Financial Calculations ----
+  const currentShiftSales = useMemo(() => {
+    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : new Date().setHours(0,0,0,0);
+    return sales.filter(s => new Date(s.date).getTime() >= resetTimeMs);
+  }, [sales, lastCashResetTimestamp]);
+
+  const currentShiftOtherIncome = useMemo(() => {
+    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : new Date().setHours(0,0,0,0);
+    return otherIncome.filter(o => new Date(o.date).getTime() >= resetTimeMs);
+  }, [otherIncome, lastCashResetTimestamp]);
+
+  const currentShiftExpenses = useMemo(() => {
+    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : new Date().setHours(0,0,0,0);
+    return expenses.filter(e => new Date(e.date).getTime() >= resetTimeMs);
+  }, [expenses, lastCashResetTimestamp]);
+
+  const handlePerformShiftReset = async (data: {
+    sellerName: string;
+    salesTotal: number;
+    otherIncomeTotal: number;
+    expensesTotal: number;
+    expectedCash: number;
+    actualCash: number;
+    cashWithdrawn: number;
+    newStartingCash: number;
+    notes: string;
+  }) => {
+    // 1. Generate & download PDF report for the current shift (and send to Telegram)
+    triggerToast('📊 جاري توليد تقرير PDF الوردية...');
+    await generateShiftReportPDF(
+      {
+        sellerName: data.sellerName,
+        startingCash: cashRegister,
+        salesTotal: data.salesTotal,
+        otherIncomeTotal: data.otherIncomeTotal,
+        expensesTotal: data.expensesTotal,
+        expectedCash: data.expectedCash,
+        actualCash: data.actualCash,
+        cashWithdrawn: data.cashWithdrawn,
+        newStartingCash: data.newStartingCash,
+        notes: data.notes
+      },
+      currentShiftSales,
+      currentShiftOtherIncome
+    );
+
+    // 2. Clear sales and other income of this shift from Firebase to save database storage
+    triggerToast('🧹 جاري تفريغ سجلات الوردية من السحابة...');
+    for (const s of currentShiftSales) {
+      await putWithOutbox(`/sales/${s.id}.json`, null);
+    }
+    for (const o of currentShiftOtherIncome) {
+      await putWithOutbox(`/otherIncome/${o.id}.json`, null);
+    }
+
+    // 3. Save shift log & new starting cash
+    const newLog: ShiftLog = {
+      id: `shift_${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      sellerName: data.sellerName,
+      salesTotal: data.salesTotal,
+      otherIncomeTotal: data.otherIncomeTotal,
+      expensesTotal: data.expensesTotal,
+      expectedCashInDrawer: data.expectedCash,
+      actualCashInDrawer: data.actualCash,
+      cashWithdrawn: data.cashWithdrawn,
+      newStartingCash: data.newStartingCash,
+      difference: data.actualCash - data.expectedCash,
+      notes: data.notes
+    };
+
+    const okLog = await putWithOutbox(`/shiftLogs/${newLog.id}.json`, newLog);
+    const okReg = await putWithOutbox('/cashRegister.json', data.newStartingCash);
+    const okTime = await putWithOutbox('/lastCashResetTimestamp.json', newLog.timestamp);
+
+    if (okReg || okLog) {
+      setShiftLogs(prev => [...prev, newLog]);
+      setCashRegister(data.newStartingCash);
+      setLastCashResetTimestamp(newLog.timestamp);
+      setShowShiftHandoverModal(false);
+      triggerToast('✅ تم تصفير الكاسة، حفظ تقرير PDF، ومسح السجلات من الفايربيز بنجاح');
+      logAudit('reset', `تصفير الوردية وتفريغ السحابة: ${data.sellerName} (كاش مفرغ: ${data.cashWithdrawn.toFixed(3)} د.ت)`);
+      loadAllData();
+    } else {
+      triggerToast('❌ حدث خطأ أثناء تصفير الكاسة وتسليم الوردية');
+    }
+  };
+
   const filteredDashboardData = useMemo(() => {
     const now = new Date();
     const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
@@ -3057,9 +3383,14 @@ export default function App() {
     const startOf7Days = startOfToday - 6 * 24 * 60 * 60 * 1000;
     const startOf30Days = startOfToday - 29 * 24 * 60 * 60 * 1000;
 
+    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : startOfToday;
+
     const inRange = (dateStr: string) => {
       if (!dateStr) return false;
       const t = new Date(dateStr).getTime();
+      if (dashboardDateFilter === 'shift') {
+        return t >= resetTimeMs;
+      }
       if (dashboardDateFilter === 'today') return t >= startOfToday;
       if (dashboardDateFilter === 'yesterday') return t >= startOfYesterday && t < startOfToday;
       if (dashboardDateFilter === '7days') return t >= startOf7Days;
@@ -3090,12 +3421,22 @@ export default function App() {
 
     const totalCashInflow = totalSalesVal + totalOtherVal;
     
-    // Expected Cash in register:
-    // If 'today' or 'all': starting cash + cash received - expenses
-    // If past period (yesterday / 7days / 30days): total cash inflow - expenses for that period
-    const expectedCashInHandVal = (dashboardDateFilter === 'today' || dashboardDateFilter === 'all')
-      ? cashRegister + totalCashInflow - totalExpensesVal
-      : totalCashInflow - totalExpensesVal;
+    // Expected Cash in register calculation:
+    let expectedCashInHandVal = 0;
+    let withdrawnAmountForFormula = 0;
+
+    if (dashboardDateFilter === 'shift') {
+      expectedCashInHandVal = cashRegister + totalCashInflow - totalExpensesVal;
+    } else if (dashboardDateFilter === 'today') {
+      const todayLogs = shiftLogs.filter(s => new Date(s.timestamp).getTime() >= startOfToday);
+      withdrawnAmountForFormula = todayLogs.reduce((sum, s) => sum + (s.cashWithdrawn || 0), 0);
+      expectedCashInHandVal = cashRegister + totalCashInflow - totalExpensesVal - withdrawnAmountForFormula;
+    } else if (dashboardDateFilter === 'all') {
+      withdrawnAmountForFormula = shiftLogs.reduce((sum, s) => sum + (s.cashWithdrawn || 0), 0);
+      expectedCashInHandVal = cashRegister + totalCashInflow - totalExpensesVal - withdrawnAmountForFormula;
+    } else {
+      expectedCashInHandVal = totalCashInflow - totalExpensesVal;
+    }
 
     return {
       dSales,
@@ -3113,9 +3454,10 @@ export default function App() {
       totalCashInflow,
       totalBuyCostOfSales: totalBuyCostOfSalesVal,
       netProfit: netProfitVal,
-      expectedCashInHand: expectedCashInHandVal
+      expectedCashInHand: expectedCashInHandVal,
+      withdrawnAmountForFormula
     };
-  }, [sales, otherIncome, expenses, cashRegister, dashboardDateFilter]);
+  }, [sales, otherIncome, expenses, cashRegister, dashboardDateFilter, lastCashResetTimestamp, shiftLogs]);
 
   const {
     dOther,
@@ -3455,17 +3797,6 @@ export default function App() {
             {currentRole === 'manager' && (
               <>
                 <button 
-                  onClick={() => setCurrentTab('spare_parts')}
-                  className={`flex-1 min-w-[130px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
-                    currentTab === 'spare_parts' 
-                      ? 'bg-red-700 text-white shadow-md shadow-red-700/15 scale-[1.03]' 
-                      : 'text-stone-600 hover:bg-stone-100/80 hover:text-stone-800'
-                  }`}
-                >
-                  <span>🔧</span>
-                  <span>قطع الغيار (الفورنيسور)</span>
-                </button>
-                <button 
                   onClick={() => setCurrentTab('history')}
                   className={`flex-1 min-w-[130px] py-2 px-3 text-xs font-black text-center rounded-xl transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 select-none ${
                     currentTab === 'history' 
@@ -3505,10 +3836,23 @@ export default function App() {
               <div className="space-y-4">
                 {/* Expected cash starting card */}
                 <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-5 shadow-xs">
-                  <h3 className="font-extrabold text-stone-800 text-base flex items-center gap-2">
-                    💵 رصيد صندوق الكاسة الأساسي
-                  </h3>
-                  <p className="text-stone-500 text-[11px] mt-1">يُرجى إدخال الرصيد الافتتاحي للدرج لبدء حسابات اليوم بدقة:</p>
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-amber-200/80 pb-3">
+                    <div>
+                      <h3 className="font-extrabold text-stone-800 text-base flex items-center gap-2">
+                        💵 رصيد صندوق الكاسة الأساسي للوردية
+                      </h3>
+                      <p className="text-stone-500 text-[11px] mt-0.5">
+                        {lastCashResetTimestamp ? `آخر تصفير للوردية: ${new Date(lastCashResetTimestamp).toLocaleString('ar-TN')}` : 'بدء حسابات الوردية الحالية'}
+                      </p>
+                    </div>
+                    <button 
+                      type="button"
+                      onClick={() => setShowShiftHandoverModal(true)}
+                      className="bg-amber-600 hover:bg-amber-700 text-white font-extrabold px-4 py-2.5 rounded-xl text-xs cursor-pointer shadow-md transition-all flex items-center justify-center gap-1.5"
+                    >
+                      <span>🔄 تصفير الكاسة وتسليم الوردية</span>
+                    </button>
+                  </div>
                   
                   <form onSubmit={handleSaveStartingCash} className="flex gap-2 mt-3">
                     <input 
@@ -3518,45 +3862,26 @@ export default function App() {
                       placeholder="0.000"
                       className="flex-1 bg-white border border-stone-200 px-3 py-2 rounded-xl text-stone-800 font-mono text-sm"
                     />
-                    <button type="submit" className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-4 rounded-xl text-xs cursor-pointer">
-                      سجل كاش البداية
+                    <button type="submit" className="bg-stone-800 hover:bg-stone-900 text-white font-bold px-4 rounded-xl text-xs cursor-pointer">
+                      تعديل كاش البداية
                     </button>
                   </form>
                   
-                  <div className="mt-4 flex justify-between items-center bg-white/70 border border-amber-200 rounded-xl p-3">
-                    <span className="text-stone-600 text-xs">كاش البداية المسجل:</span>
+                  <div className="mt-3 flex justify-between items-center bg-white/80 border border-amber-200 rounded-xl p-3">
+                    <span className="text-stone-600 text-xs font-bold">كاش البداية المسجل للوردية الحالية:</span>
                     <span className="font-mono font-bold text-red-800 text-lg">{cashRegister.toFixed(3)} د.ت</span>
                   </div>
                 </div>
 
-                {/* Date Filter Bar for Dashboard */}
-                <div className="bg-white rounded-2xl border border-stone-200 p-3 shadow-xs flex flex-col sm:flex-row items-center justify-between gap-3">
+                {/* Active Shift Header Banner */}
+                <div className="bg-white rounded-2xl border border-stone-200 p-3 shadow-xs flex items-center justify-between">
                   <div className="flex items-center gap-2 text-xs font-extrabold text-stone-800">
-                    <span className="p-1.5 bg-red-100 text-red-700 rounded-xl">📊</span>
-                    <span>فترة حسابات لوحة التحكم:</span>
+                    <span className="p-1.5 bg-red-100 text-red-700 rounded-xl">☀️</span>
+                    <span>حسابات الوردية الحالية المفتوحة (منذ آخر تصفير للكاسة)</span>
                   </div>
-                  <div className="flex flex-wrap items-center gap-1.5 w-full sm:w-auto">
-                    {[
-                      { id: 'today', label: '📅 اليوم (Aujourd\'hui)' },
-                      { id: 'yesterday', label: '⏮️ أمس' },
-                      { id: '7days', label: '🗓️ آخر 7 أيام' },
-                      { id: '30days', label: '📆 آخر 30 يوم' },
-                      { id: 'all', label: '♾️ كل التواريخ' },
-                    ].map(tab => (
-                      <button
-                        key={tab.id}
-                        type="button"
-                        onClick={() => setDashboardDateFilter(tab.id as any)}
-                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer select-none ${
-                          dashboardDateFilter === tab.id
-                            ? 'bg-red-700 text-white shadow-xs scale-105'
-                            : 'bg-stone-100 hover:bg-stone-200 text-stone-700'
-                        }`}
-                      >
-                        {tab.label}
-                      </button>
-                    ))}
-                  </div>
+                  <span className="bg-emerald-100 text-emerald-800 px-3 py-1 rounded-xl text-xs font-black">
+                    وردية نشطة 🟢
+                  </span>
                 </div>
 
                 {/* Dashboard Stats Panel */}
@@ -3596,17 +3921,15 @@ export default function App() {
                   <div className="bg-stone-900 text-stone-100 p-4 rounded-2xl border border-stone-800 shadow-md flex flex-col justify-between">
                     <div className="flex justify-between items-center">
                       <span className="text-xs text-amber-400 font-bold">
-                        💰 الكاش المتوقع بالدرج ({dashboardDateFilter === 'today' ? 'اليوم' : dashboardDateFilter === 'yesterday' ? 'أمس' : dashboardDateFilter === '7days' ? '7 أيام' : dashboardDateFilter === '30days' ? '30 يوم' : 'الكل'})
+                        💰 الكاش المتوقع بالدرج (الوردية الحالية)
                       </span>
                       <span className="text-[10px] bg-amber-400/20 text-amber-300 px-2 py-0.5 rounded-md font-bold">
-                        {dashboardDateFilter === 'today' ? 'مطابقة الكاسة' : 'صافي التدفق'}
+                        مطابقة الكاسة
                       </span>
                     </div>
                     <div className="font-mono text-2xl font-black text-amber-400 my-1 text-center">{expectedCashInHand.toFixed(3)} د.ت</div>
                     <div className="text-[10px] text-stone-300 border-t border-stone-800 pt-1.5 mt-1 font-mono text-center dir-ltr">
-                      {dashboardDateFilter === 'today' || dashboardDateFilter === 'all'
-                        ? `(بداية: ${cashRegister.toFixed(3)} + مداخيل: ${totalCashInflow.toFixed(3)} - مصاريف: ${totalExpenses.toFixed(3)})`
-                        : `(مداخيل الفترة: ${totalCashInflow.toFixed(3)} - مصاريف: ${totalExpenses.toFixed(3)})`}
+                      (بداية الوردية: {cashRegister.toFixed(3)} + مداخيل: {totalCashInflow.toFixed(3)} - مصاريف: {totalExpenses.toFixed(3)})
                     </div>
                   </div>
                   <div className="bg-rose-50/80 border border-rose-200 p-4 rounded-2xl text-center flex flex-col justify-between">
@@ -3635,27 +3958,6 @@ export default function App() {
                     <span className="text-xs text-stone-500 font-bold">🧩 مجموع القطع الإجمالي:</span>
                     <span className="font-mono text-base font-black text-stone-800">{items.reduce((s, i) => s + i.qty, 0)} قطعة</span>
                   </div>
-                </div>
-
-                {/* Svg Chart */}
-                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="font-extrabold text-stone-800 text-xs flex items-center gap-1.5">
-                      <TrendingUp size={16} className="text-red-700" />
-                      إحصائيات المبيعات والأرباح
-                    </h3>
-                    <div className="flex items-center gap-1">
-                      <button onClick={() => setChartDayOffset(prev => prev - 1)} className="p-1 hover:bg-stone-100 rounded-lg text-xs font-bold text-stone-600">◀</button>
-                      <span className="text-[10px] text-stone-500 font-bold px-1">اليوم: {chartDayOffset}</span>
-                      <button onClick={() => setChartDayOffset(prev => Math.min(0, prev + 1))} className="p-1 hover:bg-stone-100 rounded-lg text-xs font-bold text-stone-600">▶</button>
-                    </div>
-                  </div>
-                  <SvgChart 
-                    sales={sales} 
-                    otherIncome={otherIncome} 
-                    expenses={expenses} 
-                    chartDayOffset={chartDayOffset} 
-                  />
                 </div>
 
                 {/* Daily Expenses Section */}
@@ -3724,19 +4026,56 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Low Stock Alerts */}
-                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
-                  <h3 className="font-extrabold text-stone-800 text-xs text-rose-800 mb-3">⚠️ سلع في طريق النفاذ من الستوك (3 قطع أو أقل)</h3>
-                  {lowStockItems.length === 0 ? (
-                    <p className="text-stone-400 text-center py-4 text-xs">جميع السلع متوفرة بشكل ممتاز بالمستودع ✅</p>
+                {/* Shift Handover Logs Table */}
+                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs space-y-3">
+                  <div className="flex items-center justify-between border-b border-stone-100 pb-2">
+                    <h3 className="font-extrabold text-stone-800 text-xs flex items-center gap-2">
+                      <span>📜 سجل تسليم الورديات وتصفيرات الكاسة المسجلة ({shiftLogs.length})</span>
+                    </h3>
+                    <span className="text-[10px] text-stone-400">سجل أرشيف الورديات</span>
+                  </div>
+                  {shiftLogs.length === 0 ? (
+                    <p className="text-center text-stone-400 text-xs py-4">لم يتم تسجيل أي تصفير وردية سابق بعد</p>
                   ) : (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      {lowStockItems.map((i, idx) => (
-                        <div key={idx} className="flex justify-between items-center p-2.5 bg-rose-50/50 border border-rose-100 rounded-xl">
-                          <span className="text-xs font-bold text-stone-800">{i.name}</span>
-                          <span className="bg-rose-100 text-rose-800 px-2.5 py-0.5 rounded-full text-[10px] font-extrabold">باقي {i.qty} قطع</span>
-                        </div>
-                      ))}
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-right text-xs">
+                        <thead>
+                          <tr className="bg-stone-50 text-stone-600 border-b border-stone-200 text-[11px]">
+                            <th className="p-2.5 rounded-r-xl">تاريخ ووقت التصفير</th>
+                            <th className="p-2.5">اسم الوردية / البائع</th>
+                            <th className="p-2.5">مداخيل الوردية</th>
+                            <th className="p-2.5">الفعلي بالدرج</th>
+                            <th className="p-2.5">المسحوب للخزنة</th>
+                            <th className="p-2.5">كاش بداية القادمة</th>
+                            <th className="p-2.5 rounded-l-xl">الفارق / الحالة</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-stone-100 font-mono text-[11px]">
+                          {shiftLogs.slice().reverse().map((log) => {
+                            const totalIncome = (log.salesTotal || 0) + (log.otherIncomeTotal || 0);
+                            const diff = log.difference || 0;
+                            return (
+                              <tr key={log.id} className="hover:bg-stone-50/80 transition-colors">
+                                <td className="p-2.5 text-stone-500">{new Date(log.timestamp).toLocaleString('ar-TN')}</td>
+                                <td className="p-2.5 font-sans font-bold text-stone-800">{log.sellerName || 'غير مسمى'}</td>
+                                <td className="p-2.5 text-emerald-700 font-bold">{totalIncome.toFixed(3)} د.ت</td>
+                                <td className="p-2.5 text-stone-900 font-bold">{(log.actualCashInDrawer || 0).toFixed(3)} د.ت</td>
+                                <td className="p-2.5 text-blue-700 font-bold">{(log.cashWithdrawn || 0).toFixed(3)} د.ت</td>
+                                <td className="p-2.5 text-amber-700 font-bold">{(log.newStartingCash || 0).toFixed(3)} د.ت</td>
+                                <td className="p-2.5 font-sans">
+                                  {Math.abs(diff) < 0.001 ? (
+                                    <span className="text-emerald-700 font-bold bg-emerald-50 px-2 py-0.5 rounded-md">مطابقة ✅</span>
+                                  ) : diff < 0 ? (
+                                    <span className="text-rose-700 font-bold bg-rose-50 px-2 py-0.5 rounded-md dir-ltr">عجز {Math.abs(diff).toFixed(3)} ⚠️</span>
+                                  ) : (
+                                    <span className="text-blue-700 font-bold bg-blue-50 px-2 py-0.5 rounded-md dir-ltr">فائض {diff.toFixed(3)} ✨</span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
                     </div>
                   )}
                 </div>
@@ -5848,237 +6187,6 @@ export default function App() {
               </div>
             )}
 
-            {/* TAB: SPARE PARTS (Manager Only) */}
-            {currentTab === 'spare_parts' && currentRole === 'manager' && (
-              <div className="space-y-4 animate-fade-in">
-                
-                {/* Add Spare Part Card */}
-                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs text-right">
-                  <h3 className="font-extrabold text-stone-800 text-sm mb-3 text-red-800 flex items-center gap-1.5">
-                    <span>🔧 تسجيل قطع غيار مقتناة من المزوّد (الفورنيسور)</span>
-                  </h3>
-                  <p className="text-stone-400 text-[11px] mb-4">
-                    يمكنك هنا تسجيل الشاشات، البطاريات، أو أي قطع غيار اشتريتها لكي لا تنساها عند مقابلته كل مدة وسدادها إياه.
-                  </p>
-                  
-                  <form onSubmit={handleAddSparePart} className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-3.5">
-                    <div className="md:col-span-1">
-                      <label className="block text-[10px] text-stone-500 mb-1 font-bold">اسم القطعة (مثال: شاشة آيفون 11)</label>
-                      <input 
-                        type="text" 
-                        placeholder="شاشة iPhone 11"
-                        value={newSparePart.name}
-                        onChange={e => setNewSparePart(prev => ({ ...prev, name: e.target.value }))}
-                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-850 font-bold"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[10px] text-stone-500 mb-1 font-bold">اسم الفورنيسور (المزوّد)</label>
-                      <input 
-                        type="text" 
-                        placeholder="مثال: أحمد للأكسسوارات"
-                        value={newSparePart.supplierName}
-                        onChange={e => setNewSparePart(prev => ({ ...prev, supplierName: e.target.value }))}
-                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-850 font-bold"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[10px] text-stone-500 mb-1 font-bold">الكمية</label>
-                      <input 
-                        type="number" 
-                        min="1"
-                        value={newSparePart.qty}
-                        onChange={e => setNewSparePart(prev => ({ ...prev, qty: e.target.value }))}
-                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono font-bold"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[10px] text-stone-500 mb-1 font-bold">سعر تكلفة القطعة الواحدة (د.ت)</label>
-                      <input 
-                        type="number" 
-                        step="0.001"
-                        placeholder="0.000"
-                        value={newSparePart.unitCost}
-                        onChange={e => setNewSparePart(prev => ({ ...prev, unitCost: e.target.value }))}
-                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono font-bold"
-                      />
-                    </div>
-                    <div className="md:col-span-1 flex items-end">
-                      <button type="submit" className="w-full bg-red-700 hover:bg-red-800 text-white font-extrabold rounded-xl text-xs py-2.5 cursor-pointer flex items-center justify-center gap-1 transition-colors select-none">
-                        <Plus size={14} /> سجل قطعة الغيار 🔧
-                      </button>
-                    </div>
-                  </form>
-                </div>
-
-                {/* Search & Filters */}
-                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs text-right">
-                  <div className="flex flex-col md:flex-row items-center justify-between gap-3 mb-4">
-                    <h3 className="font-extrabold text-stone-800 text-xs self-start md:self-auto flex items-center gap-1.5">
-                      <span>📦 أرشيف ودفتر حساب قطع الغيار</span>
-                    </h3>
-                    
-                    <div className="flex flex-wrap gap-2 w-full md:w-auto">
-                      <select 
-                        value={sparePartStatusFilter} 
-                        onChange={e => setSparePartStatusFilter(e.target.value as any)}
-                        className="bg-stone-50 border border-stone-200 px-3 py-1.5 rounded-xl text-[11px] text-stone-700 font-bold"
-                      >
-                        <option value="all">كل قطع الغيار (الكل)</option>
-                        <option value="unpaid">⏳ غير خالصة (ديون للمزوّد)</option>
-                        <option value="paid">✅ خالصة (تم السداد)</option>
-                      </select>
-
-                      <select 
-                        value={sparePartSupplierFilter} 
-                        onChange={e => setSparePartSupplierFilter(e.target.value)}
-                        className="bg-stone-50 border border-stone-200 px-3 py-1.5 rounded-xl text-[11px] text-stone-700 font-bold"
-                      >
-                        <option value="all">كل المزوّدين (الفورنيسور)</option>
-                        {Array.from(new Set(spareParts.map(s => s.supplierName))).map((sup, idx) => (
-                          <option key={idx} value={sup}>{sup}</option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-
-                  <div className="relative mb-4">
-                    <input 
-                      type="text" 
-                      placeholder="🔍 ابحث باسم القطعة أو اسم الفورنيسور..."
-                      value={sparePartSearch}
-                      onChange={e => setSparePartSearch(e.target.value)}
-                      className="w-full bg-stone-50 border border-stone-200 pl-10 pr-3 py-2.5 rounded-xl text-xs text-stone-850"
-                    />
-                    <Search className="absolute left-3 top-3 text-stone-400" size={14} />
-                  </div>
-
-                  {/* Calculations summary card inside list */}
-                  {(() => {
-                    const filtered = spareParts.filter(s => {
-                      const matchesSearch = !sparePartSearch || normalizeArabic(s.name + ' ' + s.supplierName).includes(normalizeArabic(sparePartSearch));
-                      const matchesSupplier = sparePartSupplierFilter === 'all' || s.supplierName === sparePartSupplierFilter;
-                      const matchesStatus = sparePartStatusFilter === 'all' || s.status === sparePartStatusFilter;
-                      return matchesSearch && matchesSupplier && matchesStatus;
-                    });
-
-                    const totalSum = filtered.reduce((acc, curr) => acc + curr.totalCost, 0);
-                    const unpaidSum = filtered.filter(f => f.status === 'unpaid').reduce((acc, curr) => acc + curr.totalCost, 0);
-                    const paidSum = filtered.filter(f => f.status === 'paid').reduce((acc, curr) => acc + curr.totalCost, 0);
-
-                    return (
-                      <>
-                        <div className="grid grid-cols-3 gap-3 mb-4 bg-stone-50 p-3 rounded-2xl border border-stone-100">
-                          <div className="text-center p-2">
-                            <span className="text-[10px] text-stone-400 block font-bold">المجموع الكلي للقطع</span>
-                            <span className="font-mono text-xs font-black text-stone-800">{totalSum.toFixed(3)} د.ت</span>
-                          </div>
-                          <div className="text-center p-2 border-r border-stone-200/60">
-                            <span className="text-[10px] text-stone-400 block font-bold text-red-700">⏳ غير خالص (مطلوب)</span>
-                            <span className="font-mono text-xs font-black text-red-700">{unpaidSum.toFixed(3)} د.ت</span>
-                          </div>
-                          <div className="text-center p-2 border-r border-stone-200/60">
-                            <span className="text-[10px] text-stone-400 block font-bold text-emerald-700">✅ خالص ومدفوع</span>
-                            <span className="font-mono text-xs font-black text-emerald-700">{paidSum.toFixed(3)} د.ت</span>
-                          </div>
-                        </div>
-
-                        {filtered.length === 0 ? (
-                          <div className="text-center py-10 text-stone-400 text-xs">
-                            لا توجد أي قطع غيار مسجلة تطابق خيارات البحث الحالية.
-                          </div>
-                        ) : (
-                          <div className="space-y-2 max-h-[500px] overflow-y-auto pr-1">
-                            {filtered.slice(0, sparePartsLimit).map((sp) => (
-                              <div key={sp.id} className="flex flex-col sm:flex-row justify-between items-start sm:items-center p-3 bg-stone-50 hover:bg-stone-100/50 rounded-xl border border-stone-100 transition-colors gap-2 text-right">
-                                <div className="space-y-1">
-                                  <div className="flex items-center flex-wrap gap-2">
-                                    <span className="font-bold text-stone-900 text-sm">{sp.name}</span>
-                                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-50 text-red-700 border border-red-100 font-bold">
-                                      👤 المزوّد: {sp.supplierName}
-                                    </span>
-                                  </div>
-                                  <div className="text-[10px] text-stone-400 flex flex-wrap gap-x-3 gap-y-1">
-                                    <span>📅 التاريخ: {new Date(sp.date).toLocaleString('fr-TN')}</span>
-                                    {sp.notes && <span className="text-amber-700 font-medium">📝 ملاحظات: {sp.notes}</span>}
-                                  </div>
-                                </div>
-                                
-                                <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 pt-2 sm:pt-0 border-stone-200/60">
-                                  <div className="flex items-center gap-1 ml-2">
-                                    <button 
-                                      onClick={() => handleAdjustSparePartQty(sp.id, -1)}
-                                      className="w-6 h-6 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
-                                      title="إنقاص الكمية بـ 1"
-                                    >
-                                      -
-                                    </button>
-                                    <span className="text-xs font-bold text-stone-800 font-mono px-1">{sp.qty}</span>
-                                    <button 
-                                      onClick={() => handleAdjustSparePartQty(sp.id, 1)}
-                                      className="w-6 h-6 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
-                                      title="زيادة الكمية بـ 1"
-                                    >
-                                      +
-                                    </button>
-                                  </div>
-
-                                  <div className="text-left font-mono text-xs font-bold text-stone-800 min-w-[75px]">
-                                    <div>{sp.totalCost.toFixed(3)} د.ت</div>
-                                    <div className="text-[9px] text-stone-400 font-medium">({sp.unitCost.toFixed(3)} للقطعة)</div>
-                                  </div>
-
-                                  <div className="flex items-center gap-1">
-                                    <button 
-                                      onClick={() => handleToggleSparePartPayment(sp.id)}
-                                      className={`px-3 py-1 rounded-xl text-[10px] font-black cursor-pointer transition-colors shadow-xs ${
-                                        sp.status === 'paid' 
-                                          ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200' 
-                                          : 'bg-rose-100 text-rose-800 hover:bg-rose-200'
-                                      }`}
-                                      title="تبديل حالة السداد"
-                                    >
-                                      {sp.status === 'paid' ? '✅ خالص' : '⏳ غير خالص'}
-                                    </button>
-
-                                    <button 
-                                      onClick={() => handleDeleteSparePart(sp.id)} 
-                                      className="text-stone-400 hover:text-red-700 cursor-pointer p-1.5 transition-colors rounded-xl hover:bg-red-50"
-                                      title="حذف القطعة"
-                                    >
-                                      <Trash2 size={14} />
-                                    </button>
-                                  </div>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-
-                        {filtered.length > sparePartsLimit && (
-                          <div className="mt-4 pt-3 border-t border-stone-100 flex gap-2 justify-center">
-                            <button 
-                              onClick={() => setSparePartsLimit(prev => prev + 50)}
-                              className="bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold px-4 py-1.5 rounded-xl text-xs cursor-pointer"
-                            >
-                              عرض المزيد من قطع الغيار (+50) 🔄
-                            </button>
-                            <button 
-                              onClick={() => setSparePartsLimit(filtered.length)}
-                              className="bg-stone-800 text-white font-bold px-4 py-1.5 rounded-xl text-xs cursor-pointer"
-                            >
-                              عرض الكل ({filtered.length})
-                            </button>
-                          </div>
-                        )}
-                      </>
-                    );
-                  })()}
-                </div>
-
-              </div>
-            )}
-
           </div>
         ) : (
           /* Authentication Screen Overlay UI */
@@ -6360,6 +6468,18 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Shift Handover Modal */}
+      <ShiftHandoverModal
+        isOpen={showShiftHandoverModal}
+        onClose={() => setShowShiftHandoverModal(false)}
+        lastResetTimestamp={lastCashResetTimestamp}
+        startingCash={cashRegister}
+        currentShiftSales={currentShiftSales}
+        currentShiftOtherIncome={currentShiftOtherIncome}
+        currentShiftExpenses={currentShiftExpenses}
+        onPerformReset={handlePerformShiftReset}
+      />
 
       {/* Custom Confirmation Modal Dialog */}
       {confirmDialog.isOpen && (

@@ -105,5 +105,20 @@ export interface SparePart {
   notes?: string;        // ملاحظات إضافية
 }
 
-export type AppTab = 'dashboard' | 'stock' | 'income' | 'debts' | 'history' | 'settings' | 'spare_parts';
+export interface ShiftLog {
+  id: string;
+  timestamp: string;
+  sellerName?: string;
+  salesTotal: number;
+  otherIncomeTotal: number;
+  expensesTotal: number;
+  expectedCashInDrawer: number;
+  actualCashInDrawer: number;
+  cashWithdrawn: number;
+  newStartingCash: number;
+  difference: number;
+  notes?: string;
+}
+
+export type AppTab = 'dashboard' | 'stock' | 'income' | 'debts' | 'history' | 'settings';
 export type AppRole = 'manager' | 'seller';
