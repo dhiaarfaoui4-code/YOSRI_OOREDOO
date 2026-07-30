@@ -15,7 +15,7 @@ import {
   safeDecrementCardQty, safeIncrementCardQty,
   safeDecrementPhotoStock, safeIncrementPhotoStock,
   putWithOutbox, patchWithOutbox, flushOutbox, dbUrl, verifyManagerPinViaAuth,
-  updateManagerPinViaAuth
+  updateManagerPinViaAuth, subscribeOutboxChange, loadOutbox
 } from './firebase';
 import { SvgChart } from './components/SvgChart';
 import { InvoiceModal, InvoiceData } from './components/InvoiceModal';
@@ -407,6 +407,10 @@ export default function App() {
   // First initialization load
   useEffect(() => {
     let active = true;
+    const unsubOutbox = subscribeOutboxChange((count) => {
+      if (active) setOutboxCount(count);
+    });
+
     async function init() {
       setConnectionStatus('checking');
       const authOk = await ensureAuth();
@@ -448,9 +452,23 @@ export default function App() {
 
     return () => {
       active = false;
+      unsubOutbox();
       clearInterval(interval);
     };
   }, [currentRole]);
+
+  const handleManualFlushOutbox = async () => {
+    triggerToast('🔄 جاري محاولة إرسال العمليات المعلقة بالسحابة...');
+    const res = await flushOutbox();
+    if (res.sent > 0) {
+      triggerToast(`✅ تم إرسال ${res.sent} عملية معلقة بنجاح!`);
+      loadAllData();
+    } else if (res.remaining > 0) {
+      triggerToast(`⚠️ لم يتيسر الإرسال (باقي ${res.remaining} عملية). تحقق من الاتصال بالإنترنت.`);
+    } else {
+      triggerToast('✅ جميع العمليات محدثة ومزامنة بالسحابة.');
+    }
+  };
 
   const loadAllData = async () => {
     try {
@@ -2999,11 +3017,14 @@ export default function App() {
     if (!await promptAndVerifyPin('أدخل الرمز السري لتسجيل فلوس الكاسة الحالية:')) return;
     const inputVal = parseFloat((document.getElementById('starting-cash-inp') as HTMLInputElement)?.value) || 0;
     
-    const ok = await putWithOutbox('/cashRegister.json', inputVal);
-    if (ok) {
+    const newTimestamp = new Date().toISOString();
+    const okReg = await putWithOutbox('/cashRegister.json', inputVal);
+    const okTime = await putWithOutbox('/lastCashResetTimestamp.json', newTimestamp);
+
+    if (okReg || okTime) {
       setCashRegister(inputVal);
-      triggerToast('✅ تم تحديث كاش الكاسة الأساسي');
-      logAudit('pin', `تعديل رصيد بداية الكاسة: ${inputVal} د.ت`);
+      setLastCashResetTimestamp(newTimestamp);
+      triggerToast('✅ تم تحديث كاش البداية وبداية الوردية بنجاح');
       loadAllData();
     }
   };
@@ -3039,23 +3060,31 @@ export default function App() {
     }
 
     triggerToast('🧹 تم تجميع ودمج السلع المكررة بنجاح!');
-    logAudit('merge', `دمج السلع المتشابهة بالاسم وتجميع الستوك`);
     loadAllData();
   };
 
   const handleResetIncomeHistory = async (days: number) => {
+    const shiftStartMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : Date.now();
     const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-    const salesToRemove = sales.filter(s => new Date(s.date).getTime() >= cutoff);
-    const otherToRemove = otherIncome.filter(o => new Date(o.date).getTime() >= cutoff);
+
+    // Only remove archived sales that are strictly older than the active shift start
+    const salesToRemove = sales.filter(s => {
+      const t = new Date(s.date).getTime();
+      return t < shiftStartMs && t >= cutoff;
+    });
+    const otherToRemove = otherIncome.filter(o => {
+      const t = new Date(o.date).getTime();
+      return t < shiftStartMs && t >= cutoff;
+    });
 
     if (salesToRemove.length === 0 && otherToRemove.length === 0) {
-      return triggerToast('❌ لا توجد أي مبيعات مسجلة في هذه الفترة المحددة');
+      return triggerToast('❌ لا توجد أي مبيعات أرشيفية سابقة للوردية الحالية في هذه الفترة المحددة');
     }
 
-    if (!await promptAndVerifyPin(`⚠️ هل أنت متأكد من مسح ${salesToRemove.length} مبيعة و ${otherToRemove.length} مدخول آخر لآخر ${days} أيام؟`)) return;
+    if (!await promptAndVerifyPin(`⚠️ هل أنت متأكد من تنظيف السحابة ومسح ${salesToRemove.length} مبيعة قديمة و ${otherToRemove.length} مدخول أقدم من الوردية الحالية؟`)) return;
 
     // Generate and save/send PDF report before deleting records
-    triggerToast('📊 جاري توليد تقرير PDF التصفير...');
+    triggerToast('📊 جاري توليد تقرير PDF التصفير للأرشيف...');
     await generateResetReportPDF(salesToRemove, otherToRemove, days);
 
     for (const s of salesToRemove) {
@@ -3065,8 +3094,7 @@ export default function App() {
       await putWithOutbox(`/otherIncome/${o.id}.json`, null);
     }
 
-    triggerToast('🧹 تم تصفير المدخول للفترة المحددة');
-    logAudit('reset', `تصفير المداخيل لآخر ${days} أيام`);
+    triggerToast('🧹 تم تنظيف المبيعات الأرشيفية القديمة وتوفير مساحة السحابة دون المساس بالوردية الحالية');
     loadAllData();
   };
 
@@ -3710,10 +3738,10 @@ export default function App() {
                     : 'bg-rose-500'
                 }`} />
                 {connectionStatus === 'connected' 
-                  ? 'مزامنة نشطة 🟢' 
+                  ? (outboxCount > 0 ? `مزامنة نشطة 🟢 (${outboxCount} معلق)` : 'مزامنة نشطة 🟢') 
                   : connectionStatus === 'checking'
                   ? 'جاري المزامنة...'
-                  : 'غير متصل (أوفلاين) 🔴'
+                  : (outboxCount > 0 ? `أوفلاين 🔴 (${outboxCount} معلق)` : 'غير متصل (أوفلاين) 🔴')
                 }
               </span>
               {currentRole && (
@@ -3729,6 +3757,30 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* Offline Pending Outbox Warning Banner */}
+      {outboxCount > 0 && (
+        <div className="bg-rose-600 text-white px-4 py-3 shadow-lg flex flex-wrap items-center justify-between gap-3 z-40 text-xs font-bold border-b-2 border-rose-800">
+          <div className="flex items-center gap-2.5 max-w-3xl">
+            <span className="text-xl shrink-0">⚠️</span>
+            <div>
+              <span className="font-black text-sm block">
+                تنبيه هام جداً: يوجد {outboxCount} عملية معلقة لم تُرسل للسحابة من هذا الجهاز!
+              </span>
+              <span className="text-[11px] opacity-90 font-medium">
+                هذه العمليات محلياً فقط. لا تغلق المتصفح ولا تغير الجهاز قبل إرسالها لتفادي تداخل حسابات الصندوق.
+              </span>
+            </div>
+          </div>
+          <button
+            onClick={handleManualFlushOutbox}
+            className="bg-white text-rose-950 hover:bg-rose-100 px-4 py-2 rounded-xl text-xs font-black shadow-md cursor-pointer transition-all flex items-center gap-1.5 shrink-0"
+          >
+            <RefreshCw size={14} className="animate-spin-slow" />
+            <span>إعادة محاولة إرسال العمليات الآن ({outboxCount})</span>
+          </button>
+        </div>
+      )}
 
       {/* Main Tab Navigation */}
       {currentRole && (
@@ -5795,13 +5847,12 @@ export default function App() {
 
                 {/* Reset income registry days */}
                 <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
-                  <h3 className="font-extrabold text-stone-800 text-xs text-rose-800 mb-1">🧹 تصفير وحذف سجلات المبيعات مؤقتاً</h3>
-                  <p className="text-stone-400 text-[10px] mb-3">يمسح سجلات مبيعات الأيام السابقة دون لمس سلع المستودع أو كروت الشحن:</p>
+                  <h3 className="font-extrabold text-stone-800 text-xs text-rose-800 mb-1">🧹 تنظيف أرشيف المبيعات القديمة (لتوفير مساحة الفايربيز)</h3>
+                  <p className="text-stone-400 text-[10px] mb-3">يمسح سجلات المبيعات القديمة السابقة للوردية الحالية لحفظ المساحة المجانية للسيرفر (دون المساس بحسابات الوردية الحالية):</p>
                   <div className="flex flex-wrap gap-2">
-                    <button onClick={() => handleResetIncomeHistory(1)} className="bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold px-3 py-2 rounded-xl text-[11px] border border-rose-200 cursor-pointer">مسح اليوم فقط</button>
-                    <button onClick={() => handleResetIncomeHistory(2)} className="bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold px-3 py-2 rounded-xl text-[11px] border border-rose-200 cursor-pointer">مسح يومين</button>
-                    <button onClick={() => handleResetIncomeHistory(3)} className="bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold px-3 py-2 rounded-xl text-[11px] border border-rose-200 cursor-pointer">مسح 3 أيام</button>
-                    <button onClick={() => handleResetIncomeHistory(4)} className="bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold px-3 py-2 rounded-xl text-[11px] border border-rose-200 cursor-pointer">مسح 4 أيام</button>
+                    <button onClick={() => handleResetIncomeHistory(30)} className="bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold px-3 py-2 rounded-xl text-[11px] border border-rose-200 cursor-pointer">تنظيف الأرشيف الأقدم من 30 يوماً</button>
+                    <button onClick={() => handleResetIncomeHistory(7)} className="bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold px-3 py-2 rounded-xl text-[11px] border border-rose-200 cursor-pointer">تنظيف الأرشيف الأقدم من 7 أيام</button>
+                    <button onClick={() => handleResetIncomeHistory(1)} className="bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold px-3 py-2 rounded-xl text-[11px] border border-rose-200 cursor-pointer">تنظيف كل ما هو قبل الوردية الحالية</button>
                   </div>
                 </div>
 
@@ -6415,6 +6466,8 @@ export default function App() {
         currentShiftSales={currentShiftSales}
         currentShiftOtherIncome={currentShiftOtherIncome}
         currentShiftExpenses={currentShiftExpenses}
+        outboxCount={outboxCount}
+        onFlushOutbox={handleManualFlushOutbox}
         onPerformReset={handlePerformShiftReset}
       />
 

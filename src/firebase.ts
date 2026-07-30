@@ -468,6 +468,25 @@ export interface OutboxEntry {
   createdAt: number;
 }
 
+type OutboxChangeListener = (count: number) => void;
+const outboxListeners: OutboxChangeListener[] = [];
+
+export function subscribeOutboxChange(listener: OutboxChangeListener): () => void {
+  outboxListeners.push(listener);
+  try { listener(loadOutbox().length); } catch (e) {}
+  return () => {
+    const idx = outboxListeners.indexOf(listener);
+    if (idx >= 0) outboxListeners.splice(idx, 1);
+  };
+}
+
+function notifyOutboxChange() {
+  const count = loadOutbox().length;
+  outboxListeners.forEach(l => {
+    try { l(count); } catch (e) {}
+  });
+}
+
 export function loadOutbox(): OutboxEntry[] {
   try {
     const raw = localStorage.getItem(OUTBOX_KEY);
@@ -480,6 +499,7 @@ export function loadOutbox(): OutboxEntry[] {
 export function saveOutboxList(list: OutboxEntry[]) {
   try {
     localStorage.setItem(OUTBOX_KEY, JSON.stringify(list));
+    notifyOutboxChange();
   } catch (e) {}
 }
 
@@ -497,17 +517,23 @@ export function removeFromOutbox(entryId: string) {
   saveOutboxList(loadOutbox().filter(e => e.id !== entryId));
 }
 
-export async function tryPutRemote(path: string, payload: any, method: 'PUT' | 'PATCH' = 'PUT'): Promise<boolean> {
-  try {
-    const r = await fetch(dbUrl(path), {
-      method,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    return r.ok;
-  } catch (e) {
-    return false;
+export async function tryPutRemote(path: string, payload: any, method: 'PUT' | 'PATCH' = 'PUT', retries = 3): Promise<boolean> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const r = await fetch(dbUrl(path), {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (r.ok) return true;
+    } catch (e) {
+      // network error, try again after short delay
+    }
+    if (attempt < retries - 1) {
+      await new Promise(res => setTimeout(res, 350 * (attempt + 1)));
+    }
   }
+  return false;
 }
 
 export async function putWithOutbox(path: string, payload: any): Promise<boolean> {
@@ -524,9 +550,9 @@ export async function patchWithOutbox(path: string, payload: any): Promise<boole
   return ok;
 }
 
-export async function flushOutbox(onSuccess?: (count: number) => void): Promise<void> {
+export async function flushOutbox(onSuccess?: (count: number) => void): Promise<{ sent: number; remaining: number }> {
   const list = loadOutbox();
-  if (list.length === 0) return;
+  if (list.length === 0) return { sent: 0, remaining: 0 };
   let sentCount = 0;
   for (const entry of list) {
     const ok = await tryPutRemote(entry.path, entry.payload, entry.method || 'PUT');
@@ -538,6 +564,9 @@ export async function flushOutbox(onSuccess?: (count: number) => void): Promise<
   if (sentCount > 0 && onSuccess) {
     onSuccess(sentCount);
   }
+  const remaining = loadOutbox().length;
+  notifyOutboxChange();
+  return { sent: sentCount, remaining };
 }
 
 export async function safeDecrementPhotoStock(

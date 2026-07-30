@@ -9,6 +9,8 @@ interface ShiftHandoverModalProps {
   currentShiftSales: Sale[];
   currentShiftOtherIncome: OtherIncome[];
   currentShiftExpenses: Expense[];
+  outboxCount?: number;
+  onFlushOutbox?: () => Promise<any>;
   onPerformReset: (data: {
     sellerName: string;
     salesTotal: number;
@@ -30,6 +32,8 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
   currentShiftSales,
   currentShiftOtherIncome,
   currentShiftExpenses,
+  outboxCount = 0,
+  onFlushOutbox,
   onPerformReset
 }) => {
   if (!isOpen) return null;
@@ -52,6 +56,16 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
 
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (outboxCount > 0) {
+      const confirmForce = window.confirm(
+        `⚠️ تحذير هام جداً:\nيوجد ${outboxCount} عملية مسجلة محلياً ولم تُرسل بعد للسحابة من هذا الجهاز!\n\n` +
+        `إذا قمت بالتصفير الآن دون إرسالها، فلن تُحسب هذه المبيعات في السيرفر السحابي وقد تسبب فارقاً في الكاش.\n\n` +
+        `يرجى التأكد من تشغيل الإنترنت والضغط على زر "إعادة محاولة إرسال العمليات".\n\n` +
+        `هل تريد التصفير والتسليم رغم ذلك؟`
+      );
+      if (!confirmForce) return;
+    }
+
     onPerformReset({
       sellerName,
       salesTotal,
@@ -96,6 +110,27 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
 
         {/* Scrollable Form Body */}
         <form onSubmit={handleFormSubmit} className="space-y-4 py-4 overflow-y-auto pr-1 flex-1">
+          {/* Outbox Pending Warning Card */}
+          {outboxCount > 0 && (
+            <div className="bg-rose-500 text-white p-3.5 rounded-2xl border-2 border-rose-700 shadow-md text-xs space-y-2">
+              <div className="flex items-center justify-between gap-2 font-black">
+                <span className="text-sm">⚠️ يوجد {outboxCount} عملية معلقة لم تُرسل للسحابة!</span>
+                {onFlushOutbox && (
+                  <button
+                    type="button"
+                    onClick={onFlushOutbox}
+                    className="bg-white text-rose-900 hover:bg-rose-100 font-black px-3 py-1 rounded-xl text-[11px] cursor-pointer shadow-xs transition-colors shrink-0"
+                  >
+                    إرسال الآن 🔄
+                  </button>
+                )}
+              </div>
+              <p className="leading-relaxed opacity-95">
+                هذه العمليات مسجلة محلياً على هذا الجهاز فقط. يرجى التأكد من تشغيل الواي فاي والضغط على زر الإرسال قبل التصفير لتفادي أي فارق بالصندوق.
+              </p>
+            </div>
+          )}
+
           {/* Shift Info Banner */}
           <div className="bg-stone-50 border border-stone-200 rounded-2xl p-3 text-xs text-stone-600 flex justify-between items-center">
             <div>
