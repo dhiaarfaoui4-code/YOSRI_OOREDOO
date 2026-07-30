@@ -3017,15 +3017,19 @@ export default function App() {
     if (!await promptAndVerifyPin('أدخل الرمز السري لتسجيل فلوس الكاسة الحالية:')) return;
     const inputVal = parseFloat((document.getElementById('starting-cash-inp') as HTMLInputElement)?.value) || 0;
     
-    const newTimestamp = new Date().toISOString();
     const okReg = await putWithOutbox('/cashRegister.json', inputVal);
-    const okTime = await putWithOutbox('/lastCashResetTimestamp.json', newTimestamp);
-
-    if (okReg || okTime) {
+    if (okReg) {
       setCashRegister(inputVal);
-      setLastCashResetTimestamp(newTimestamp);
-      triggerToast('✅ تم تحديث كاش البداية وبداية الوردية بنجاح');
+      // Only set lastCashResetTimestamp if none exists yet, do NOT reset ongoing shift timestamp
+      if (!lastCashResetTimestamp) {
+        const newTimestamp = new Date().toISOString();
+        await putWithOutbox('/lastCashResetTimestamp.json', newTimestamp);
+        setLastCashResetTimestamp(newTimestamp);
+      }
+      triggerToast('✅ تم تحديث كاش البداية بنجاح');
       loadAllData();
+    } else {
+      triggerToast('❌ تعذر حفظ كاش البداية');
     }
   };
 
@@ -3304,17 +3308,17 @@ export default function App() {
 
   // ---- 9. Dashboard Financial Calculations ----
   const currentShiftSales = useMemo(() => {
-    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : new Date().setHours(0,0,0,0);
+    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
     return sales.filter(s => new Date(s.date).getTime() >= resetTimeMs);
   }, [sales, lastCashResetTimestamp]);
 
   const currentShiftOtherIncome = useMemo(() => {
-    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : new Date().setHours(0,0,0,0);
+    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
     return otherIncome.filter(o => new Date(o.date).getTime() >= resetTimeMs);
   }, [otherIncome, lastCashResetTimestamp]);
 
   const currentShiftExpenses = useMemo(() => {
-    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : new Date().setHours(0,0,0,0);
+    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
     return expenses.filter(e => new Date(e.date).getTime() >= resetTimeMs);
   }, [expenses, lastCashResetTimestamp]);
 
@@ -3397,7 +3401,7 @@ export default function App() {
     const startOf7Days = startOfToday - 6 * 24 * 60 * 60 * 1000;
     const startOf30Days = startOfToday - 29 * 24 * 60 * 60 * 1000;
 
-    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : startOfToday;
+    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
 
     const inRange = (dateStr: string) => {
       if (!dateStr) return false;
