@@ -501,7 +501,33 @@ export default function App() {
       if (typeof lastResetRaw === 'string') {
         setLastCashResetTimestamp(lastResetRaw);
       }
-      setShiftLogs(parseRawWithKeys<ShiftLog>(shiftLogsRaw));
+      
+      const parsedLogs = parseRawWithKeys<ShiftLog>(shiftLogsRaw);
+      // Deduplicate shift logs created accidentally within 30 seconds with identical seller and expected cash
+      const uniqueLogs: ShiftLog[] = [];
+      const dupLogIdsToDelete: string[] = [];
+      parsedLogs.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+      for (const log of parsedLogs) {
+        const isDup = uniqueLogs.some(existing => {
+          const timeDiff = Math.abs(new Date(existing.timestamp).getTime() - new Date(log.timestamp).getTime());
+          const sameSeller = (existing.sellerName || '') === (log.sellerName || '');
+          const sameSales = Math.abs((existing.salesTotal || 0) - (log.salesTotal || 0)) < 0.001;
+          const sameActual = Math.abs((existing.actualCashInDrawer || 0) - (log.actualCashInDrawer || 0)) < 0.001;
+          return timeDiff < 30000 && sameSeller && sameSales && sameActual;
+        });
+
+        if (isDup) {
+          dupLogIdsToDelete.push(log.id);
+        } else {
+          uniqueLogs.push(log);
+        }
+      }
+
+      for (const dupId of dupLogIdsToDelete) {
+        putWithOutbox(`/shiftLogs/${dupId}.json`, null);
+      }
+      setShiftLogs(uniqueLogs);
 
       setItems(parseRawWithKeys<Item>(itemsRaw));
       setSales(parseRawWithKeys<Sale>(salesRaw));
@@ -3322,6 +3348,20 @@ export default function App() {
     return expenses.filter(e => new Date(e.date).getTime() >= resetTimeMs);
   }, [expenses, lastCashResetTimestamp]);
 
+  const isResettingShiftRef = useRef<boolean>(false);
+
+  const handleDeleteShiftLog = async (logId: string) => {
+    if (!await promptAndVerifyPin('أدخل الرمز السري لحذف سجل تصفير الوردية:')) return;
+    const ok = await putWithOutbox(`/shiftLogs/${logId}.json`, null);
+    if (ok) {
+      setShiftLogs(prev => prev.filter(l => l.id !== logId));
+      triggerToast('🗑️ تم حذف سجل الوردية بنجاح');
+      logAudit('delete', `حذف سجل تصفير وردية ID: ${logId}`);
+    } else {
+      triggerToast('❌ تعذر حذف السجل');
+    }
+  };
+
   const handlePerformShiftReset = async (data: {
     sellerName: string;
     salesTotal: number;
@@ -3333,64 +3373,71 @@ export default function App() {
     newStartingCash: number;
     notes: string;
   }) => {
-    // 1. Generate & download PDF report for the current shift (and send to Telegram)
-    triggerToast('📊 جاري توليد تقرير PDF الوردية...');
-    await generateShiftReportPDF(
-      {
+    if (isResettingShiftRef.current) return;
+    isResettingShiftRef.current = true;
+
+    try {
+      // 1. Generate & download PDF report for the current shift (and send to Telegram)
+      triggerToast('📊 جاري توليد تقرير PDF الوردية...');
+      await generateShiftReportPDF(
+        {
+          sellerName: data.sellerName,
+          startingCash: cashRegister,
+          salesTotal: data.salesTotal,
+          otherIncomeTotal: data.otherIncomeTotal,
+          expensesTotal: data.expensesTotal,
+          expectedCash: data.expectedCash,
+          actualCash: data.actualCash,
+          cashWithdrawn: data.cashWithdrawn,
+          newStartingCash: data.newStartingCash,
+          notes: data.notes
+        },
+        currentShiftSales,
+        currentShiftOtherIncome
+      );
+
+      // 2. Clear sales and other income of this shift from Firebase to save database storage
+      triggerToast('🧹 جاري تفريغ سجلات الوردية من السحابة...');
+      for (const s of currentShiftSales) {
+        await putWithOutbox(`/sales/${s.id}.json`, null);
+      }
+      for (const o of currentShiftOtherIncome) {
+        await putWithOutbox(`/otherIncome/${o.id}.json`, null);
+      }
+
+      // 3. Save shift log & new starting cash
+      const newLog: ShiftLog = {
+        id: `shift_${Date.now()}`,
+        timestamp: new Date().toISOString(),
         sellerName: data.sellerName,
-        startingCash: cashRegister,
         salesTotal: data.salesTotal,
         otherIncomeTotal: data.otherIncomeTotal,
         expensesTotal: data.expensesTotal,
-        expectedCash: data.expectedCash,
-        actualCash: data.actualCash,
+        expectedCashInDrawer: data.expectedCash,
+        actualCashInDrawer: data.actualCash,
         cashWithdrawn: data.cashWithdrawn,
         newStartingCash: data.newStartingCash,
+        difference: data.actualCash - data.expectedCash,
         notes: data.notes
-      },
-      currentShiftSales,
-      currentShiftOtherIncome
-    );
+      };
 
-    // 2. Clear sales and other income of this shift from Firebase to save database storage
-    triggerToast('🧹 جاري تفريغ سجلات الوردية من السحابة...');
-    for (const s of currentShiftSales) {
-      await putWithOutbox(`/sales/${s.id}.json`, null);
-    }
-    for (const o of currentShiftOtherIncome) {
-      await putWithOutbox(`/otherIncome/${o.id}.json`, null);
-    }
+      const okLog = await putWithOutbox(`/shiftLogs/${newLog.id}.json`, newLog);
+      const okReg = await putWithOutbox('/cashRegister.json', data.newStartingCash);
+      const okTime = await putWithOutbox('/lastCashResetTimestamp.json', newLog.timestamp);
 
-    // 3. Save shift log & new starting cash
-    const newLog: ShiftLog = {
-      id: `shift_${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      sellerName: data.sellerName,
-      salesTotal: data.salesTotal,
-      otherIncomeTotal: data.otherIncomeTotal,
-      expensesTotal: data.expensesTotal,
-      expectedCashInDrawer: data.expectedCash,
-      actualCashInDrawer: data.actualCash,
-      cashWithdrawn: data.cashWithdrawn,
-      newStartingCash: data.newStartingCash,
-      difference: data.actualCash - data.expectedCash,
-      notes: data.notes
-    };
-
-    const okLog = await putWithOutbox(`/shiftLogs/${newLog.id}.json`, newLog);
-    const okReg = await putWithOutbox('/cashRegister.json', data.newStartingCash);
-    const okTime = await putWithOutbox('/lastCashResetTimestamp.json', newLog.timestamp);
-
-    if (okReg || okLog) {
-      setShiftLogs(prev => [...prev, newLog]);
-      setCashRegister(data.newStartingCash);
-      setLastCashResetTimestamp(newLog.timestamp);
-      setShowShiftHandoverModal(false);
-      triggerToast('✅ تم تصفير الكاسة، حفظ تقرير PDF، ومسح السجلات من الفايربيز بنجاح');
-      logAudit('reset', `تصفير الوردية وتفريغ السحابة: ${data.sellerName} (كاش مفرغ: ${data.cashWithdrawn.toFixed(3)} د.ت)`);
-      loadAllData();
-    } else {
-      triggerToast('❌ حدث خطأ أثناء تصفير الكاسة وتسليم الوردية');
+      if (okReg || okLog) {
+        setShiftLogs(prev => [...prev, newLog]);
+        setCashRegister(data.newStartingCash);
+        setLastCashResetTimestamp(newLog.timestamp);
+        setShowShiftHandoverModal(false);
+        triggerToast('✅ تم تصفير الكاسة، حفظ تقرير PDF، ومسح السجلات من الفايربيز بنجاح');
+        logAudit('reset', `تصفير الوردية وتفريغ السحابة: ${data.sellerName} (كاش مفرغ: ${data.cashWithdrawn.toFixed(3)} د.ت)`);
+        loadAllData();
+      } else {
+        triggerToast('❌ حدث خطأ أثناء تصفير الكاسة وتسليم الوردية');
+      }
+    } finally {
+      isResettingShiftRef.current = false;
     }
   };
 
@@ -4089,7 +4136,8 @@ export default function App() {
                             <th className="p-2.5">الفعلي بالدرج</th>
                             <th className="p-2.5">المسحوب للخزنة</th>
                             <th className="p-2.5">كاش بداية القادمة</th>
-                            <th className="p-2.5 rounded-l-xl">الفارق / الحالة</th>
+                            <th className="p-2.5">الفارق / الحالة</th>
+                            <th className="p-2.5 rounded-l-xl text-center">إجراءات</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-stone-100 font-mono text-[11px]">
@@ -4111,6 +4159,17 @@ export default function App() {
                                     <span className="text-rose-700 font-bold bg-rose-50 px-2 py-0.5 rounded-md dir-ltr">عجز {Math.abs(diff).toFixed(3)} ⚠️</span>
                                   ) : (
                                     <span className="text-blue-700 font-bold bg-blue-50 px-2 py-0.5 rounded-md dir-ltr">فائض {diff.toFixed(3)} ✨</span>
+                                  )}
+                                </td>
+                                <td className="p-2.5 text-center font-sans">
+                                  {currentRole === 'owner' && (
+                                    <button
+                                      onClick={() => handleDeleteShiftLog(log.id)}
+                                      title="حذف هذا السجل"
+                                      className="p-1 text-stone-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+                                    >
+                                      <Trash2 size={13} />
+                                    </button>
                                   )}
                                 </td>
                               </tr>

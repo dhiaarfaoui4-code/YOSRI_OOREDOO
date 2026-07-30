@@ -21,7 +21,7 @@ interface ShiftHandoverModalProps {
     cashWithdrawn: number;
     newStartingCash: number;
     notes: string;
-  }) => void;
+  }) => Promise<void> | void;
 }
 
 export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
@@ -48,14 +48,17 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
   const [actualCashInput, setActualCashInput] = useState(expectedCash.toFixed(3));
   const [newStartingCashInput, setNewStartingCashInput] = useState('0.000');
   const [notes, setNotes] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const actualCash = parseFloat(actualCashInput) || 0;
   const newStartingCash = parseFloat(newStartingCashInput) || 0;
   const cashWithdrawn = Math.max(0, actualCash - newStartingCash);
   const difference = actualCash - expectedCash;
 
-  const handleFormSubmit = (e: React.FormEvent) => {
+  const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
+
     if (outboxCount > 0) {
       const confirmForce = window.confirm(
         `⚠️ تحذير هام جداً:\nيوجد ${outboxCount} عملية مسجلة محلياً ولم تُرسل بعد للسحابة من هذا الجهاز!\n\n` +
@@ -66,17 +69,22 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
       if (!confirmForce) return;
     }
 
-    onPerformReset({
-      sellerName,
-      salesTotal,
-      otherIncomeTotal,
-      expensesTotal,
-      expectedCash,
-      actualCash,
-      cashWithdrawn,
-      newStartingCash,
-      notes
-    });
+    try {
+      setIsSubmitting(true);
+      await onPerformReset({
+        sellerName,
+        salesTotal,
+        otherIncomeTotal,
+        expensesTotal,
+        expectedCash,
+        actualCash,
+        cashWithdrawn,
+        newStartingCash,
+        notes
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const formattedStartTime = lastResetTimestamp 
@@ -269,15 +277,21 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
               <button
                 type="button"
                 onClick={onClose}
-                className="px-4 py-2.5 rounded-xl border border-stone-200 text-stone-600 hover:bg-stone-100 font-bold text-xs cursor-pointer"
+                disabled={isSubmitting}
+                className="px-4 py-2.5 rounded-xl border border-stone-200 text-stone-600 hover:bg-stone-100 font-bold text-xs cursor-pointer disabled:opacity-50"
               >
                 إلغاء
               </button>
               <button
                 type="submit"
-                className="px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-black text-xs cursor-pointer shadow-md transition-all flex items-center gap-1.5"
+                disabled={isSubmitting}
+                className="px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-black text-xs cursor-pointer shadow-md transition-all flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <span>🔄 تأكيد التصفير وتوليد PDF</span>
+                {isSubmitting ? (
+                  <span>⏳ جاري التصفير وتوليد التقرير...</span>
+                ) : (
+                  <span>🔄 تأكيد التصفير وتوليد PDF</span>
+                )}
               </button>
             </div>
           </div>
