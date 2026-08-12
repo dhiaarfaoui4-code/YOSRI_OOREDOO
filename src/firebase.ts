@@ -517,6 +517,11 @@ export function removeFromOutbox(entryId: string) {
   saveOutboxList(loadOutbox().filter(e => e.id !== entryId));
 }
 
+export function clearOutboxForPaths(prefixes: string[]) {
+  const list = loadOutbox().filter(e => !prefixes.some(p => e.path.startsWith(p)));
+  saveOutboxList(list);
+}
+
 export async function tryPutRemote(path: string, payload: any, method: 'PUT' | 'PATCH' = 'PUT', retries = 3): Promise<boolean> {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {

@@ -15,7 +15,7 @@ import {
   safeDecrementCardQty, safeIncrementCardQty,
   safeDecrementPhotoStock, safeIncrementPhotoStock,
   putWithOutbox, patchWithOutbox, flushOutbox, dbUrl, verifyManagerPinViaAuth,
-  updateManagerPinViaAuth, subscribeOutboxChange, loadOutbox
+  updateManagerPinViaAuth, subscribeOutboxChange, loadOutbox, clearOutboxForPaths
 } from './firebase';
 import { SvgChart } from './components/SvgChart';
 import { InvoiceModal, InvoiceData } from './components/InvoiceModal';
@@ -393,6 +393,7 @@ export default function App() {
   const [historyLimit, setHistoryLimit] = useState(20);
   const [expensesLimit, setExpensesLimit] = useState(20);
   const [auditLimit, setAuditLimit] = useState(20);
+  const [shiftLogsLimit, setShiftLogsLimit] = useState(5);
 
   const triggerToast = (msg: string) => {
     setToastMsg(msg);
@@ -3117,12 +3118,21 @@ export default function App() {
     triggerToast('📊 جاري توليد تقرير PDF التصفير للأرشيف...');
     await generateResetReportPDF(salesToRemove, otherToRemove, days);
 
-    for (const s of salesToRemove) {
-      await putWithOutbox(`/sales/${s.id}.json`, null);
+    if (salesToRemove.length > 0) {
+      const salesPatch: Record<string, null> = {};
+      salesToRemove.forEach(s => { salesPatch[s.id] = null; });
+      await patchWithOutbox('/sales.json', salesPatch);
     }
-    for (const o of otherToRemove) {
-      await putWithOutbox(`/otherIncome/${o.id}.json`, null);
+    if (otherToRemove.length > 0) {
+      const otherPatch: Record<string, null> = {};
+      otherToRemove.forEach(o => { otherPatch[o.id] = null; });
+      await patchWithOutbox('/otherIncome.json', otherPatch);
     }
+
+    const removedSalesIds = new Set(salesToRemove.map(s => s.id));
+    const removedOtherIds = new Set(otherToRemove.map(o => o.id));
+    setSales(prev => prev.filter(s => !removedSalesIds.has(s.id)));
+    setOtherIncome(prev => prev.filter(o => !removedOtherIds.has(o.id)));
 
     triggerToast('🧹 تم تنظيف المبيعات الأرشيفية القديمة وتوفير مساحة السحابة دون المساس بالوردية الحالية');
     loadAllData();
@@ -3396,14 +3406,39 @@ export default function App() {
         currentShiftOtherIncome
       );
 
-      // 2. Clear sales and other income of this shift from Firebase to save database storage
+      // 2. Clear outbox queue & wipe sales, other income, and expenses from Firebase
       triggerToast('🧹 جاري تفريغ سجلات الوردية من السحابة...');
-      for (const s of currentShiftSales) {
-        await putWithOutbox(`/sales/${s.id}.json`, null);
+      clearOutboxForPaths(['/sales', '/otherIncome', '/expenses']);
+
+      // Batch delete from Firebase using fast patch / put operations
+      if (sales.length > 0) {
+        const salesPatch: Record<string, null> = {};
+        sales.forEach(s => { salesPatch[s.id] = null; });
+        await patchWithOutbox('/sales.json', salesPatch);
+      } else {
+        await putWithOutbox('/sales.json', null);
       }
-      for (const o of currentShiftOtherIncome) {
-        await putWithOutbox(`/otherIncome/${o.id}.json`, null);
+
+      if (otherIncome.length > 0) {
+        const incomePatch: Record<string, null> = {};
+        otherIncome.forEach(o => { incomePatch[o.id] = null; });
+        await patchWithOutbox('/otherIncome.json', incomePatch);
+      } else {
+        await putWithOutbox('/otherIncome.json', null);
       }
+
+      if (expenses.length > 0) {
+        const expensePatch: Record<string, null> = {};
+        expenses.forEach(e => { expensePatch[e.id] = null; });
+        await patchWithOutbox('/expenses.json', expensePatch);
+      } else {
+        await putWithOutbox('/expenses.json', null);
+      }
+
+      // Clear local state immediately so UI updates cleanly
+      setSales([]);
+      setOtherIncome([]);
+      setExpenses([]);
 
       // 3. Save shift log & new starting cash
       const newLog: ShiftLog = {
@@ -4126,58 +4161,96 @@ export default function App() {
                   {shiftLogs.length === 0 ? (
                     <p className="text-center text-stone-400 text-xs py-4">لم يتم تسجيل أي تصفير وردية سابق بعد</p>
                   ) : (
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-right text-xs">
-                        <thead>
-                          <tr className="bg-stone-50 text-stone-600 border-b border-stone-200 text-[11px]">
-                            <th className="p-2.5 rounded-r-xl">تاريخ ووقت التصفير</th>
-                            <th className="p-2.5">اسم الوردية / البائع</th>
-                            <th className="p-2.5">مداخيل الوردية</th>
-                            <th className="p-2.5">الفعلي بالدرج</th>
-                            <th className="p-2.5">المسحوب للخزنة</th>
-                            <th className="p-2.5">كاش بداية القادمة</th>
-                            <th className="p-2.5">الفارق / الحالة</th>
-                            <th className="p-2.5 rounded-l-xl text-center">إجراءات</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-stone-100 font-mono text-[11px]">
-                          {shiftLogs.slice().reverse().map((log) => {
-                            const totalIncome = (log.salesTotal || 0) + (log.otherIncomeTotal || 0);
-                            const diff = log.difference || 0;
-                            return (
-                              <tr key={log.id} className="hover:bg-stone-50/80 transition-colors">
-                                <td className="p-2.5 text-stone-500">{new Date(log.timestamp).toLocaleString('ar-TN')}</td>
-                                <td className="p-2.5 font-sans font-bold text-stone-800">{log.sellerName || 'غير مسمى'}</td>
-                                <td className="p-2.5 text-emerald-700 font-bold">{totalIncome.toFixed(3)} د.ت</td>
-                                <td className="p-2.5 text-stone-900 font-bold">{(log.actualCashInDrawer || 0).toFixed(3)} د.ت</td>
-                                <td className="p-2.5 text-blue-700 font-bold">{(log.cashWithdrawn || 0).toFixed(3)} د.ت</td>
-                                <td className="p-2.5 text-amber-700 font-bold">{(log.newStartingCash || 0).toFixed(3)} د.ت</td>
-                                <td className="p-2.5 font-sans">
-                                  {Math.abs(diff) < 0.001 ? (
-                                    <span className="text-emerald-700 font-bold bg-emerald-50 px-2 py-0.5 rounded-md">مطابقة ✅</span>
-                                  ) : diff < 0 ? (
-                                    <span className="text-rose-700 font-bold bg-rose-50 px-2 py-0.5 rounded-md dir-ltr">عجز {Math.abs(diff).toFixed(3)} ⚠️</span>
-                                  ) : (
-                                    <span className="text-blue-700 font-bold bg-blue-50 px-2 py-0.5 rounded-md dir-ltr">فائض {diff.toFixed(3)} ✨</span>
-                                  )}
-                                </td>
-                                <td className="p-2.5 text-center font-sans">
-                                  {currentRole === 'owner' && (
-                                    <button
-                                      onClick={() => handleDeleteShiftLog(log.id)}
-                                      title="حذف هذا السجل"
-                                      className="p-1 text-stone-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
-                                    >
-                                      <Trash2 size={13} />
-                                    </button>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
+                    <>
+                      <div className="overflow-x-auto max-h-72 overflow-y-auto rounded-xl border border-stone-100">
+                        <table className="w-full text-right text-xs">
+                          <thead className="sticky top-0 bg-stone-50 z-10 shadow-xs">
+                            <tr className="text-stone-600 border-b border-stone-200 text-[11px]">
+                              <th className="p-2.5 rounded-r-xl">تاريخ ووقت التصفير</th>
+                              <th className="p-2.5">اسم الوردية / البائع</th>
+                              <th className="p-2.5">مداخيل الوردية</th>
+                              <th className="p-2.5">الفعلي بالدرج</th>
+                              <th className="p-2.5">المسحوب للخزنة</th>
+                              <th className="p-2.5">كاش بداية القادمة</th>
+                              <th className="p-2.5">الفارق / الحالة</th>
+                              <th className="p-2.5 rounded-l-xl text-center">إجراءات</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-stone-100 font-mono text-[11px]">
+                            {shiftLogs.slice().reverse().slice(0, shiftLogsLimit).map((log) => {
+                              const totalIncome = (log.salesTotal || 0) + (log.otherIncomeTotal || 0);
+                              const diff = log.difference || 0;
+                              return (
+                                <tr key={log.id} className="hover:bg-stone-50/80 transition-colors">
+                                  <td className="p-2.5 text-stone-500">{new Date(log.timestamp).toLocaleString('ar-TN')}</td>
+                                  <td className="p-2.5 font-sans font-bold text-stone-800">{log.sellerName || 'غير مسمى'}</td>
+                                  <td className="p-2.5 text-emerald-700 font-bold">{totalIncome.toFixed(3)} د.ت</td>
+                                  <td className="p-2.5 text-stone-900 font-bold">{(log.actualCashInDrawer || 0).toFixed(3)} د.ت</td>
+                                  <td className="p-2.5 text-blue-700 font-bold">{(log.cashWithdrawn || 0).toFixed(3)} د.ت</td>
+                                  <td className="p-2.5 text-amber-700 font-bold">{(log.newStartingCash || 0).toFixed(3)} د.ت</td>
+                                  <td className="p-2.5 font-sans">
+                                    {Math.abs(diff) < 0.001 ? (
+                                      <span className="text-emerald-700 font-bold bg-emerald-50 px-2 py-0.5 rounded-md">مطابقة ✅</span>
+                                    ) : diff < 0 ? (
+                                      <span className="text-rose-700 font-bold bg-rose-50 px-2 py-0.5 rounded-md dir-ltr">عجز {Math.abs(diff).toFixed(3)} ⚠️</span>
+                                    ) : (
+                                      <span className="text-blue-700 font-bold bg-blue-50 px-2 py-0.5 rounded-md dir-ltr">فائض {diff.toFixed(3)} ✨</span>
+                                    )}
+                                  </td>
+                                  <td className="p-2.5 text-center font-sans">
+                                    {currentRole === 'owner' && (
+                                      <button
+                                        onClick={() => handleDeleteShiftLog(log.id)}
+                                        title="حذف هذا السجل"
+                                        className="p-1 text-stone-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+                                      >
+                                        <Trash2 size={13} />
+                                      </button>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      {/* Pagination / Expand controls */}
+                      <div className="flex flex-wrap gap-2 justify-between items-center pt-2 text-xs">
+                        <span className="text-stone-400 text-[10px]">
+                          عرض {Math.min(shiftLogsLimit, shiftLogs.length)} من إجمالي {shiftLogs.length} وردية
+                        </span>
+                        <div className="flex gap-2">
+                          {shiftLogs.length > shiftLogsLimit && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => setShiftLogsLimit(prev => prev + 10)}
+                                className="bg-amber-50 hover:bg-amber-100 text-amber-800 font-bold px-3 py-1.5 rounded-lg text-[10px] transition-colors cursor-pointer border border-amber-200"
+                              >
+                                عرض المزيد (+10) ⬇️
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setShiftLogsLimit(shiftLogs.length)}
+                                className="bg-stone-800 hover:bg-stone-900 text-white font-bold px-3 py-1.5 rounded-lg text-[10px] transition-colors cursor-pointer"
+                              >
+                                عرض كل السجلات ({shiftLogs.length}) 📜
+                              </button>
+                            </>
+                          )}
+                          {shiftLogsLimit > 5 && (
+                            <button
+                              type="button"
+                              onClick={() => setShiftLogsLimit(5)}
+                              className="bg-stone-100 hover:bg-stone-200 text-stone-600 font-bold px-3 py-1.5 rounded-lg text-[10px] transition-colors cursor-pointer border border-stone-200"
+                            >
+                              طي السجل ⬆️
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </>
                   )}
                 </div>
               </div>
