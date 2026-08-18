@@ -8,7 +8,8 @@ interface VisualProductRecognitionModalProps {
   onClose: () => void;
   onSelectProduct: (item: Item) => void;
   onUpdateItemImage: (itemId: string, imageUrl: string) => void;
-  onAddNewItemWithImage?: (name: string, sellPrice: number, buyPrice: number, qty: number, category: string, imageUrl: string) => void;
+  onAddNewItemWithImage?: (name: string, sellPrice: number, buyPrice: number, qty: number, category: string, imageUrl: string, barcode?: string) => void;
+  onAttachPhotoToForm?: (imageUrl: string) => void;
   targetItemToUpdate?: Item | null;
   mode?: 'sell' | 'stock';
 }
@@ -57,6 +58,7 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
   onSelectProduct,
   onUpdateItemImage,
   onAddNewItemWithImage,
+  onAttachPhotoToForm,
   targetItemToUpdate,
   mode = 'sell'
 }) => {
@@ -73,6 +75,7 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
   // New Item Quick Add State
   const [showQuickAddForm, setShowQuickAddForm] = useState<boolean>(false);
   const [newItemName, setNewItemName] = useState<string>('');
+  const [newItemBarcode, setNewItemBarcode] = useState<string>('');
   const [newItemSell, setNewItemSell] = useState<string>('');
   const [newItemBuy, setNewItemBuy] = useState<string>('');
   const [newItemQty, setNewItemQty] = useState<string>('1');
@@ -437,16 +440,32 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
             {/* Stock Mode Options */}
             {capturedImage && !targetItemToUpdate && mode === 'stock' && (
               <div className="bg-stone-50 border border-stone-200 rounded-2xl p-3 space-y-3 mt-auto">
-                <div className="flex items-center justify-between">
+                {/* Primary Action: Attach to main product addition form */}
+                {onAttachPhotoToForm && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (capturedImage) {
+                        onAttachPhotoToForm(capturedImage);
+                        onClose();
+                      }
+                    }}
+                    className="w-full bg-amber-600 hover:bg-amber-700 text-white font-extrabold py-2.5 px-3 rounded-xl text-xs flex items-center justify-center gap-2 cursor-pointer shadow-md shadow-amber-600/20 transition-all"
+                  >
+                    <Check size={16} /> 📌 اعتماد هذه الصورة للسلعة الجاري إدخالها (مع الباركود)
+                  </button>
+                )}
+
+                <div className="flex items-center justify-between pt-1 border-t border-stone-200">
                   <span className="text-xs font-black text-stone-900">
-                    {showQuickAddForm ? '✨ إضافة سلعة جديدة بالصورة للستوك' : '💾 خيارات الصورة الملتقطة:'}
+                    {showQuickAddForm ? '✨ إضافة سلعة جديدة بالصورة والباركود للستوك' : '💾 خيارات أخرى للصورة:'}
                   </span>
                   <button 
                     type="button"
                     onClick={() => setShowQuickAddForm(!showQuickAddForm)}
                     className="text-[10px] font-extrabold bg-amber-100 text-amber-900 hover:bg-amber-200 px-2.5 py-1 rounded-lg transition-colors cursor-pointer"
                   >
-                    {showQuickAddForm ? 'تغيير لربط بمنتج مسجل' : '➕ السلعة غير موجودة بالمخزن؟ أضفها الآن'}
+                    {showQuickAddForm ? 'تغيير لربط بمنتج مسجل' : '➕ إنشاء سلعة جديدة مباشرة من هنا'}
                   </button>
                 </div>
 
@@ -460,6 +479,17 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
                         value={newItemName}
                         onChange={e => setNewItemName(e.target.value)}
                         className="w-full border border-stone-200 rounded-lg p-1.5 text-xs font-bold text-stone-900"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] font-bold text-stone-600 mb-0.5">الباركود (اختياري)</label>
+                      <input 
+                        type="text"
+                        placeholder="اكتب أو امسح الباركود"
+                        value={newItemBarcode}
+                        onChange={e => setNewItemBarcode(e.target.value)}
+                        className="w-full border border-stone-200 rounded-lg p-1.5 text-xs font-mono font-bold text-stone-900"
                       />
                     </div>
 
@@ -522,9 +552,11 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
                               parseFloat(newItemBuy) || 0,
                               parseInt(newItemQty) || 1,
                               newItemCategory,
-                              capturedImage
+                              capturedImage,
+                              newItemBarcode.trim()
                             );
                             setNewItemName('');
+                            setNewItemBarcode('');
                             setNewItemSell('');
                             setNewItemBuy('');
                             setShowQuickAddForm(false);

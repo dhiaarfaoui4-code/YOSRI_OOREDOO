@@ -22,7 +22,8 @@ export function dbUrl(path: string): string {
 }
 
 // Ensure Auth Token
-export async function ensureAuth(retries = 3): Promise<boolean> {
+export async function ensureAuth(retries = 2): Promise<boolean> {
+  if (idToken) return true;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const res = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${FIREBASE_API_KEY}`, {
@@ -39,10 +40,12 @@ export async function ensureAuth(retries = 3): Promise<boolean> {
           return true;
         }
       }
-    } catch (e) {
-      console.error('Anonymous auth attempt failed:', e);
+    } catch (e: any) {
+      console.warn('Anonymous auth note (continuing in local/offline mode):', e?.message || e);
     }
-    await new Promise(res => setTimeout(res, 800 * (attempt + 1)));
+    if (attempt < retries - 1) {
+      await new Promise(res => setTimeout(res, 500 * (attempt + 1)));
+    }
   }
   return false;
 }

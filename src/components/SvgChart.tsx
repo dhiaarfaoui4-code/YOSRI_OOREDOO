@@ -100,7 +100,8 @@ export const SvgChart: React.FC<SvgChartProps> = ({ sales, otherIncome, expenses
                 y1={y} 
                 x2={width - paddingRight} 
                 y2={y} 
-                stroke="#f0ece4" 
+                stroke="currentColor"
+                className="text-stone-200 dark:text-stone-800"
                 strokeWidth="1" 
                 strokeDasharray="4 4"
               />
@@ -108,9 +109,9 @@ export const SvgChart: React.FC<SvgChartProps> = ({ sales, otherIncome, expenses
                 x={paddingLeft - 5} 
                 y={y + 3} 
                 fontSize="8" 
-                fill="#8a8172" 
+                fill="currentColor"
                 textAnchor="end"
-                className="font-mono"
+                className="font-mono text-stone-500 dark:text-stone-400"
               >
                 {val.toFixed(1)}
               </text>
@@ -124,7 +125,8 @@ export const SvgChart: React.FC<SvgChartProps> = ({ sales, otherIncome, expenses
           y1={zeroY} 
           x2={width - paddingRight} 
           y2={zeroY} 
-          stroke="#e6ddcc" 
+          stroke="currentColor"
+          className="text-stone-300 dark:text-stone-700"
           strokeWidth="1.5"
         />
 
@@ -156,9 +158,9 @@ export const SvgChart: React.FC<SvgChartProps> = ({ sales, otherIncome, expenses
               x={x} 
               y={height - 5} 
               fontSize="8" 
-              fill="#8a8172" 
+              fill="currentColor"
               textAnchor="middle" 
-              className="font-mono"
+              className="font-mono text-stone-500 dark:text-stone-400"
             >
               {h}h
             </text>

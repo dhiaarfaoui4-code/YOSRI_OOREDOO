@@ -3,7 +3,10 @@ import {
   TrendingUp, Plus, Minus, Search, Trash2, ShieldAlert, CreditCard, 
   History, Settings as SettingsIcon, Package, Phone, FileText, Check, 
   Camera, ShoppingBag, Radio, Wifi, LogOut, CheckCircle, RefreshCw, X,
-  Pencil, Image as ImageIcon, Sparkles, Zap, CornerDownLeft
+  Pencil, Image as ImageIcon, Sparkles, Zap, CornerDownLeft,
+  Moon, Sun, Laptop, Users, UserCheck, Merge, ChevronDown, ChevronUp,
+  AlertCircle, HelpCircle, Layers, ArrowDownRight, UserPlus, PhoneCall,
+  MessageCircle, Link2, Briefcase, Building2
 } from 'lucide-react';
 import { 
   Item, Sale, OtherIncome, Debt, CardStockEntry, Expense, 
@@ -24,7 +27,12 @@ import { LoginOverlay } from './components/LoginOverlay';
 import { VisualProductRecognitionModal } from './components/VisualProductRecognitionModal';
 import { DuplicateProductModal } from './components/DuplicateProductModal';
 import { ShiftHandoverModal } from './components/ShiftHandoverModal';
+import { PayDebtModal, PayDebtModalTarget } from './components/PayDebtModal';
 import { findSimilarProducts, recordLearningDecision, SimilarityResult } from './utils/productSimilarity';
+import { 
+  groupDebtsByCustomer, findCustomerSuggestions, assessCustomerSimilarity,
+  CustomerDebtGroup, CustomerSuggestion
+} from './utils/customerDebtMatcher';
 
 // Helper to normalize Arabic
 function normalizeArabic(str: string): string {
@@ -269,6 +277,81 @@ export default function App() {
   const [currentTab, setCurrentTab] = useState<AppTab>('income');
   const [connectionStatus, setConnectionStatus] = useState<'checking' | 'connected' | 'offline'>('checking');
   const [outboxCount, setOutboxCount] = useState<number>(0);
+  const [payDebtTarget, setPayDebtTarget] = useState<PayDebtModalTarget | null>(null);
+
+  // ---- Dark Mode / Theme State (Default: System / Device Preference) ----
+  type ThemeMode = 'system' | 'dark' | 'light';
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    try {
+      const saved = localStorage.getItem('yosri_gsm_theme') as ThemeMode;
+      if (saved === 'dark' || saved === 'light' || saved === 'system') return saved;
+    } catch (e) {
+      // ignore
+    }
+    return 'system'; // Auto detect by default
+  });
+
+  const [isDarkEffective, setIsDarkEffective] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      const saved = localStorage.getItem('yosri_gsm_theme');
+      if (saved === 'dark') return true;
+      if (saved === 'light') return false;
+      return window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)').matches : false;
+    } catch (e) {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+
+    const updateTheme = () => {
+      let isDark = false;
+      if (themeMode === 'dark') {
+        isDark = true;
+      } else if (themeMode === 'light') {
+        isDark = false;
+      } else {
+        // System preference
+        isDark = mediaQuery.matches;
+      }
+      setIsDarkEffective(isDark);
+      if (isDark) {
+        document.documentElement.classList.add('dark');
+      } else {
+        document.documentElement.classList.remove('dark');
+      }
+    };
+
+    updateTheme();
+    try {
+      localStorage.setItem('yosri_gsm_theme', themeMode);
+    } catch (e) {
+      // ignore
+    }
+
+    const handleChange = (e: MediaQueryListEvent) => {
+      if (themeMode === 'system') {
+        setIsDarkEffective(e.matches);
+        if (e.matches) {
+          document.documentElement.classList.add('dark');
+        } else {
+          document.documentElement.classList.remove('dark');
+        }
+      }
+    };
+
+    if (mediaQuery.addEventListener) {
+      mediaQuery.addEventListener('change', handleChange);
+      return () => mediaQuery.removeEventListener('change', handleChange);
+    } else if (mediaQuery.addListener) {
+      // legacy support
+      mediaQuery.addListener(handleChange);
+      return () => mediaQuery.removeListener(handleChange);
+    }
+  }, [themeMode]);
 
   // ---- Modals & Overlays ----
   const [lastInvoice, setLastInvoice] = useState<InvoiceData | null>(null);
@@ -299,7 +382,7 @@ export default function App() {
   const [cardOperator, setCardOperator] = useState('Ooredoo');
   const [cardValue, setCardValue] = useState('1');
   const [cardQty, setCardQty] = useState('');
-  const [addBalanceOperator, setAddBalanceOperator] = useState('Ooredoo');
+  const [addBalanceOperator, setAddBalanceOperator] = useState('Ooredoo_1005');
   const [addBalanceAmount, setAddBalanceAmount] = useState('');
   const [newPlanName, setNewPlanName] = useState('');
   const [newPlanValidity, setNewPlanValidity] = useState('');
@@ -358,11 +441,14 @@ export default function App() {
   const [showVisualRecognitionModal, setShowVisualRecognitionModal] = useState<boolean>(false);
   const [visualRecognitionMode, setVisualRecognitionMode] = useState<'sell' | 'stock'>('sell');
   const [targetItemToCapturePhoto, setTargetItemToCapturePhoto] = useState<Item | null>(null);
+  const itemDirectFileInputRef = useRef<HTMLInputElement>(null);
 
   const [stockSearch, setStockSearch] = useState('');
   const [selectedStockCategory, setSelectedStockCategory] = useState<string>('all');
   const [selectedSellCategory, setSelectedSellCategory] = useState<string>('all');
   const [debtSearch, setDebtSearch] = useState('');
+  const [debtViewMode, setDebtViewMode] = useState<'grouped' | 'list'>('grouped');
+  const [expandedCustomerGroups, setExpandedCustomerGroups] = useState<Record<string, boolean>>({});
   const [auditLogSearch, setAuditLogSearch] = useState('');
   const [historySearch, setHistorySearch] = useState('');
   const [historyCategory, setHistoryCategory] = useState<'all' | 'item' | 'recharge' | 'forfait' | 'photo' | 'service'>('all');
@@ -414,9 +500,25 @@ export default function App() {
 
     async function init() {
       setConnectionStatus('checking');
-      const authOk = await ensureAuth();
-      if (!authOk && active) {
-        triggerToast('⚠️ فشل الاتصال بخادم الهوية');
+
+      // 1. Resume manager session if previously logged in
+      const sessionRole = sessionStorage.getItem('yosri_role_v2') as AppRole | null;
+      if (sessionRole === 'manager') {
+        const resumed = await resumeManagerSession();
+        if (resumed) {
+          setCurrentRole('manager');
+          setCurrentTab('income');
+        } else {
+          sessionStorage.removeItem('yosri_role_v2');
+          setCurrentRole(null);
+          await ensureAuth(2);
+        }
+      } else {
+        if (sessionRole === 'seller') {
+          setCurrentRole('seller');
+          setCurrentTab('income');
+        }
+        await ensureAuth(2);
       }
 
       // Try flushing outbox immediately
@@ -426,22 +528,6 @@ export default function App() {
 
       // Load all data
       await loadAllData();
-
-      // Resume manager session if saved
-      const sessionRole = sessionStorage.getItem('yosri_role_v2') as AppRole | null;
-      if (sessionRole === 'seller') {
-        setCurrentRole('seller');
-        setCurrentTab('income');
-      } else if (sessionRole === 'manager') {
-        const resumed = await resumeManagerSession();
-        if (resumed) {
-          setCurrentRole('manager');
-          setCurrentTab('income');
-        } else {
-          sessionStorage.removeItem('yosri_role_v2');
-          setCurrentRole(null);
-        }
-      }
     }
     init();
 
@@ -645,7 +731,27 @@ export default function App() {
         setForfaitPlans(parseRawWithKeys<ForfaitPlan>(plansRaw));
       }
 
-      setForfaitBalance(balanceRaw ? { Ooredoo: 0, Orange: 0, 'Tunisie Telecom': 0, ...balanceRaw } : { Ooredoo: 0, Orange: 0, 'Tunisie Telecom': 0 });
+      if (balanceRaw) {
+        const raw1005 = balanceRaw.Ooredoo_1005 !== undefined ? balanceRaw.Ooredoo_1005 : (balanceRaw.Ooredoo || 0);
+        const raw1006 = balanceRaw.Ooredoo_1006 !== undefined ? balanceRaw.Ooredoo_1006 : 0;
+        const ooredooTotal = raw1005 + raw1006;
+        setForfaitBalance({
+          ...balanceRaw,
+          Ooredoo: ooredooTotal,
+          Ooredoo_1005: raw1005,
+          Ooredoo_1006: raw1006,
+          Orange: balanceRaw.Orange || 0,
+          'Tunisie Telecom': balanceRaw['Tunisie Telecom'] || 0
+        });
+      } else {
+        setForfaitBalance({
+          Ooredoo: 0,
+          Ooredoo_1005: 0,
+          Ooredoo_1006: 0,
+          Orange: 0,
+          'Tunisie Telecom': 0
+        });
+      }
       setPhotoPaperStock(typeof photoPaperStockRaw === 'number' ? photoPaperStockRaw : 0);
 
       // Handle legacy raw PIN hashing
@@ -823,8 +929,13 @@ export default function App() {
     buyPrice: number,
     qty: number,
     category: string,
-    imageUrl: string
+    imageUrl: string,
+    barcode?: string
   ) => {
+    const barcodeArray = barcode
+      ? barcode.split(',').map(b => b.trim()).filter(b => b.length > 0)
+      : [];
+
     const newItemObj: Item = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       name,
@@ -833,16 +944,57 @@ export default function App() {
       qty,
       category,
       imageUrl,
-      barcodes: []
+      barcodes: barcodeArray,
+      barcode: barcodeArray[0]
     };
 
     setItems(prev => [newItemObj, ...prev]);
     const ok = await putWithOutbox(`/items/${newItemObj.id}.json`, newItemObj);
     if (ok) {
-      triggerToast(`✨ تم تسجيل "${name}" بالستوك وإرفاق صورتها فوراً!`);
-      logAudit('edit', `تسجيل سلعة جديدة بالصورة: ${name}`);
+      triggerToast(`✨ تم تسجيل "${name}" بالستوك وإرفاق صورتها والباركود بنجاح!`);
+      logAudit('edit', `تسجيل سلعة جديدة بالصورة والباركود: ${name}`);
       handleQuickAddItemToCart(newItemObj, 1);
     }
+  };
+
+  const handleDirectItemPhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const dataUrl = evt.target?.result as string;
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        const maxDim = 720;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          const compressed = canvas.toDataURL('image/jpeg', 0.85);
+          setNewItem(prev => ({ ...prev, imageUrl: compressed }));
+          triggerToast('📸 تم إرفاق صورة السلعة بنجاح!');
+        } else {
+          setNewItem(prev => ({ ...prev, imageUrl: dataUrl }));
+          triggerToast('📸 تم إرفاق صورة السلعة بنجاح!');
+        }
+      };
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+    // Reset file input so same file can be re-selected if needed
+    e.target.value = '';
   };
 
   const handleAdjustQty = async (itemId: string, delta: number) => {
@@ -850,16 +1002,24 @@ export default function App() {
     if (!item) return;
     if (delta < 0 && item.qty <= 0) return triggerToast('❌ المخزن فارغ بالفعل');
 
+    const prevQty = item.qty;
+    const nextQty = Math.max(0, prevQty + delta);
+
+    // 1. Instant Optimistic State Update (0ms visual delay)
+    setItems(prev => prev.map(i => i.id === itemId ? { ...i, qty: nextQty } : i));
+    triggerToast(delta > 0 ? `➕ ${item.name}: ${nextQty} قطعة` : `➖ ${item.name}: ${nextQty} قطعة`);
+
+    // 2. Background Safe Sync
     const result = delta > 0 
-      ? await safeIncrementItemQty(itemId, delta)
-      : await safeDecrementItemQty(itemId, Math.abs(delta));
+      ? await safeIncrementItemQty(itemId, delta, prevQty)
+      : await safeDecrementItemQty(itemId, Math.abs(delta), prevQty);
 
     if (result.success) {
-      triggerToast('✅ تم تحديث الكمية');
-      logAudit('edit', `تعديل كمية "${item.name}" يدوياً: ${delta > 0 ? '+' : ''}${delta}`);
-      loadAllData();
+      logAudit('edit', `تعديل كمية "${item.name}" يدوياً: ${delta > 0 ? '+' : ''}${delta} (${prevQty} ← ${nextQty})`);
     } else {
-      triggerToast('❌ فشل تعديل الكمية، الرجاء المحاولة مجدداً');
+      // Revert if failed
+      setItems(prev => prev.map(i => i.id === itemId ? { ...i, qty: prevQty } : i));
+      triggerToast('❌ فشل حفظ الكمية في السحابة، تم التراجع');
     }
   };
 
@@ -874,16 +1034,20 @@ export default function App() {
     const delta = val - item.qty;
     if (delta === 0) return;
 
+    const prevQty = item.qty;
+    // 1. Instant Optimistic UI Update
+    setItems(prev => prev.map(i => i.id === itemId ? { ...i, qty: val } : i));
+    triggerToast(`✅ ${item.name}: ${val} قطعة`);
+
     const result = delta > 0 
-      ? await safeIncrementItemQty(itemId, delta)
-      : await safeDecrementItemQty(itemId, Math.abs(delta));
+      ? await safeIncrementItemQty(itemId, delta, prevQty)
+      : await safeDecrementItemQty(itemId, Math.abs(delta), prevQty);
 
     if (result.success) {
-      triggerToast('✅ تم تعديل الكمية الدقيقة');
       logAudit('edit', `تعديل كمية "${item.name}" للقيمة المحددة: ${val}`);
-      loadAllData();
     } else {
-      triggerToast('❌ فشل التعديل، حاول مرة أخرى');
+      setItems(prev => prev.map(i => i.id === itemId ? { ...i, qty: prevQty } : i));
+      triggerToast('❌ فشل حفظ التعديل، تم التراجع');
     }
   };
 
@@ -1863,19 +2027,31 @@ export default function App() {
     if (!card) return;
     if (delta < 0 && card.qty <= 0) return triggerToast('❌ المخزن فارغ بالفعل');
 
+    const prevQty = card.qty;
+    const nextQty = Math.max(0, prevQty + delta);
+
+    // 1. Instant Optimistic State Update (0ms visual delay)
+    setCardStock(prev => prev.map(c => c.id === id ? { ...c, qty: nextQty } : c));
+    triggerToast(delta > 0 ? `➕ ${card.operator} (${card.value} د.ت): ${nextQty}` : `➖ ${card.operator} (${card.value} د.ت): ${nextQty}`);
+
+    // 2. Background Safe Sync
     if (delta > 0) {
-      const res = await safeIncrementCardQty(card.id, delta, card.qty);
-      const newQty = res.newQty !== undefined ? res.newQty : card.qty + delta;
-      setCardStock(prev => prev.map(c => c.id === id ? { ...c, qty: newQty } : c));
-      triggerToast('✅ تم تحديث كمية البطاقات');
-      logAudit('edit', `تعديل سريع لستوك بطاقات ${card.operator} فئة ${card.value}: ${card.qty} ← ${newQty} (+${delta})`);
+      const res = await safeIncrementCardQty(card.id, delta, prevQty);
+      if (!res.success) {
+        setCardStock(prev => prev.map(c => c.id === id ? { ...c, qty: prevQty } : c));
+        triggerToast('❌ فشل حفظ بطاقات الشحن في السحابة');
+      } else {
+        logAudit('edit', `تعديل سريع لستوك بطاقات ${card.operator} فئة ${card.value}: ${prevQty} ← ${nextQty} (+${delta})`);
+      }
     } else {
       const absDelta = Math.abs(delta);
-      const res = await safeDecrementCardQty(card.id, absDelta, card.qty);
-      const newQty = res.newQty !== undefined ? res.newQty : Math.max(0, card.qty - absDelta);
-      setCardStock(prev => prev.map(c => c.id === id ? { ...c, qty: newQty } : c));
-      triggerToast('✅ تم تحديث كمية البطاقات');
-      logAudit('edit', `تعديل سريع لستوك بطاقات ${card.operator} فئة ${card.value}: ${card.qty} ← ${newQty} (-${absDelta})`);
+      const res = await safeDecrementCardQty(card.id, absDelta, prevQty);
+      if (!res.success) {
+        setCardStock(prev => prev.map(c => c.id === id ? { ...c, qty: prevQty } : c));
+        triggerToast('❌ فشل حفظ بطاقات الشحن في السحابة');
+      } else {
+        logAudit('edit', `تعديل سريع لستوك بطاقات ${card.operator} فئة ${card.value}: ${prevQty} ← ${nextQty} (-${absDelta})`);
+      }
     }
   };
 
@@ -1900,31 +2076,55 @@ export default function App() {
     const amt = parseFloat(addBalanceAmount) || 0;
     if (amt <= 0) return triggerToast('❌ أدخل قيمة شحن صحيحة');
 
-    const updated = {
+    const updated: ForfaitBalance = {
       ...forfaitBalance,
       [addBalanceOperator]: (forfaitBalance[addBalanceOperator] || 0) + amt
     };
+
+    // Calculate Ooredoo total if either 1005 or 1006 was charged
+    if (addBalanceOperator === 'Ooredoo_1005' || addBalanceOperator === 'Ooredoo_1006' || addBalanceOperator === 'Ooredoo') {
+      const b1005 = updated.Ooredoo_1005 || 0;
+      const b1006 = updated.Ooredoo_1006 || 0;
+      updated.Ooredoo = b1005 + b1006;
+    }
+
     const ok = await putWithOutbox('/forfaitBalance.json', updated);
     if (ok) {
-      triggerToast('✅ تم إضافة الرصيد بنجاح');
-      logAudit('edit', `شحن رصيد فورفاي لـ ${addBalanceOperator}: +${amt} د.ت`);
+      const opName = addBalanceOperator === 'Ooredoo_1005' 
+        ? 'Ooredoo (حساب 1005)' 
+        : addBalanceOperator === 'Ooredoo_1006' 
+        ? 'Ooredoo (حساب 1006)' 
+        : addBalanceOperator;
+      triggerToast(`✅ تم شحن رصيد ${opName} بمبلغ +${amt.toFixed(3)} د.ت`);
+      logAudit('edit', `شحن رصيد فورفاي لـ ${opName}: +${amt} د.ت`);
       setAddBalanceAmount('');
+      setForfaitBalance(updated);
       loadAllData();
     }
   };
 
-  const handleEditForfaitBalanceExact = async (op: string) => {
-    const current = forfaitBalance[op] || 0;
-    const input = prompt(`أدخل الرصيد الدقيق لـ ${op} بالدينار:`, String(current));
+  const handleEditForfaitBalanceExact = async (opKey: string, customLabel?: string) => {
+    const label = customLabel || (
+      opKey === 'Ooredoo_1005' ? 'Ooredoo (حساب 1005)' : 
+      opKey === 'Ooredoo_1006' ? 'Ooredoo (حساب 1006)' : 
+      opKey === 'Ooredoo' ? 'Ooredoo (الإجمالي)' : 
+      opKey
+    );
+    const current = forfaitBalance[opKey] || 0;
+    const input = prompt(`أدخل الرصيد الدقيق لـ ${label} بالدينار:`, String(current));
     if (input === null) return;
     const val = parseFloat(input);
     if (isNaN(val) || val < 0) return triggerToast('❌ رقم غير صالح');
 
-    const updated = { ...forfaitBalance, [op]: val };
+    const updated: ForfaitBalance = { ...forfaitBalance, [opKey]: val };
+    if (opKey === 'Ooredoo_1005' || opKey === 'Ooredoo_1006') {
+      updated.Ooredoo = (updated.Ooredoo_1005 || 0) + (updated.Ooredoo_1006 || 0);
+    }
     const ok = await putWithOutbox('/forfaitBalance.json', updated);
     if (ok) {
-      triggerToast('✅ تم تعديل الرصيد');
-      logAudit('edit', `تعديل رصيد فورفاي لـ ${op}: ${current} ← ${val} د.ت`);
+      triggerToast(`✅ تم تعديل رصيد ${label}`);
+      logAudit('edit', `تعديل رصيد فورفاي لـ ${label}: ${current} ← ${val} د.ت`);
+      setForfaitBalance(updated);
       loadAllData();
     }
   };
@@ -1955,19 +2155,31 @@ export default function App() {
 
   const handleQuickAdjustPhotoStock = async (delta: number) => {
     if (delta < 0 && photoPaperStock <= 0) return triggerToast('❌ المخزون فارغ بالفعل');
+    const prevQty = photoPaperStock;
+    const nextQty = Math.max(0, prevQty + delta);
+
+    // 1. Instant Optimistic State Update (0ms delay)
+    setPhotoPaperStock(nextQty);
+    triggerToast(delta > 0 ? `➕ ورق الصور: ${nextQty}` : `➖ ورق الصور: ${nextQty}`);
+
+    // 2. Background Safe Sync
     if (delta > 0) {
-      const res = await safeIncrementPhotoStock(delta, photoPaperStock);
-      const newQty = res.newQty !== undefined ? res.newQty : photoPaperStock + delta;
-      setPhotoPaperStock(newQty);
-      triggerToast('✅ تم تحديث مخزون ورق الصور');
-      logAudit('edit', `تعديل سريع لمخزون ورق الصور: ${photoPaperStock} ← ${newQty} (+${delta})`);
+      const res = await safeIncrementPhotoStock(delta, prevQty);
+      if (!res.success) {
+        setPhotoPaperStock(prevQty);
+        triggerToast('❌ فشل حفظ مخزون ورق الصور في السحابة');
+      } else {
+        logAudit('edit', `تعديل سريع لمخزون ورق الصور: ${prevQty} ← ${nextQty} (+${delta})`);
+      }
     } else {
       const absDelta = Math.abs(delta);
-      const res = await safeDecrementPhotoStock(absDelta, photoPaperStock);
-      const newQty = res.newQty !== undefined ? res.newQty : Math.max(0, photoPaperStock - absDelta);
-      setPhotoPaperStock(newQty);
-      triggerToast('✅ تم تحديث مخزون ورق الصور');
-      logAudit('edit', `تعديل سريع لمخزون ورق الصور: ${photoPaperStock} ← ${newQty} (-${absDelta})`);
+      const res = await safeDecrementPhotoStock(absDelta, prevQty);
+      if (!res.success) {
+        setPhotoPaperStock(prevQty);
+        triggerToast('❌ فشل حفظ مخزون ورق الصور في السحابة');
+      } else {
+        logAudit('edit', `تعديل سريع لمخزون ورق الصور: ${prevQty} ← ${nextQty} (-${absDelta})`);
+      }
     }
   };
 
@@ -2076,60 +2288,167 @@ export default function App() {
     }
   };
 
-  const handlePayDebt = async (debtId: string, fullPayment: boolean) => {
+  const handlePayDebt = (debtId: string, fullPayment: boolean) => {
     const debt = debts.find(d => d.id === debtId);
     if (!debt) return;
-    const remaining = debt.amount - debt.paid;
-    let payAmount = remaining;
+    const remaining = Math.max(0, debt.amount - debt.paid);
+    setPayDebtTarget({
+      type: 'single',
+      debt,
+      defaultAmount: fullPayment ? remaining : undefined
+    });
+  };
 
-    if (!fullPayment) {
-      const input = prompt(`قداش دفع الحريف؟ (المتبقي: ${remaining.toFixed(3)} د.ت)`, remaining.toFixed(3));
-      if (input === null) return;
-      payAmount = parseFloat(input);
-      if (isNaN(payAmount) || payAmount <= 0) return triggerToast('❌ رقم غير صالح');
-      if (payAmount > remaining) payAmount = remaining;
+  const handlePayCustomerGroup = (group: CustomerDebtGroup, isFullPayment: boolean) => {
+    if (group.totalRemaining <= 0.001) {
+      return triggerToast('ℹ️ هذا الحريف ليس لديه أي ديون متبقية حالياً');
     }
+    setPayDebtTarget({
+      type: 'group',
+      group,
+      defaultAmount: isFullPayment ? group.totalRemaining : undefined
+    });
+  };
 
-    // Calculate accurate profit portion for the payment based on debt line buy costs
-    let totalDebtCost = 0;
-    if (debt.lines) {
-      for (const line of debt.lines) {
-        if (line.type === 'item' && line.itemId) {
-          const it = items.find(i => i.id === line.itemId);
-          totalDebtCost += (it?.buy || 0) * (line.qty || 1);
+  const handleExecuteDebtPayment = async (params: {
+    target: PayDebtModalTarget;
+    amount: number;
+    destination: 'drawer' | 'manager';
+    notes?: string;
+  }) => {
+    const { target, amount: payAmount, destination } = params;
+    if (payAmount <= 0) return;
+    const isToManager = destination === 'manager';
+
+    if (target.type === 'single' && target.debt) {
+      const debt = debts.find(d => d.id === target.debt!.id) || target.debt;
+      const remaining = Math.max(0, debt.amount - debt.paid);
+      const actualPayAmount = Math.min(payAmount, remaining);
+
+      // Calculate accurate profit portion for the payment based on debt line buy costs
+      let totalDebtCost = 0;
+      if (debt.lines) {
+        for (const line of debt.lines) {
+          if (line.type === 'item' && line.itemId) {
+            const it = items.find(i => i.id === line.itemId);
+            totalDebtCost += (it?.buy || 0) * (line.qty || 1);
+          }
         }
       }
-    }
-    const totalDebtAmount = debt.amount || 1;
-    const profitMarginRatio = Math.max(0, (totalDebtAmount - totalDebtCost) / totalDebtAmount);
-    const profitCommission = payAmount * profitMarginRatio;
+      const totalDebtAmount = debt.amount || 1;
+      const profitMarginRatio = Math.max(0, (totalDebtAmount - totalDebtCost) / totalDebtAmount);
+      const profitCommission = actualPayAmount * profitMarginRatio;
 
-    const incomeEntry: OtherIncome = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      category: 'debt_payment',
-      label: `خلاص دين - ${debt.customerName} (${debt.note || ''})`,
-      amount: payAmount,
-      commission: profitCommission,
-      date: new Date().toISOString(),
-      debtId: debt.id
-    };
+      const incomeEntry: OtherIncome = {
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        category: 'debt_payment',
+        label: `خلاص دين ${isToManager ? '(لجيب المدير)' : '(بالكاسة)'} - ${debt.customerName} (${debt.note || ''})`,
+        amount: actualPayAmount,
+        commission: profitCommission,
+        date: new Date().toISOString(),
+        debtId: debt.id,
+        destination: destination
+      };
 
-    const updatedDebt: Debt = {
-      ...debt,
-      paid: debt.paid + payAmount,
-      status: (debt.paid + payAmount >= debt.amount - 0.001) ? 'paid' : 'open'
-    };
+      const updatedDebt: Debt = {
+        ...debt,
+        paid: debt.paid + actualPayAmount,
+        status: (debt.paid + actualPayAmount >= debt.amount - 0.001) ? 'paid' : 'open'
+      };
 
-    // Optimistic local state update
-    setDebts(prev => prev.map(d => d.id === debt.id ? updatedDebt : d));
-    setOtherIncome(prev => [incomeEntry, ...prev]);
+      // Optimistic local state update
+      setDebts(prev => prev.map(d => d.id === debt.id ? updatedDebt : d));
+      setOtherIncome(prev => [incomeEntry, ...prev]);
 
-    const ok1 = await putWithOutbox(`/debts/${debt.id}.json`, updatedDebt);
-    const ok2 = await putWithOutbox(`/otherIncome/${incomeEntry.id}.json`, incomeEntry);
+      const ok1 = await putWithOutbox(`/debts/${debt.id}.json`, updatedDebt);
+      const ok2 = await putWithOutbox(`/otherIncome/${incomeEntry.id}.json`, incomeEntry);
 
-    if (ok1 && ok2) {
-      triggerToast(updatedDebt.status === 'paid' ? '🎉 تم سداد الدين بالكامل!' : `✅ تم تسجيل دفعة بقيمة ${payAmount.toFixed(3)} د.ت`);
-      logAudit('sale', `تسديد جزئي/كلي لدين ${debt.customerName}: ${payAmount} د.ت`);
+      if (ok1 && ok2) {
+        triggerToast(
+          isToManager
+            ? `💼 تم سداد ${actualPayAmount.toFixed(3)} د.ت لجيب المدير (خارج كاسة الوردية)`
+            : updatedDebt.status === 'paid' ? '🎉 تم سداد الدين بالكامل في الكاسة!' : `✅ تم تسجيل دفعة ${actualPayAmount.toFixed(3)} د.ت بالكاسة`
+        );
+        logAudit('sale', `تسديد دين ${debt.customerName}: ${actualPayAmount.toFixed(3)} د.ت [الوجهة: ${isToManager ? 'جيب المدير خارج الكاسة' : 'صندوق الكاسة'}]`);
+        loadAllData();
+      }
+    } else if (target.type === 'group' && target.group) {
+      const group = target.group;
+      let remainingToDistribute = payAmount;
+      const updatedDebtsToSave: Debt[] = [];
+      const incomeEntriesToSave: OtherIncome[] = [];
+
+      // Sort open debts oldest first
+      const sortedOpen = [...group.openDebts].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+      for (const debt of sortedOpen) {
+        if (remainingToDistribute <= 0.0001) break;
+
+        const debtRemaining = Math.max(0, debt.amount - debt.paid);
+        const payForThisDebt = Math.min(debtRemaining, remainingToDistribute);
+
+        if (payForThisDebt > 0) {
+          remainingToDistribute -= payForThisDebt;
+
+          // Calculate profit margin ratio
+          let totalDebtCost = 0;
+          if (debt.lines) {
+            for (const line of debt.lines) {
+              if (line.type === 'item' && line.itemId) {
+                const it = items.find(i => i.id === line.itemId);
+                totalDebtCost += (it?.buy || 0) * (line.qty || 1);
+              }
+            }
+          }
+          const totalDebtAmount = debt.amount || 1;
+          const profitMarginRatio = Math.max(0, (totalDebtAmount - totalDebtCost) / totalDebtAmount);
+          const profitCommission = payForThisDebt * profitMarginRatio;
+
+          const incomeEntry: OtherIncome = {
+            id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6) + Math.floor(Math.random() * 100),
+            category: 'debt_payment',
+            label: `خلاص دين ${isToManager ? '(لجيب المدير)' : '(بالكاسة)'} - ${group.canonicalName} (${debt.note || 'دين'})`,
+            amount: payForThisDebt,
+            commission: profitCommission,
+            date: new Date().toISOString(),
+            debtId: debt.id,
+            destination: destination
+          };
+
+          const updatedDebt: Debt = {
+            ...debt,
+            paid: debt.paid + payForThisDebt,
+            status: (debt.paid + payForThisDebt >= debt.amount - 0.001) ? 'paid' : 'open'
+          };
+
+          updatedDebtsToSave.push(updatedDebt);
+          incomeEntriesToSave.push(incomeEntry);
+        }
+      }
+
+      if (updatedDebtsToSave.length === 0) return;
+
+      // Optimistically update debts and otherIncome in state
+      setDebts(prev => {
+        const map = new Map(updatedDebtsToSave.map(d => [d.id, d]));
+        return prev.map(d => map.get(d.id) || d);
+      });
+      setOtherIncome(prev => [...incomeEntriesToSave, ...prev]);
+
+      // Persist each
+      for (const d of updatedDebtsToSave) {
+        await putWithOutbox(`/debts/${d.id}.json`, d);
+      }
+      for (const inc of incomeEntriesToSave) {
+        await putWithOutbox(`/otherIncome/${inc.id}.json`, inc);
+      }
+
+      triggerToast(
+        isToManager
+          ? `💼 تم سداد ${payAmount.toFixed(3)} د.ت لجيب المدير وتوزيعها على ديون "${group.canonicalName}" (خارج الكاسة)`
+          : `🎉 تم تسجيل دفعة ${payAmount.toFixed(3)} د.ت بالكاسة وتوزيعها على ديون "${group.canonicalName}" بنجاح!`
+      );
+      logAudit('sale', `تسديد جماعي لديون الحريف ${group.canonicalName}: ${payAmount.toFixed(3)} د.ت على ${updatedDebtsToSave.length} دين [الوجهة: ${isToManager ? 'جيب المدير خارج الكاسة' : 'صندوق الكاسة'}]`);
       loadAllData();
     }
   };
@@ -2190,12 +2509,19 @@ export default function App() {
 
       // Rollback forfait balance
       if (Object.keys(forfaitIncrements).length > 0) {
-        const updatedBalance = { ...forfaitBalance };
+        const updatedBalance: ForfaitBalance = { ...forfaitBalance };
         for (const op of Object.keys(forfaitIncrements)) {
-          const curBal = updatedBalance[op] || 0;
-          updatedBalance[op] = curBal + forfaitIncrements[op];
+          if (op === 'Ooredoo') {
+            const inc = forfaitIncrements[op];
+            updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + inc;
+            updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
+          } else {
+            const curBal = updatedBalance[op] || 0;
+            updatedBalance[op] = curBal + forfaitIncrements[op];
+          }
         }
         await putWithOutbox('/forfaitBalance.json', updatedBalance);
+        setForfaitBalance(updatedBalance);
       }
 
       // Rollback photo paper stock
@@ -2249,6 +2575,40 @@ export default function App() {
     } else {
       triggerToast('❌ فشل حذف الدين، تأكد من الاتصال');
     }
+  };
+
+  // Unify / Standardize Customer Name & Phone across all debts in the group
+  const handleUnifyCustomerName = async (group: CustomerDebtGroup) => {
+    if (currentRole !== 'manager') return;
+    const standardName = prompt(
+      `أدخل الاسم الموحد المعتمد لجميع ديون هذا الحريف (${group.debts.length} ديون مسجلة):\nالأسماء المسجلة حالياً: ${group.allNames.join(' ، ')}`,
+      group.canonicalName
+    );
+    if (!standardName || !standardName.trim()) return;
+
+    const trimmed = standardName.trim();
+    const phonePrompt = prompt(`رقم الهاتف المعتمد للحريف (اختياري):`, group.phone || '');
+    const updatedPhone = phonePrompt !== null ? phonePrompt.trim() || undefined : group.phone;
+
+    const updatedDebts = group.debts.map(d => ({
+      ...d,
+      customerName: trimmed,
+      customerPhone: updatedPhone || d.customerPhone
+    }));
+
+    // Optimistic update
+    setDebts(prev => {
+      const map = new Map(updatedDebts.map(d => [d.id, d]));
+      return prev.map(d => map.get(d.id) || d);
+    });
+
+    for (const d of updatedDebts) {
+      await putWithOutbox(`/debts/${d.id}.json`, d);
+    }
+
+    triggerToast(`✅ تم توحيد الاسم إلى "${trimmed}" في كافة ديون الحريف (${group.debts.length})`);
+    logAudit('edit', `توحيد أسماء ديون الحريف ${group.canonicalName} إلى ${trimmed}`);
+    loadAllData();
   };
 
   // ---- Spare Parts Actions ----
@@ -2319,13 +2679,21 @@ export default function App() {
     if (!sp) return;
     if (delta < 0 && sp.qty <= 1) return triggerToast('❌ لا يمكن للكمية أن تكون أقل من 1، يمكنك حذف السطر إن أردت');
 
+    const prevQty = sp.qty;
     const newVal = sp.qty + delta;
     const updated = { ...sp, qty: newVal, totalCost: newVal * sp.unitCost };
+
+    // 1. Instant Optimistic State Update
+    setSpareParts(prev => prev.map(s => s.id === id ? updated : s));
+    triggerToast(delta > 0 ? `➕ ${sp.name}: ${newVal}` : `➖ ${sp.name}: ${newVal}`);
+
+    // 2. Background Sync
     const ok = await putWithOutbox(`/spareParts/${sp.id}.json`, updated);
     if (ok) {
-      triggerToast('✅ تم تعديل الكمية');
-      logAudit('edit', `تعديل سريع لكمية قطعة الغيار "${sp.name}": ${sp.qty} ← ${newVal}`);
-      loadAllData();
+      logAudit('edit', `تعديل سريع لكمية قطعة الغيار "${sp.name}": ${prevQty} ← ${newVal}`);
+    } else {
+      setSpareParts(prev => prev.map(s => s.id === id ? sp : s));
+      triggerToast('❌ فشل حفظ تعديل قطعة الغيار، تم التراجع');
     }
   };
 
@@ -2764,20 +3132,29 @@ export default function App() {
 
       // Apply forfait depletions to the forfaitBalance object and write once
       if (Object.keys(forfaitDepletions).length > 0) {
-        const updatedBalance = { ...forfaitBalance };
+        const updatedBalance: ForfaitBalance = { ...forfaitBalance };
         for (const op of Object.keys(forfaitDepletions)) {
-          const curBal = updatedBalance[op] || 0;
-          updatedBalance[op] = Math.max(0, curBal - forfaitDepletions[op]);
+          if (op === 'Ooredoo') {
+            let rem = forfaitDepletions[op];
+            const cur1005 = updatedBalance.Ooredoo_1005 ?? 0;
+            const cur1006 = updatedBalance.Ooredoo_1006 ?? 0;
+
+            if (cur1005 >= rem) {
+              updatedBalance.Ooredoo_1005 = cur1005 - rem;
+              rem = 0;
+            } else {
+              updatedBalance.Ooredoo_1005 = 0;
+              rem -= cur1005;
+              updatedBalance.Ooredoo_1006 = Math.max(0, cur1006 - rem);
+            }
+            updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
+          } else {
+            const curBal = updatedBalance[op] || 0;
+            updatedBalance[op] = Math.max(0, curBal - forfaitDepletions[op]);
+          }
         }
         await putWithOutbox('/forfaitBalance.json', updatedBalance);
-
-        setForfaitBalance(prev => {
-          const next = { ...prev };
-          for (const op of Object.keys(forfaitDepletions)) {
-            next[op] = Math.max(0, (next[op] || 0) - forfaitDepletions[op]);
-          }
-          return next;
-        });
+        setForfaitBalance(updatedBalance);
       }
 
       // Photo Paper Stock depletion
@@ -3012,9 +3389,17 @@ export default function App() {
             }
             // Rollback forfait balance
             if (record.category === 'forfait' && record.cardOperator) {
-              const curBal = forfaitBalance[record.cardOperator] || 0;
-              await putWithOutbox('/forfaitBalance.json', { ...forfaitBalance, [record.cardOperator]: curBal + record.amount });
-              setForfaitBalance(prev => ({ ...prev, [record.cardOperator!]: (prev[record.cardOperator!] || 0) + record.amount }));
+              const op = record.cardOperator;
+              const updatedBalance: ForfaitBalance = { ...forfaitBalance };
+              if (op === 'Ooredoo') {
+                updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + record.amount;
+                updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
+              } else {
+                const curBal = updatedBalance[op] || 0;
+                updatedBalance[op] = curBal + record.amount;
+              }
+              await putWithOutbox('/forfaitBalance.json', updatedBalance);
+              setForfaitBalance(updatedBalance);
             }
             // Rollback photo paper stock
             if (record.category === 'photo') {
@@ -3350,7 +3735,12 @@ export default function App() {
 
   const currentShiftOtherIncome = useMemo(() => {
     const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
-    return otherIncome.filter(o => new Date(o.date).getTime() >= resetTimeMs);
+    return otherIncome.filter(o => new Date(o.date).getTime() >= resetTimeMs && o.destination !== 'manager');
+  }, [otherIncome, lastCashResetTimestamp]);
+
+  const currentShiftManagerDebtIncome = useMemo(() => {
+    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
+    return otherIncome.filter(o => new Date(o.date).getTime() >= resetTimeMs && o.destination === 'manager');
   }, [otherIncome, lastCashResetTimestamp]);
 
   const currentShiftExpenses = useMemo(() => {
@@ -3499,7 +3889,9 @@ export default function App() {
     };
 
     const dSales = sales.filter(s => inRange(s.date));
-    const dOther = otherIncome.filter(o => inRange(o.date));
+    const dOtherAll = otherIncome.filter(o => inRange(o.date));
+    const dOther = dOtherAll.filter(o => o.destination !== 'manager'); // Only drawer income
+    const dManagerDebts = dOtherAll.filter(o => o.destination === 'manager'); // Manager collected debts
     const dExpenses = expenses.filter(e => inRange(e.date));
 
     const totalSalesVal = dSales.reduce((s, c) => s + c.total, 0);
@@ -3508,6 +3900,7 @@ export default function App() {
     const totalPhotoSalesVal = dOther.filter(o => o.category === 'photo').reduce((s, c) => s + c.amount, 0);
     const totalServiceSalesVal = dOther.filter(o => o.category === 'service').reduce((s, c) => s + c.amount, 0);
     const totalDebtPaymentSalesVal = dOther.filter(o => o.category === 'debt_payment').reduce((s, c) => s + c.amount, 0);
+    const totalManagerDebtPaymentVal = dManagerDebts.reduce((s, c) => s + c.amount, 0);
     
     const totalServicesAndOthersVal = dOther.filter(o => o.category !== 'forfait' && o.category !== 'recharge').reduce((s, c) => s + c.amount, 0);
     const totalOtherVal = dOther.reduce((s, c) => s + c.amount, 0);
@@ -3541,6 +3934,7 @@ export default function App() {
     return {
       dSales,
       dOther,
+      dManagerDebts,
       dExpenses,
       totalSales: totalSalesVal,
       totalForfaitSales: totalForfaitSalesVal,
@@ -3548,6 +3942,7 @@ export default function App() {
       totalPhotoSales: totalPhotoSalesVal,
       totalServiceSales: totalServiceSalesVal,
       totalDebtPaymentSales: totalDebtPaymentSalesVal,
+      totalManagerDebtPayment: totalManagerDebtPaymentVal,
       totalServicesAndOthers: totalServicesAndOthersVal,
       totalOther: totalOtherVal,
       totalExpenses: totalExpensesVal,
@@ -3567,6 +3962,7 @@ export default function App() {
     totalPhotoSales,
     totalServiceSales,
     totalDebtPaymentSales,
+    totalManagerDebtPayment,
     totalServicesAndOthers,
     totalOther,
     totalExpenses,
@@ -3577,6 +3973,57 @@ export default function App() {
   } = filteredDashboardData;
 
   const totalOwed = debts.filter(d => d.status === 'open').reduce((s, d) => s + (d.amount - d.paid), 0);
+
+  // Smart Customer Grouping and Debt Calculations
+  const groupedCustomerDebts = useMemo(() => {
+    return groupDebtsByCustomer(debts);
+  }, [debts]);
+
+  const openCustomerGroups = useMemo(() => {
+    return groupedCustomerDebts.filter(g => g.totalRemaining > 0.001 && (
+      !debtSearch || 
+      g.allNames.some(n => normalizeArabic(n).includes(normalizeArabic(debtSearch))) ||
+      (g.phone && g.phone.includes(debtSearch))
+    ));
+  }, [groupedCustomerDebts, debtSearch]);
+
+  const paidCustomerGroups = useMemo(() => {
+    return groupedCustomerDebts.filter(g => g.totalRemaining <= 0.001);
+  }, [groupedCustomerDebts]);
+
+  // Real-time suggestions for manual debt input
+  const manualDebtSuggestions = useMemo(() => {
+    return findCustomerSuggestions(manualDebt.name, manualDebt.phone, debts, 45);
+  }, [manualDebt.name, manualDebt.phone, debts]);
+
+  // Top fuzzy match for manual debt (for smart detection alert)
+  const topManualDebtMatch = useMemo(() => {
+    if (!manualDebt.name || manualDebt.name.trim().length < 2) return null;
+    const suggestions = findCustomerSuggestions(manualDebt.name, manualDebt.phone, debts, 60);
+    if (suggestions.length === 0) return null;
+    const top = suggestions[0];
+    // If exact name string is already typed, don't show the "Did you mean" prompt
+    if (top.canonicalName.trim().toLowerCase() === manualDebt.name.trim().toLowerCase()) {
+      return null;
+    }
+    return top;
+  }, [manualDebt.name, manualDebt.phone, debts]);
+
+  // Real-time suggestions for POS cart credit/debt input
+  const invoiceCustomerSuggestions = useMemo(() => {
+    return findCustomerSuggestions(invoiceCustomerName, invoiceCustomerPhone, debts, 45);
+  }, [invoiceCustomerName, invoiceCustomerPhone, debts]);
+
+  const topInvoiceCustomerMatch = useMemo(() => {
+    if (!invoiceCustomerName || invoiceCustomerName.trim().length < 2) return null;
+    const suggestions = findCustomerSuggestions(invoiceCustomerName, invoiceCustomerPhone, debts, 60);
+    if (suggestions.length === 0) return null;
+    const top = suggestions[0];
+    if (top.canonicalName.trim().toLowerCase() === invoiceCustomerName.trim().toLowerCase()) {
+      return null;
+    }
+    return top;
+  }, [invoiceCustomerName, invoiceCustomerPhone, debts]);
 
   // Render variables
   const openDebts = debts.filter(d => d.status === 'open' && (!debtSearch || normalizeArabic(d.customerName).includes(normalizeArabic(debtSearch))));
@@ -3807,7 +4254,59 @@ export default function App() {
             </h1>
             <p className="text-[11px] text-stone-400 mt-1.5 font-medium">تسيير مبيعات وستوك المحل — مزامنة سحابية فائقة السرعة</p>
           </div>
-          <div className="flex items-center gap-3.5">
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Theme Mode Selector (Device Auto / Dark / Light) */}
+            <div className="flex items-center bg-stone-800/90 border border-stone-700/80 rounded-xl p-0.5 shadow-inner">
+              <button
+                type="button"
+                onClick={() => {
+                  setThemeMode('system');
+                  triggerToast('💻 تم ضبط المظهر تلقائياً حسب إعدادات جهازك');
+                }}
+                className={`px-2 py-1 rounded-lg text-xs font-bold flex items-center gap-1 transition-all cursor-pointer select-none ${
+                  themeMode === 'system' 
+                    ? 'bg-red-700 text-white shadow-xs' 
+                    : 'text-stone-400 hover:text-stone-200'
+                }`}
+                title="تلقائي: يتبع الوضع الداكن أو الفاتح لنظام جهازك"
+              >
+                <Laptop size={13} />
+                <span className="text-[10px] hidden sm:inline">حسب الجهاز</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setThemeMode('dark');
+                  triggerToast('🌙 تم تفعيل الوضع الداكن (الليلي)');
+                }}
+                className={`px-2 py-1 rounded-lg text-xs font-bold flex items-center gap-1 transition-all cursor-pointer select-none ${
+                  themeMode === 'dark' 
+                    ? 'bg-red-700 text-white shadow-xs' 
+                    : 'text-stone-400 hover:text-stone-200'
+                }`}
+                title="الوضع الداكن دائماً"
+              >
+                <Moon size={13} />
+                <span className="text-[10px] hidden sm:inline">داكن</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setThemeMode('light');
+                  triggerToast('☀️ تم تفعيل الوضع الفاتح (النهاري)');
+                }}
+                className={`px-2 py-1 rounded-lg text-xs font-bold flex items-center gap-1 transition-all cursor-pointer select-none ${
+                  themeMode === 'light' 
+                    ? 'bg-red-700 text-white shadow-xs' 
+                    : 'text-stone-400 hover:text-stone-200'
+                }`}
+                title="الوضع الفاتح دائماً"
+              >
+                <Sun size={13} />
+                <span className="text-[10px] hidden sm:inline">فاتح</span>
+              </button>
+            </div>
+
             <div className="flex flex-col items-center sm:items-end gap-1.5">
               <span className={`text-[10px] px-3 py-1 rounded-full font-extrabold flex items-center gap-1.5 border transition-all ${
                 connectionStatus === 'connected' 
@@ -4072,6 +4571,21 @@ export default function App() {
                   </div>
                 </div>
 
+                {totalManagerDebtPayment > 0 && (
+                  <div className="bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800/60 p-3 rounded-2xl flex items-center justify-between px-4 text-xs shadow-xs animate-fade-in">
+                    <div className="flex items-center gap-2 text-purple-950 dark:text-purple-200">
+                      <span className="text-base">💼</span>
+                      <div>
+                        <span className="font-extrabold">سداد ديون استلمها المدير مباشرة (خارج الكاسة):</span>
+                        <span className="text-[10px] text-purple-700 dark:text-purple-400 block">تم استبعادها آلياً من كاش الدرج والمبيعات</span>
+                      </div>
+                    </div>
+                    <span className="font-mono text-sm font-black text-purple-800 dark:text-purple-300">
+                      {totalManagerDebtPayment.toFixed(3)} د.ت
+                    </span>
+                  </div>
+                )}
+
                 {/* Quick inventory totals */}
                 <div className="grid grid-cols-2 gap-3">
                   <div className="bg-white p-3.5 rounded-2xl border border-stone-200 flex items-center justify-between px-5">
@@ -4293,7 +4807,14 @@ export default function App() {
                           </select>
                         </div>
                         <div>
-                          <label className="block text-[11px] text-stone-500 mb-1">الباركود والصورة (اختياري)</label>
+                          <label className="block text-[11px] text-stone-500 mb-1">الباركود والصورة (معاً)</label>
+                          <input 
+                            type="file" 
+                            ref={itemDirectFileInputRef} 
+                            accept="image/*" 
+                            className="hidden" 
+                            onChange={handleDirectItemPhotoUpload} 
+                          />
                           <div className="flex gap-1.5">
                             <input 
                               type="text" 
@@ -4305,10 +4826,19 @@ export default function App() {
                             <button 
                               type="button" 
                               onClick={() => setScannerContext('stock')}
-                              className="bg-stone-800 text-white p-2.5 rounded-xl cursor-pointer"
+                              className="bg-stone-800 hover:bg-stone-900 text-white p-2.5 rounded-xl cursor-pointer transition-colors"
                               title="مسح باركود بالكاميرا"
                             >
                               <Camera size={16} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => itemDirectFileInputRef.current?.click()}
+                              className="bg-stone-700 hover:bg-stone-800 text-white p-2.5 rounded-xl cursor-pointer text-xs flex items-center gap-1 shrink-0 transition-colors"
+                              title="التقاط أو رفع صورة مباشرة"
+                            >
+                              <Camera size={14} className="text-amber-300" />
+                              <span className="hidden sm:inline font-bold">صورة</span>
                             </button>
                             <button
                               type="button"
@@ -4317,24 +4847,39 @@ export default function App() {
                                 setTargetItemToCapturePhoto(null);
                                 setShowVisualRecognitionModal(true);
                               }}
-                              className="bg-amber-600 hover:bg-amber-700 text-white p-2.5 rounded-xl cursor-pointer font-bold text-xs flex items-center gap-1 shrink-0"
-                              title="التقاط صورة للسلعة الجديدة"
+                              className="bg-amber-600 hover:bg-amber-700 text-white p-2.5 rounded-xl cursor-pointer font-bold text-xs flex items-center gap-1 shrink-0 transition-colors"
+                              title="التعرف الذكي والبحث بالذكاء الاصطناعي"
                             >
                               <Sparkles size={14} />
-                              <span className="hidden sm:inline">صورة</span>
+                              <span className="hidden sm:inline">تحليل</span>
                             </button>
                           </div>
                           {newItem.imageUrl && (
-                            <div className="mt-1 flex items-center gap-2 bg-amber-50 p-1.5 rounded-lg border border-amber-200 text-[10px] text-amber-900 font-bold">
-                              <img src={newItem.imageUrl} alt="" className="w-6 h-6 rounded object-cover" />
-                              <span className="truncate">تم إرفاق صورة للسلعة!</span>
-                              <button
-                                type="button"
-                                onClick={() => setNewItem(prev => ({ ...prev, imageUrl: '' }))}
-                                className="mr-auto text-red-600 hover:text-red-800 font-bold"
-                              >
-                                إزالة
-                              </button>
+                            <div className="mt-2 flex items-center justify-between gap-2 bg-amber-50/80 p-2 rounded-xl border border-amber-200 text-xs text-amber-900 font-bold shadow-2xs">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <img 
+                                  src={newItem.imageUrl} 
+                                  alt="صورة السلعة" 
+                                  className="w-8 h-8 rounded-lg object-cover border border-amber-300 shadow-2xs shrink-0" 
+                                />
+                                <span className="truncate text-[11px]">✨ تم إرفاق صورة السلعة بنجاح</span>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => itemDirectFileInputRef.current?.click()}
+                                  className="text-[10px] bg-amber-200/80 hover:bg-amber-300 text-amber-900 px-2 py-1 rounded-lg transition-colors font-extrabold cursor-pointer"
+                                >
+                                  تغيير
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setNewItem(prev => ({ ...prev, imageUrl: '' }))}
+                                  className="text-[10px] bg-rose-100 hover:bg-rose-200 text-rose-800 px-2 py-1 rounded-lg transition-colors font-extrabold cursor-pointer"
+                                >
+                                  إزالة
+                                </button>
+                              </div>
                             </div>
                           )}
                         </div>
@@ -4436,26 +4981,29 @@ export default function App() {
                             <span className="font-bold text-stone-800">📶 {c.operator} — {c.value} د.ت</span>
                             <div className="flex items-center gap-2">
                               {currentRole === 'manager' ? (
-                                <div className="flex items-center gap-1">
+                                <div className="flex items-center gap-1.5">
                                   <button 
-                                    onClick={() => handleAdjustCardQty(c.id, -1)}
-                                    className="w-6 h-6 rounded-full bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                                    type="button"
+                                    onClick={(e) => { e.stopPropagation(); handleAdjustCardQty(c.id, -1); }}
+                                    className="w-6 h-6 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 active:bg-stone-400 active:scale-85 flex items-center justify-center font-black font-mono text-xs cursor-pointer select-none transition-all duration-75"
                                     title="إنقاص 1"
                                   >
                                     -
                                   </button>
                                   <button 
+                                    type="button"
                                     onClick={() => handleEditCardQty(c.id)}
-                                    className={`px-2.5 py-1 rounded-lg font-bold font-mono text-[11px] cursor-pointer ${
-                                      c.qty <= 3 ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'
+                                    className={`px-2.5 py-1 rounded-lg font-bold font-mono text-[11px] cursor-pointer select-none transition-all active:scale-95 ${
+                                      c.qty <= 3 ? 'bg-rose-100 text-rose-800 border border-rose-200' : 'bg-emerald-100 text-emerald-800 border border-emerald-200'
                                     }`}
                                     title="تعديل الكمية الدقيقة"
                                   >
                                     {c.qty} قطع
                                   </button>
                                   <button 
-                                    onClick={() => handleAdjustCardQty(c.id, 1)}
-                                    className="w-6 h-6 rounded-full bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                                    type="button"
+                                    onClick={(e) => { e.stopPropagation(); handleAdjustCardQty(c.id, 1); }}
+                                    className="w-6 h-6 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 active:bg-stone-400 active:scale-85 flex items-center justify-center font-black font-mono text-xs cursor-pointer select-none transition-all duration-75"
                                     title="زيادة 1"
                                   >
                                     +
@@ -4491,11 +5039,12 @@ export default function App() {
                       <form onSubmit={handleAddForfaitBalance} className="space-y-3">
                         <div className="grid grid-cols-2 gap-2">
                           <div>
-                            <label className="block text-[10px] text-stone-500 mb-1">المشغل</label>
-                            <select value={addBalanceOperator} onChange={e => setAddBalanceOperator(e.target.value)} className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800">
-                              <option value="Ooredoo">Ooredoo</option>
-                              <option value="Orange">Orange</option>
-                              <option value="Tunisie Telecom">Tunisie Telecom</option>
+                            <label className="block text-[10px] text-stone-500 mb-1">المشغل / الحساب</label>
+                            <select value={addBalanceOperator} onChange={e => setAddBalanceOperator(e.target.value)} className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-bold">
+                              <option value="Ooredoo_1005">🔴 Ooredoo (حساب 1005)</option>
+                              <option value="Ooredoo_1006">🔴 Ooredoo (حساب 1006)</option>
+                              <option value="Orange">🟠 Orange</option>
+                              <option value="Tunisie Telecom">🔵 اتصالات تونس (Tunisie Telecom)</option>
                             </select>
                           </div>
                           <div>
@@ -4519,20 +5068,90 @@ export default function App() {
 
                   <div className={`bg-white rounded-2xl border border-stone-200 p-5 shadow-xs ${currentRole !== 'manager' ? 'col-span-1 md:col-span-2' : ''}`}>
                     <h3 className="font-extrabold text-stone-800 text-xs mb-3">📊 رصيد المشغلين الحالي بالفورفاي</h3>
-                    <div className="space-y-2">
-                      {['Ooredoo', 'Orange', 'Tunisie Telecom'].map((op, idx) => {
-                        const bal = forfaitBalance[op] || 0;
+                    <div className="space-y-2.5">
+                      {/* Ooredoo with 1005 & 1006 accounts */}
+                      {(() => {
+                        const bal1005 = forfaitBalance.Ooredoo_1005 || 0;
+                        const bal1006 = forfaitBalance.Ooredoo_1006 || 0;
+                        const totalOoredoo = (forfaitBalance.Ooredoo_1005 !== undefined || forfaitBalance.Ooredoo_1006 !== undefined) 
+                          ? (bal1005 + bal1006) 
+                          : (forfaitBalance.Ooredoo || 0);
+
                         return (
-                          <div key={idx} className="flex justify-between items-center text-xs p-2.5 bg-stone-50 rounded-xl border border-stone-100">
-                            <span className="font-bold text-stone-800">🌐 رصيد {op}</span>
-                            {currentRole === 'manager' ? (
-                              <button 
-                                onClick={() => handleEditForfaitBalanceExact(op)}
-                                className={`px-3 py-1 rounded-full font-bold font-mono text-[11px] ${
-                                  bal <= 5 ? 'bg-rose-100 text-rose-800' : 'bg-stone-100 text-stone-800'
+                          <div className="p-3 bg-red-50/50 rounded-xl border border-red-100 space-y-2">
+                            <div className="flex justify-between items-center text-xs">
+                              <span className="font-extrabold text-red-950 flex items-center gap-1.5">
+                                <span className="w-2.5 h-2.5 rounded-full bg-red-600 inline-block"></span>
+                                🌐 رصيد Ooredoo (الإجمالي)
+                              </span>
+                              <span 
+                                className={`px-3 py-1 rounded-full font-black font-mono text-[12px] ${
+                                  totalOoredoo <= 10 ? 'bg-rose-100 text-rose-800 border border-rose-200' : 'bg-red-100 text-red-900 border border-red-200'
                                 }`}
                               >
-                                {bal.toFixed(3)} د.ت
+                                {totalOoredoo.toFixed(3)} د.ت
+                              </span>
+                            </div>
+
+                            {/* Sub accounts 1005 and 1006 */}
+                            <div className="grid grid-cols-2 gap-2 pt-1 border-t border-red-100/80">
+                              <div className="flex justify-between items-center bg-white px-2.5 py-1.5 rounded-lg border border-red-100 text-[11px]">
+                                <span className="font-bold text-stone-700">حساب 1005:</span>
+                                {currentRole === 'manager' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleEditForfaitBalanceExact('Ooredoo_1005', 'Ooredoo (حساب 1005)')}
+                                    className="font-mono font-bold text-red-700 hover:underline cursor-pointer bg-red-50 px-1.5 py-0.5 rounded"
+                                    title="انقر لتعديل رصيد حساب 1005"
+                                  >
+                                    {bal1005.toFixed(3)} د.ت ✏️
+                                  </button>
+                                ) : (
+                                  <span className="font-mono font-bold text-stone-800">{bal1005.toFixed(3)} د.ت</span>
+                                )}
+                              </div>
+
+                              <div className="flex justify-between items-center bg-white px-2.5 py-1.5 rounded-lg border border-red-100 text-[11px]">
+                                <span className="font-bold text-stone-700">حساب 1006:</span>
+                                {currentRole === 'manager' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleEditForfaitBalanceExact('Ooredoo_1006', 'Ooredoo (حساب 1006)')}
+                                    className="font-mono font-bold text-red-700 hover:underline cursor-pointer bg-red-50 px-1.5 py-0.5 rounded"
+                                    title="انقر لتعديل رصيد حساب 1006"
+                                  >
+                                    {bal1006.toFixed(3)} د.ت ✏️
+                                  </button>
+                                ) : (
+                                  <span className="font-mono font-bold text-stone-800">{bal1006.toFixed(3)} د.ت</span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Orange and Tunisie Telecom */}
+                      {[
+                        { key: 'Orange', name: 'Orange', color: 'orange', dot: 'bg-orange-500', bg: 'bg-orange-50/50', border: 'border-orange-100' },
+                        { key: 'Tunisie Telecom', name: 'اتصالات تونس (Tunisie Telecom)', color: 'sky', dot: 'bg-sky-600', bg: 'bg-sky-50/50', border: 'border-sky-100' }
+                      ].map((opItem, idx) => {
+                        const bal = forfaitBalance[opItem.key] || 0;
+                        return (
+                          <div key={idx} className={`flex justify-between items-center text-xs p-2.5 ${opItem.bg} rounded-xl border ${opItem.border}`}>
+                            <span className="font-bold text-stone-800 flex items-center gap-1.5">
+                              <span className={`w-2.5 h-2.5 rounded-full ${opItem.dot} inline-block`}></span>
+                              🌐 رصيد {opItem.name}
+                            </span>
+                            {currentRole === 'manager' ? (
+                              <button 
+                                onClick={() => handleEditForfaitBalanceExact(opItem.key, opItem.name)}
+                                className={`px-3 py-1 rounded-full font-bold font-mono text-[11px] cursor-pointer hover:scale-105 transition-transform ${
+                                  bal <= 5 ? 'bg-rose-100 text-rose-800' : 'bg-stone-100 text-stone-800'
+                                }`}
+                                title={`انقر لتعديل رصيد ${opItem.name}`}
+                              >
+                                {bal.toFixed(3)} د.ت ✏️
                               </button>
                             ) : (
                               <span 
@@ -4596,19 +5215,19 @@ export default function App() {
                       </div>
                       <div className="flex items-center gap-2">
                         {currentRole === 'manager' ? (
-                          <div className="flex items-center gap-1">
+                          <div className="flex items-center gap-1.5">
                             <button 
                               type="button"
-                              onClick={() => handleQuickAdjustPhotoStock(-10)}
-                              className="px-2 py-1 rounded-lg bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 font-bold font-mono text-[10px] cursor-pointer"
+                              onClick={(e) => { e.stopPropagation(); handleQuickAdjustPhotoStock(-10); }}
+                              className="px-2 py-1 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 active:bg-stone-400 active:scale-85 font-bold font-mono text-[10px] cursor-pointer transition-all select-none duration-75"
                               title="إنقاص 10 صور"
                             >
                               -10
                             </button>
                             <button 
                               type="button"
-                              onClick={() => handleQuickAdjustPhotoStock(-1)}
-                              className="w-7 h-7 rounded-full bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                              onClick={(e) => { e.stopPropagation(); handleQuickAdjustPhotoStock(-1); }}
+                              className="w-7 h-7 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 active:bg-stone-400 active:scale-85 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none transition-all duration-75"
                               title="إنقاص 1 صورة"
                             >
                               -
@@ -4616,7 +5235,7 @@ export default function App() {
                             <button 
                               type="button"
                               onClick={handleEditPhotoStock}
-                              className={`px-3 py-1.5 rounded-xl font-black font-mono text-xs cursor-pointer shadow-2xs ${
+                              className={`px-3 py-1.5 rounded-xl font-black font-mono text-xs cursor-pointer shadow-2xs transition-all active:scale-95 ${
                                 photoPaperStock <= 10 ? 'bg-rose-600 text-white' : 'bg-purple-700 text-white'
                               }`}
                               title="اضغط لتعديل الرقم مباشرة"
@@ -4625,16 +5244,16 @@ export default function App() {
                             </button>
                             <button 
                               type="button"
-                              onClick={() => handleQuickAdjustPhotoStock(1)}
-                              className="w-7 h-7 rounded-full bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none"
+                              onClick={(e) => { e.stopPropagation(); handleQuickAdjustPhotoStock(1); }}
+                              className="w-7 h-7 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 active:bg-stone-400 active:scale-85 flex items-center justify-center font-bold font-mono text-xs cursor-pointer select-none transition-all duration-75"
                               title="زيادة 1 صورة"
                             >
                               +
                             </button>
                             <button 
                               type="button"
-                              onClick={() => handleQuickAdjustPhotoStock(10)}
-                              className="px-2 py-1 rounded-lg bg-stone-100 border border-stone-200 text-stone-700 hover:bg-stone-200 font-bold font-mono text-[10px] cursor-pointer"
+                              onClick={(e) => { e.stopPropagation(); handleQuickAdjustPhotoStock(10); }}
+                              className="px-2 py-1 rounded-lg bg-stone-200 border border-stone-300 text-stone-800 hover:bg-stone-300 active:bg-stone-400 active:scale-85 font-bold font-mono text-[10px] cursor-pointer transition-all select-none duration-75"
                               title="زيادة 10 صور"
                             >
                               +10
@@ -4917,35 +5536,53 @@ export default function App() {
                             </div>
                           </div>
 
-                          <div className="flex items-center gap-2 justify-end">
+                          <div className="flex items-center gap-1.5 justify-end">
                             {currentRole === 'manager' && (
-                              <button onClick={() => handleAdjustQty(i.id, -1)} className="p-1.5 bg-stone-200 hover:bg-stone-300 text-stone-700 rounded-lg cursor-pointer">
-                                <Minus size={14} />
+                              <button 
+                                type="button"
+                                onClick={(e) => { e.stopPropagation(); handleAdjustQty(i.id, -1); }} 
+                                className="w-7 h-7 flex items-center justify-center bg-stone-200 hover:bg-stone-300 active:bg-stone-400 active:scale-85 text-stone-800 rounded-lg cursor-pointer transition-all select-none shadow-2xs font-mono font-black text-sm"
+                                title="إنقاص 1 من المخزن"
+                              >
+                                <Minus size={14} strokeWidth={2.5} />
                               </button>
                             )}
                             <button 
+                              type="button"
                               onClick={() => currentRole === 'manager' ? handleEditQtyExact(i.id) : undefined}
                               disabled={currentRole !== 'manager'}
-                              className={`px-3 py-1 font-mono text-xs font-black rounded-lg ${
-                                i.qty <= 3 ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'
+                              className={`px-3 py-1 font-mono text-xs font-black rounded-lg transition-all select-none active:scale-95 ${
+                                i.qty <= 3 ? 'bg-rose-100 text-rose-800 border border-rose-200' : 'bg-emerald-100 text-emerald-800 border border-emerald-200'
                               } ${currentRole === 'manager' ? 'cursor-pointer hover:opacity-90' : 'cursor-default'}`}
+                              title={currentRole === 'manager' ? 'انقر لتحديد الكمية بدقة' : 'الكمية المتوفرة بالمخزن'}
                             >
                               {i.qty} {currentRole === 'manager' ? 'قطع' : 'قطع متوفرة'}
                             </button>
                             {currentRole === 'manager' && (
-                              <button onClick={() => handleAdjustQty(i.id, 1)} className="p-1.5 bg-stone-200 hover:bg-stone-300 text-stone-700 rounded-lg cursor-pointer">
-                                <Plus size={14} />
+                              <button 
+                                type="button"
+                                onClick={(e) => { e.stopPropagation(); handleAdjustQty(i.id, 1); }} 
+                                className="w-7 h-7 flex items-center justify-center bg-stone-200 hover:bg-stone-300 active:bg-stone-400 active:scale-85 text-stone-800 rounded-lg cursor-pointer transition-all select-none shadow-2xs font-mono font-black text-sm"
+                                title="زيادة 1 للمخزن"
+                              >
+                                <Plus size={14} strokeWidth={2.5} />
                               </button>
                             )}
                             <button 
+                              type="button"
                               onClick={() => setScannerContext(`manage-${i.id}`)}
-                              className="p-1.5 bg-stone-800 text-stone-100 hover:bg-stone-900 rounded-lg cursor-pointer"
+                              className="p-1.5 bg-stone-800 text-stone-100 hover:bg-stone-900 active:scale-90 rounded-lg cursor-pointer transition-all"
                               title="ربط باركود إضافي"
                             >
                               <Camera size={14} />
                             </button>
                             {currentRole === 'manager' && (
-                              <button onClick={() => handleDeleteItem(i.id)} className="p-1.5 text-stone-400 hover:text-red-700 cursor-pointer">
+                              <button 
+                                type="button"
+                                onClick={() => handleDeleteItem(i.id)} 
+                                className="p-1.5 text-stone-400 hover:text-red-700 active:scale-90 cursor-pointer transition-all"
+                                title="حذف السلعة"
+                              >
                                 <Trash2 size={14} />
                               </button>
                             )}
@@ -5322,7 +5959,13 @@ export default function App() {
                                 <option value="Orange">Orange</option>
                                 <option value="Tunisie Telecom">Tunisie Telecom</option>
                               </select>
-                              <span className="text-[9px] text-stone-400 block mt-1">الرصيد المتوفر: {(forfaitBalance[forfaitOp] || 0).toFixed(3)} د.ت</span>
+                              <span className="text-[9px] text-stone-500 block mt-1 font-mono font-medium">
+                                الرصيد المتوفر: {
+                                  forfaitOp === 'Ooredoo' 
+                                    ? `${((forfaitBalance.Ooredoo_1005 || 0) + (forfaitBalance.Ooredoo_1006 || 0) || (forfaitBalance.Ooredoo || 0)).toFixed(3)} د.ت (1005: ${(forfaitBalance.Ooredoo_1005 || 0).toFixed(3)} | 1006: ${(forfaitBalance.Ooredoo_1006 || 0).toFixed(3)})`
+                                    : `${(forfaitBalance[forfaitOp] || 0).toFixed(3)} د.ت`
+                                }
+                              </span>
                             </div>
                             <div>
                               <label className="block text-[10px] text-stone-500 mb-0.5">اختر الباقة</label>
@@ -5565,7 +6208,7 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={() => handleAdjustCartLineQty(line.id, -1)}
-                                  className="w-5 h-5 flex items-center justify-center text-stone-700 font-extrabold hover:bg-stone-100 rounded cursor-pointer transition-colors"
+                                  className="w-5 h-5 flex items-center justify-center text-stone-800 font-black hover:bg-stone-200 active:bg-stone-300 active:scale-85 rounded cursor-pointer transition-all select-none duration-75"
                                   title="إنقاص الكمية"
                                 >
                                   -
@@ -5573,7 +6216,7 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={() => handleEditCartLineQtyExact(line.id)}
-                                  className="font-mono font-extrabold px-1.5 text-xs text-stone-900 hover:text-amber-700 hover:bg-stone-100 rounded cursor-pointer transition-colors"
+                                  className="font-mono font-extrabold px-1.5 text-xs text-stone-900 hover:text-amber-700 hover:bg-stone-100 active:scale-95 rounded cursor-pointer transition-all select-none"
                                   title="انقر لتحديد الكمية بالضبط"
                                 >
                                   {line.qty}
@@ -5581,7 +6224,7 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={() => handleAdjustCartLineQty(line.id, 1)}
-                                  className="w-5 h-5 flex items-center justify-center text-stone-700 font-extrabold hover:bg-stone-100 rounded cursor-pointer transition-colors"
+                                  className="w-5 h-5 flex items-center justify-center text-stone-800 font-black hover:bg-stone-200 active:bg-stone-300 active:scale-85 rounded cursor-pointer transition-all select-none duration-75"
                                   title="زيادة الكمية"
                                 >
                                   +
@@ -5608,25 +6251,73 @@ export default function App() {
                       </div>
 
                       {/* Invoice options */}
-                      <div className="space-y-2 bg-stone-50 p-2.5 rounded-xl border border-stone-100 text-[10px]">
+                      <div className="space-y-2 bg-stone-50 dark:bg-stone-800/60 p-2.5 rounded-xl border border-stone-100 dark:border-stone-700/60 text-[10px]">
                         <div>
-                          <label className="block text-[10px] text-stone-500 mb-0.5">اسم الحريف (اختياري/مهم للدين)</label>
+                          <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">اسم الحريف (اختياري / مهم للدين)</label>
                           <input 
                             type="text" 
                             placeholder="اسم الحريف"
                             value={invoiceCustomerName}
                             onChange={e => setInvoiceCustomerName(e.target.value)}
-                            className="w-full bg-white border border-stone-200 px-2 py-1.5 rounded-lg text-xs"
+                            className="w-full bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-700 px-2 py-1.5 rounded-lg text-xs text-stone-800 dark:text-stone-100"
                           />
+
+                          {/* Smart detection alert banner in POS cart */}
+                          {topInvoiceCustomerMatch && (
+                            <div className="mt-1.5 bg-amber-50 dark:bg-amber-950/50 border border-amber-300 dark:border-amber-700/70 p-2 rounded-lg text-[10px] space-y-1 animate-fade-in">
+                              <div className="flex items-start gap-1 text-amber-900 dark:text-amber-200 font-bold leading-tight">
+                                <AlertCircle size={12} className="shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+                                <div>
+                                  <span>هل تقصد: </span>
+                                  <span className="font-black text-amber-800 dark:text-amber-300 underline">{topInvoiceCustomerMatch.canonicalName}</span>؟
+                                </div>
+                              </div>
+                              <div className="text-[9px] text-amber-800/80 dark:text-amber-300/80">
+                                {topInvoiceCustomerMatch.reason}
+                                {topInvoiceCustomerMatch.totalRemaining > 0 && ` • باقي عليه: ${topInvoiceCustomerMatch.totalRemaining.toFixed(3)} د.ت`}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setInvoiceCustomerName(topInvoiceCustomerMatch.canonicalName);
+                                  if (topInvoiceCustomerMatch.phone) setInvoiceCustomerPhone(topInvoiceCustomerMatch.phone);
+                                }}
+                                className="w-full bg-amber-600 hover:bg-amber-700 text-white font-bold py-1 px-2 rounded text-[9px] flex items-center justify-center gap-1 cursor-pointer transition-colors shadow-xs"
+                              >
+                                <UserCheck size={11} /> ربط مع حساب "{topInvoiceCustomerMatch.canonicalName}"
+                              </button>
+                            </div>
+                          )}
+
+                          {/* Quick suggestion chips in POS cart */}
+                          {invoiceCustomerSuggestions.length > 0 && !topInvoiceCustomerMatch && (
+                            <div className="flex flex-wrap gap-1 mt-1">
+                              {invoiceCustomerSuggestions.slice(0, 3).map((sug, i) => (
+                                <button
+                                  key={i}
+                                  type="button"
+                                  onClick={() => {
+                                    setInvoiceCustomerName(sug.canonicalName);
+                                    if (sug.phone) setInvoiceCustomerPhone(sug.phone);
+                                  }}
+                                  className="bg-stone-100 hover:bg-stone-200 dark:bg-stone-700 dark:hover:bg-stone-600 text-stone-700 dark:text-stone-200 px-1.5 py-0.5 rounded text-[9px] transition-colors border border-stone-200 dark:border-stone-600 cursor-pointer flex items-center gap-1"
+                                >
+                                  <span>👤 {sug.canonicalName}</span>
+                                  {sug.totalRemaining > 0 && <span className="text-rose-600 dark:text-rose-400 font-mono font-bold">({sug.totalRemaining.toFixed(3)})</span>}
+                                </button>
+                              ))}
+                            </div>
+                          )}
                         </div>
+
                         <div>
-                          <label className="block text-[10px] text-stone-500 mb-0.5">رقم تليفون الحريف (اختياري)</label>
+                          <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">رقم تليفون الحريف (اختياري)</label>
                           <input 
                             type="text" 
                             placeholder="رقم الهاتف"
                             value={invoiceCustomerPhone}
                             onChange={e => setInvoiceCustomerPhone(e.target.value)}
-                            className="w-full bg-white border border-stone-200 px-2 py-1.5 rounded-lg text-xs font-mono"
+                            className="w-full bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-700 px-2 py-1.5 rounded-lg text-xs font-mono text-stone-800 dark:text-stone-100"
                           />
                         </div>
                         <label className="flex items-center gap-2 mt-1.5 cursor-pointer select-none">
@@ -5709,8 +6400,16 @@ export default function App() {
                   <div className="space-y-2 max-h-60 overflow-y-auto font-sans">
                     {(() => {
                       const merged = [
-                        ...sales.map(s => ({ ...s, isSale: true, label: `${s.itemName} × ${s.qty}`, icon: '🛍️' })),
-                        ...otherIncome.map(o => ({ ...o, isSale: false, label: o.label, icon: o.category === 'recharge' ? '📶' : o.category === 'forfait' ? '🌐' : o.category === 'photo' ? '🪪' : '🔧' }))
+                        ...sales.map(s => ({ ...s, isSale: true, label: `${s.itemName} × ${s.qty}`, icon: '🛍️', destination: 'drawer' as const })),
+                        ...otherIncome.map(o => ({ 
+                          ...o, 
+                          isSale: false, 
+                          label: o.label, 
+                          destination: o.destination || 'drawer',
+                          icon: o.destination === 'manager' 
+                            ? '💼' 
+                            : o.category === 'recharge' ? '📶' : o.category === 'forfait' ? '🌐' : o.category === 'photo' ? '🪪' : o.category === 'debt_payment' ? '💳' : '🔧' 
+                        }))
                       ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
                       if (merged.length === 0) {
@@ -5720,11 +6419,18 @@ export default function App() {
                       return merged.slice(0, 10).map((entry, idx) => (
                         <div key={idx} className="flex justify-between items-center p-2.5 bg-stone-50 rounded-xl border border-stone-100">
                           <div>
-                            <div className="font-bold text-stone-800 text-xs">{entry.icon} {entry.label}</div>
+                            <div className="font-bold text-stone-800 text-xs flex items-center gap-1.5 flex-wrap">
+                              <span>{entry.icon} {entry.label}</span>
+                              {entry.destination === 'manager' && (
+                                <span className="bg-purple-100 text-purple-900 border border-purple-200 text-[9px] px-1.5 py-0.2 rounded font-black">
+                                  💼 جيب المدير (خارج الكاسة)
+                                </span>
+                              )}
+                            </div>
                             <div className="text-[10px] text-stone-400">{new Date(entry.date).toLocaleTimeString('fr-TN', { hour: '2-digit', minute: '2-digit' })}</div>
                           </div>
                           <div className="flex items-center gap-3">
-                            <span className="font-mono text-emerald-700 font-bold text-xs">
+                            <span className={`font-mono font-bold text-xs ${entry.destination === 'manager' ? 'text-purple-800' : 'text-emerald-700'}`}>
                               {(entry.total !== undefined ? entry.total : entry.amount).toFixed(3)} د.ت
                             </span>
                             {currentRole === 'manager' && (
@@ -5817,133 +6523,437 @@ export default function App() {
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 
                 {/* Add debt form */}
-                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs h-fit">
-                  <h3 className="font-extrabold text-stone-800 text-xs text-rose-800 mb-3 flex items-center gap-1.5">
-                    <Plus size={16} /> تسجيل دين يدوي خارجي
-                  </h3>
+                <div className="bg-white dark:bg-stone-900 rounded-2xl border border-stone-200 dark:border-stone-800 p-5 shadow-xs h-fit space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="font-extrabold text-stone-800 dark:text-stone-100 text-xs text-rose-800 dark:text-rose-400 flex items-center gap-1.5">
+                      <Plus size={16} /> تسجيل دين يدوي خارجي
+                    </h3>
+                    <span className="text-[10px] bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 font-bold px-2 py-0.5 rounded-full">
+                      دفتر الديون
+                    </span>
+                  </div>
+
                   <form onSubmit={handleAddManualDebt} className="space-y-3">
                     <div>
-                      <label className="block text-[10px] text-stone-500 mb-0.5">اسم الحريف بالكامل</label>
+                      <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">اسم الحريف بالكامل</label>
                       <input 
                         type="text" 
-                        placeholder="اسم الحريف"
+                        placeholder="اسم الحريف (مثال: أحمد الطرابلسي)"
                         value={manualDebt.name}
                         onChange={e => setManualDebt(prev => ({ ...prev, name: e.target.value }))}
-                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
+                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 px-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 focus:ring-2 focus:ring-rose-500 focus:outline-none"
                       />
+
+                      {/* Smart Fuzzy Detection Alert Prompt */}
+                      {topManualDebtMatch && (
+                        <div className="mt-2 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 p-2.5 rounded-xl text-[11px] animate-fade-in space-y-1.5">
+                          <div className="flex items-start gap-1.5 text-amber-900 dark:text-amber-200 font-bold">
+                            <AlertCircle size={14} className="shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+                            <div>
+                              <span>هل تقصد الحريف المسجل: </span>
+                              <strong className="underline decoration-amber-500 font-black">{topManualDebtMatch.canonicalName}</strong>؟
+                            </div>
+                          </div>
+                          <div className="text-[10px] text-amber-800/80 dark:text-amber-300/80 pr-4">
+                            {topManualDebtMatch.reason}
+                            {topManualDebtMatch.totalRemaining > 0 && ` • لديه حالياً ديون قائمة بقيمة ${topManualDebtMatch.totalRemaining.toFixed(3)} د.ت`}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setManualDebt(prev => ({
+                                ...prev,
+                                name: topManualDebtMatch.canonicalName,
+                                phone: topManualDebtMatch.phone || prev.phone
+                              }));
+                            }}
+                            className="w-full bg-amber-600 hover:bg-amber-700 text-white font-bold py-1 px-2 rounded-lg text-[10px] flex items-center justify-center gap-1 cursor-pointer transition-all shadow-xs"
+                          >
+                            <UserCheck size={12} /> اعتماد اسم وبيانات "{topManualDebtMatch.canonicalName}"
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Smart Quick Suggestion Pills */}
+                      {manualDebtSuggestions.length > 0 && !topManualDebtMatch && (
+                        <div className="flex flex-wrap gap-1 mt-1.5">
+                          <span className="text-[9px] text-stone-400 dark:text-stone-500 w-full font-medium">حرفاء مسجلون مطابقون:</span>
+                          {manualDebtSuggestions.slice(0, 3).map((sug, i) => (
+                            <button
+                              key={i}
+                              type="button"
+                              onClick={() => setManualDebt(prev => ({ ...prev, name: sug.canonicalName, phone: sug.phone || prev.phone }))}
+                              className="bg-stone-100 hover:bg-stone-200 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-800 dark:text-stone-200 px-2 py-0.5 rounded-full text-[10px] transition-colors border border-stone-200 dark:border-stone-700 cursor-pointer flex items-center gap-1"
+                            >
+                              <span>👤 {sug.canonicalName}</span>
+                              {sug.totalRemaining > 0 && (
+                                <span className="text-rose-600 dark:text-rose-400 font-mono font-bold">({sug.totalRemaining.toFixed(3)} د.ت)</span>
+                              )}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
+
                     <div>
-                      <label className="block text-[10px] text-stone-500 mb-0.5">رقم هاتف الحريف</label>
+                      <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">رقم هاتف الحريف</label>
                       <input 
                         type="text" 
-                        placeholder="رقم الهاتف"
+                        placeholder="رقم الهاتف (اختياري)"
                         value={manualDebt.phone}
                         onChange={e => setManualDebt(prev => ({ ...prev, phone: e.target.value }))}
-                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
+                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 px-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 font-mono focus:ring-2 focus:ring-rose-500 focus:outline-none"
                       />
                     </div>
+
                     <div>
-                      <label className="block text-[10px] text-stone-500 mb-0.5">المبلغ د.ت</label>
+                      <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">المبلغ د.ت</label>
                       <input 
                         type="number" 
                         step="0.001"
                         placeholder="0.000"
                         value={manualDebt.amount}
                         onChange={e => setManualDebt(prev => ({ ...prev, amount: e.target.value }))}
-                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
+                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 px-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 font-mono focus:ring-2 focus:ring-rose-500 focus:outline-none"
                       />
                     </div>
+
                     <div>
-                      <label className="block text-[10px] text-stone-500 mb-0.5">تفاصيل وملاحظة الدين</label>
+                      <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">تفاصيل وملاحظة الدين</label>
                       <input 
                         type="text" 
                         placeholder="سلفة كاش، شاحن، بطاقة..."
                         value={manualDebt.note}
                         onChange={e => setManualDebt(prev => ({ ...prev, note: e.target.value }))}
-                        className="w-full bg-stone-50 border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
+                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 px-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 focus:ring-2 focus:ring-rose-500 focus:outline-none"
                       />
                     </div>
-                    <button type="submit" className="w-full bg-rose-700 hover:bg-rose-800 text-white font-bold py-2 rounded-xl text-xs cursor-pointer">
-                      سجل الدين بالدفتر 💳
+
+                    <button type="submit" className="w-full bg-rose-700 hover:bg-rose-800 text-white font-bold py-2.5 rounded-xl text-xs cursor-pointer shadow-xs transition-colors flex items-center justify-center gap-1.5">
+                      <CreditCard size={14} /> سجل الدين بالدفتر 💳
                     </button>
                   </form>
                 </div>
 
                 {/* Debts listing columns (width 2) */}
                 <div className="md:col-span-2 space-y-4">
-                  <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
-                    <div className="flex items-center justify-between gap-2 mb-3">
-                      <h3 className="font-extrabold text-stone-800 text-xs">📋 الديون المفتوحة (غير المكتملة)</h3>
-                      <div className="bg-rose-100 text-rose-800 px-2.5 py-0.5 rounded-full text-[10px] font-extrabold">
-                        إجمالي المستحقات المتبقية: {totalOwed.toFixed(3)} د.ت
+                  <div className="bg-white dark:bg-stone-900 rounded-2xl border border-stone-200 dark:border-stone-800 p-5 shadow-xs space-y-3">
+                    
+                    {/* Header with stats and View Mode Switcher */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-stone-100 dark:border-stone-800">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <h3 className="font-extrabold text-stone-800 dark:text-stone-100 text-sm">📋 الديون المفتوحة</h3>
+                          <span className="bg-rose-100 dark:bg-rose-950/60 text-rose-800 dark:text-rose-300 px-2.5 py-0.5 rounded-full text-[10px] font-black">
+                            المجموع: {totalOwed.toFixed(3)} د.ت
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-stone-500 dark:text-stone-400 mt-0.5">
+                          {openCustomerGroups.length} حرفاء مدينين • إجمالي {openDebts.length} دين مفتوح
+                        </p>
+                      </div>
+
+                      {/* View Mode Switcher */}
+                      <div className="flex items-center bg-stone-100 dark:bg-stone-800 p-1 rounded-xl gap-1 text-xs shrink-0 self-start sm:self-auto">
+                        <button
+                          type="button"
+                          onClick={() => setDebtViewMode('grouped')}
+                          className={`flex items-center gap-1 px-2.5 py-1 rounded-lg font-bold transition-all text-[11px] cursor-pointer ${
+                            debtViewMode === 'grouped'
+                              ? 'bg-white dark:bg-stone-900 text-rose-700 dark:text-rose-400 shadow-xs'
+                              : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
+                          }`}
+                        >
+                          <Users size={13} /> تجميع ذكي للحرفاء ({openCustomerGroups.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDebtViewMode('list')}
+                          className={`flex items-center gap-1 px-2.5 py-1 rounded-lg font-bold transition-all text-[11px] cursor-pointer ${
+                            debtViewMode === 'list'
+                              ? 'bg-white dark:bg-stone-900 text-rose-700 dark:text-rose-400 shadow-xs'
+                              : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
+                          }`}
+                        >
+                          <Layers size={13} /> السجلات الفردية ({openDebts.length})
+                        </button>
                       </div>
                     </div>
 
-                    <div className="relative mb-3">
+                    {/* Search Bar */}
+                    <div className="relative">
                       <input 
                         type="text" 
-                        placeholder="🔍 فتش باسم الحريف..."
+                        placeholder="🔍 فتش باسم الحريف (يتعرف على الحروف المختلفة والأرقام)..."
                         value={debtSearch}
                         onChange={e => setDebtSearch(e.target.value)}
-                        className="w-full bg-stone-50 border border-stone-200 pl-10 pr-3 py-2 rounded-xl text-xs text-stone-800"
+                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 pl-10 pr-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 focus:ring-2 focus:ring-rose-500 focus:outline-none"
                       />
-                      <Search className="absolute left-3 top-3 text-stone-400" size={13} />
+                      <Search className="absolute left-3 top-2.5 text-stone-400" size={14} />
                     </div>
 
-                    <div className="space-y-2 max-h-96 overflow-y-auto">
-                      {openDebts.length === 0 ? (
-                        <p className="text-stone-400 text-center py-8 text-xs">لا يوجد أي ديون مفتوحة حالياً 🎉</p>
-                      ) : (
-                        openDebts.map((d, idx) => {
-                          const remaining = d.amount - d.paid;
-                          return (
-                            <div key={idx} className="p-3 bg-stone-50 hover:bg-stone-100/50 border border-stone-100 rounded-xl transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-                              <div>
-                                <div className="font-bold text-stone-900">{d.customerName}</div>
-                                {d.customerPhone && <div className="text-[10px] text-stone-400 font-mono">📞 {d.customerPhone}</div>}
-                                <div className="text-[10px] text-stone-500 mt-0.5">📝 التفاصيل: {d.note}</div>
-                                <div className="text-[10px] text-stone-400">التاريخ: {new Date(d.date).toLocaleDateString('fr-TN')}</div>
-                              </div>
-                              <div className="flex flex-col items-end gap-1.5">
-                                <div className="font-bold font-mono">
-                                  <span className="text-stone-400">المجموع: {d.amount.toFixed(3)}</span>{' '}
-                                  <span className="text-rose-700">المتبقي: {remaining.toFixed(3)} د.ت</span>
+                    {/* GROUPED VIEW */}
+                    {debtViewMode === 'grouped' && (
+                      <div className="space-y-3 max-h-[500px] overflow-y-auto pr-1">
+                        {openCustomerGroups.length === 0 ? (
+                          <div className="text-center py-10 space-y-1 text-stone-400 dark:text-stone-500">
+                            <CheckCircle size={32} className="mx-auto text-emerald-500 opacity-80" />
+                            <p className="font-bold text-xs">لا يوجد أي ديون مفتوحة حالياً 🎉</p>
+                            <p className="text-[10px]">كافة الحرفاء قاموا بتسوية مستحقاتهم بالكامل</p>
+                          </div>
+                        ) : (
+                          openCustomerGroups.map(group => {
+                            const isExpanded = !!expandedCustomerGroups[group.id];
+                            const hasMultipleNames = group.allNames.length > 1;
+
+                            return (
+                              <div 
+                                key={group.id}
+                                className="p-3.5 bg-stone-50 dark:bg-stone-800/60 hover:bg-stone-100/60 dark:hover:bg-stone-800 rounded-2xl border border-stone-200/80 dark:border-stone-700/80 transition-all space-y-2.5"
+                              >
+                                {/* Group Top Row: Customer info & Total Balance */}
+                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                                  <div className="space-y-1">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <div className="font-extrabold text-stone-900 dark:text-stone-100 text-sm flex items-center gap-1.5">
+                                        <span className="w-6 h-6 rounded-full bg-rose-100 dark:bg-rose-950 text-rose-700 dark:text-rose-300 flex items-center justify-center text-xs font-black">
+                                          👤
+                                        </span>
+                                        <span>{group.canonicalName}</span>
+                                      </div>
+
+                                      {group.openDebts.length > 1 && (
+                                        <span className="bg-amber-100 dark:bg-amber-950/80 text-amber-900 dark:text-amber-300 font-extrabold px-2 py-0.5 rounded-full text-[10px]">
+                                          {group.openDebts.length} ديون مفتوحة ⚡
+                                        </span>
+                                      )}
+
+                                      {group.phone && (
+                                        <a 
+                                          href={`tel:${group.phone}`}
+                                          className="text-[10px] text-stone-500 dark:text-stone-400 hover:text-stone-800 dark:hover:text-stone-200 font-mono flex items-center gap-1 bg-white dark:bg-stone-900 px-2 py-0.5 rounded-full border border-stone-200 dark:border-stone-700"
+                                        >
+                                          <PhoneCall size={10} /> {group.phone}
+                                        </a>
+                                      )}
+                                    </div>
+
+                                    {/* Smart Multiple Names / Fuzzy Cluster Alert */}
+                                    {hasMultipleNames && (
+                                      <div className="flex items-center gap-1.5 text-[10px] text-amber-800 dark:text-amber-300 bg-amber-50/80 dark:bg-amber-950/40 px-2.5 py-1 rounded-lg border border-amber-200 dark:border-amber-800/60">
+                                        <Merge size={12} className="shrink-0" />
+                                        <span>رصد أسماء متشابهة: {group.allNames.join(' ، ')}</span>
+                                        {currentRole === 'manager' && (
+                                          <button
+                                            type="button"
+                                            onClick={() => handleUnifyCustomerName(group)}
+                                            className="mr-auto font-bold text-amber-900 dark:text-amber-200 underline hover:text-amber-700 cursor-pointer text-[10px]"
+                                          >
+                                            توحيد الاسم 🪄
+                                          </button>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+
+                                  {/* Right side: Amount & Settle Actions */}
+                                  <div className="flex items-center gap-2 self-end sm:self-auto">
+                                    <div className="text-right">
+                                      <div className="text-[10px] text-stone-400">إجمالي المتبقي</div>
+                                      <div className="font-mono text-base font-black text-rose-700 dark:text-rose-400">
+                                        {group.totalRemaining.toFixed(3)} د.ت
+                                      </div>
+                                    </div>
+                                  </div>
                                 </div>
-                                <div className="flex gap-1.5">
-                                  <button onClick={() => handlePayDebt(d.id, true)} className="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">
-                                    ✅ سداد كامل
-                                  </button>
-                                  <button onClick={() => handlePayDebt(d.id, false)} className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">
-                                    💵 جزء
-                                  </button>
-                                  {currentRole === 'manager' && (
-                                    <button onClick={() => handleDeleteDebt(d.id)} className="text-stone-400 hover:text-red-700 cursor-pointer p-1">
-                                      <Trash2 size={13} />
+
+                                {/* Customer Group Actions Bar */}
+                                <div className="flex items-center justify-between gap-2 pt-2 border-t border-stone-200/60 dark:border-stone-700/60 flex-wrap">
+                                  <div className="flex items-center gap-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => handlePayCustomerGroup(group, true)}
+                                      className="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-2.5 py-1 rounded-lg text-[10px] cursor-pointer transition-colors shadow-xs flex items-center gap-1"
+                                      title="سداد كامل الديون المفتوحة لهذا الحريف دفعة واحدة"
+                                    >
+                                      <Check size={12} /> سداد كامل ({group.totalRemaining.toFixed(3)} د.ت)
                                     </button>
-                                  )}
+
+                                    <button
+                                      type="button"
+                                      onClick={() => handlePayCustomerGroup(group, false)}
+                                      className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-2.5 py-1 rounded-lg text-[10px] cursor-pointer transition-colors shadow-xs flex items-center gap-1"
+                                      title="تسديد دفعة على الحساب يتم توزيعها تلقائياً على أقدم الديون"
+                                    >
+                                      <CreditCard size={12} /> دفعة على الحساب 💵
+                                    </button>
+                                  </div>
+
+                                  {/* Toggle breakdown button */}
+                                  <button
+                                    type="button"
+                                    onClick={() => setExpandedCustomerGroups(prev => ({ ...prev, [group.id]: !prev[group.id] }))}
+                                    className="text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-white text-[10px] font-bold flex items-center gap-1 cursor-pointer px-2 py-1 rounded-lg hover:bg-stone-200/60 dark:hover:bg-stone-700 transition-colors"
+                                  >
+                                    <span>تفاصيل الديون ({group.debts.length})</span>
+                                    {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                                  </button>
+                                </div>
+
+                                {/* Expanded Itemized Debt Records for this customer */}
+                                {isExpanded && (
+                                  <div className="pt-2 border-t border-stone-200/60 dark:border-stone-700/60 space-y-2 animate-fade-in">
+                                    <div className="text-[10px] font-bold text-stone-500 dark:text-stone-400">
+                                      سجل الديون الفردية الخاصة بـ "{group.canonicalName}":
+                                    </div>
+                                    <div className="space-y-1.5">
+                                      {group.debts.map((d, dIdx) => {
+                                        const dRemaining = Math.max(0, d.amount - d.paid);
+                                        const isPaid = d.status === 'paid' || dRemaining <= 0.001;
+
+                                        return (
+                                          <div 
+                                            key={d.id || dIdx}
+                                            className={`p-2 rounded-xl text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 border ${
+                                              isPaid 
+                                                ? 'bg-emerald-50/50 dark:bg-emerald-950/20 border-emerald-200/60 dark:border-emerald-800/40 opacity-75' 
+                                                : 'bg-white dark:bg-stone-900 border-stone-200 dark:border-stone-700'
+                                            }`}
+                                          >
+                                            <div className="space-y-0.5">
+                                              <div className="flex items-center gap-2">
+                                                <span className="font-bold text-stone-800 dark:text-stone-200 text-xs">
+                                                  {d.note || 'دين'}
+                                                </span>
+                                                {d.customerName !== group.canonicalName && (
+                                                  <span className="text-[9px] bg-stone-100 dark:bg-stone-800 text-stone-500 px-1.5 py-0.2 rounded">
+                                                    سُجل باسم: {d.customerName}
+                                                  </span>
+                                                )}
+                                                {isPaid && (
+                                                  <span className="text-[9px] bg-emerald-100 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-300 font-bold px-1.5 py-0.2 rounded">
+                                                    مخلص بالكامل ✅
+                                                  </span>
+                                                )}
+                                              </div>
+                                              <div className="text-[10px] text-stone-400">
+                                                التاريخ: {new Date(d.date).toLocaleDateString('fr-TN')}
+                                                {d.customerPhone && ` • 📞 ${d.customerPhone}`}
+                                              </div>
+                                            </div>
+
+                                            <div className="flex items-center gap-2 self-end sm:self-auto">
+                                              <div className="text-right font-mono text-xs font-bold">
+                                                <span className="text-stone-400 text-[10px]">الأصل: {d.amount.toFixed(3)}</span>{' '}
+                                                <span className={isPaid ? "text-emerald-700 dark:text-emerald-400" : "text-rose-700 dark:text-rose-400"}>
+                                                  المتبقي: {dRemaining.toFixed(3)} د.ت
+                                                </span>
+                                              </div>
+
+                                              {!isPaid && (
+                                                <div className="flex items-center gap-1">
+                                                  <button
+                                                    type="button"
+                                                    onClick={() => handlePayDebt(d.id, true)}
+                                                    className="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-2 py-0.5 rounded text-[10px] cursor-pointer"
+                                                    title="سداد هذا الدين الفردي"
+                                                  >
+                                                    ✅ سداد
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    onClick={() => handlePayDebt(d.id, false)}
+                                                    className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-2 py-0.5 rounded text-[10px] cursor-pointer"
+                                                    title="سداد جزء من هذا الدين"
+                                                  >
+                                                    💵 جزء
+                                                  </button>
+                                                </div>
+                                              )}
+
+                                              {currentRole === 'manager' && (
+                                                <button
+                                                  type="button"
+                                                  onClick={() => handleDeleteDebt(d.id)}
+                                                  className="text-stone-400 hover:text-red-700 cursor-pointer p-1 rounded hover:bg-red-50 dark:hover:bg-red-950"
+                                                  title="حذف هذا الدين"
+                                                >
+                                                  <Trash2 size={13} />
+                                                </button>
+                                              )}
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    )}
+
+                    {/* FLAT LIST VIEW */}
+                    {debtViewMode === 'list' && (
+                      <div className="space-y-2 max-h-[500px] overflow-y-auto pr-1">
+                        {openDebts.length === 0 ? (
+                          <p className="text-stone-400 text-center py-8 text-xs">لا يوجد أي ديون مفتوحة حالياً 🎉</p>
+                        ) : (
+                          openDebts.map((d, idx) => {
+                            const remaining = d.amount - d.paid;
+                            return (
+                              <div key={idx} className="p-3 bg-stone-50 dark:bg-stone-800/60 hover:bg-stone-100/50 dark:hover:bg-stone-800 border border-stone-100 dark:border-stone-700/60 rounded-xl transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                                <div>
+                                  <div className="font-bold text-stone-900 dark:text-stone-100">{d.customerName}</div>
+                                  {d.customerPhone && <div className="text-[10px] text-stone-400 font-mono">📞 {d.customerPhone}</div>}
+                                  <div className="text-[10px] text-stone-500 dark:text-stone-400 mt-0.5">📝 التفاصيل: {d.note}</div>
+                                  <div className="text-[10px] text-stone-400">التاريخ: {new Date(d.date).toLocaleDateString('fr-TN')}</div>
+                                </div>
+                                <div className="flex flex-col items-end gap-1.5">
+                                  <div className="font-bold font-mono">
+                                    <span className="text-stone-400">المجموع: {d.amount.toFixed(3)}</span>{' '}
+                                    <span className="text-rose-700 dark:text-rose-400">المتبقي: {remaining.toFixed(3)} د.ت</span>
+                                  </div>
+                                  <div className="flex gap-1.5">
+                                    <button onClick={() => handlePayDebt(d.id, true)} className="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">
+                                      ✅ سداد كامل
+                                    </button>
+                                    <button onClick={() => handlePayDebt(d.id, false)} className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">
+                                      💵 جزء
+                                    </button>
+                                    {currentRole === 'manager' && (
+                                      <button onClick={() => handleDeleteDebt(d.id)} className="text-stone-400 hover:text-red-700 cursor-pointer p-1">
+                                        <Trash2 size={13} />
+                                      </button>
+                                    )}
+                                  </div>
                                 </div>
                               </div>
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* Recently paid debts */}
-                  <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs text-xs">
-                    <h3 className="font-extrabold text-stone-800 text-xs mb-3 text-emerald-800">✅ ديون مخلصة مؤخراً</h3>
+                  <div className="bg-white dark:bg-stone-900 rounded-2xl border border-stone-200 dark:border-stone-800 p-5 shadow-xs text-xs">
+                    <h3 className="font-extrabold text-stone-800 dark:text-stone-100 text-xs mb-3 text-emerald-800 dark:text-emerald-400 flex items-center gap-1.5">
+                      <CheckCircle size={14} /> ديون مخلصة مؤخراً
+                    </h3>
                     {paidDebts.length === 0 ? (
-                      <p className="text-stone-400 text-center py-6">لا توجد ديون مخلصة مسجلة</p>
+                      <p className="text-stone-400 dark:text-stone-500 text-center py-6">لا توجد ديون مخلصة مسجلة</p>
                     ) : (
                       <div className="space-y-1.5">
                         {paidDebts.map((d, idx) => (
-                          <div key={idx} className="flex justify-between items-center p-2.5 bg-emerald-50/45 rounded-xl border border-emerald-100">
+                          <div key={idx} className="flex justify-between items-center p-2.5 bg-emerald-50/45 dark:bg-emerald-950/30 rounded-xl border border-emerald-100 dark:border-emerald-900/40">
                             <div>
-                              <span className="font-bold text-stone-800">{d.customerName}</span>
+                              <span className="font-bold text-stone-800 dark:text-stone-200">{d.customerName}</span>
                               <span className="text-[10px] text-stone-400 mr-2">{d.note}</span>
                             </div>
-                            <span className="font-mono text-emerald-700 font-bold">{d.amount.toFixed(3)} د.ت</span>
+                            <span className="font-mono text-emerald-700 dark:text-emerald-400 font-bold">{d.amount.toFixed(3)} د.ت</span>
                           </div>
                         ))}
                       </div>
@@ -6123,6 +7133,69 @@ export default function App() {
             {currentTab === 'settings' && currentRole === 'manager' && (
               <div className="space-y-4">
                 
+                {/* Theme & Dark Mode Preference Card */}
+                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
+                  <h3 className="font-extrabold text-stone-800 text-xs mb-1 flex items-center gap-1.5">
+                    <span>🌓 مظهر التطبيق والوضع الداكن (Dark Mode)</span>
+                  </h3>
+                  <p className="text-stone-400 text-[11px] mb-3">اختر مظهر التطبيق المفضل أو اجعله متطابقاً تلقائياً مع نظام جهازك:</p>
+                  
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 max-w-xl">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setThemeMode('system');
+                        triggerToast('💻 تم ضبط المظهر تلقائياً حسب إعدادات جهازك');
+                      }}
+                      className={`p-3 rounded-xl border flex flex-col items-center justify-center text-center gap-1.5 transition-all cursor-pointer select-none ${
+                        themeMode === 'system'
+                          ? 'border-red-700 bg-red-50 text-red-700 font-bold shadow-xs'
+                          : 'border-stone-200 bg-stone-50 text-stone-700 hover:bg-stone-100'
+                      }`}
+                    >
+                      <Laptop size={20} />
+                      <span className="text-xs font-bold">تلقائي حسب الجهاز</span>
+                      <span className="text-[10px] text-stone-400 font-normal">
+                        {isDarkEffective ? '(حالياً داكن 🌙)' : '(حالياً فاتح ☀️)'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setThemeMode('dark');
+                        triggerToast('🌙 تم تفعيل الوضع الداكن (الليلي)');
+                      }}
+                      className={`p-3 rounded-xl border flex flex-col items-center justify-center text-center gap-1.5 transition-all cursor-pointer select-none ${
+                        themeMode === 'dark'
+                          ? 'border-red-700 bg-red-50 text-red-700 font-bold shadow-xs'
+                          : 'border-stone-200 bg-stone-50 text-stone-700 hover:bg-stone-100'
+                      }`}
+                    >
+                      <Moon size={20} />
+                      <span className="text-xs font-bold">الوضع الداكن دائماً</span>
+                      <span className="text-[10px] text-stone-400 font-normal">مريح للعين ليلاً</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setThemeMode('light');
+                        triggerToast('☀️ تم تفعيل الوضع الفاتح (النهاري)');
+                      }}
+                      className={`p-3 rounded-xl border flex flex-col items-center justify-center text-center gap-1.5 transition-all cursor-pointer select-none ${
+                        themeMode === 'light'
+                          ? 'border-red-700 bg-red-50 text-red-700 font-bold shadow-xs'
+                          : 'border-stone-200 bg-stone-50 text-stone-700 hover:bg-stone-100'
+                      }`}
+                    >
+                      <Sun size={20} />
+                      <span className="text-xs font-bold">الوضع الفاتح دائماً</span>
+                      <span className="text-[10px] text-stone-400 font-normal">واجهة نهارية كلاسيكية</span>
+                    </button>
+                  </div>
+                </div>
+
                 {/* Change Pin Card */}
                 <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs">
                   <h3 className="font-extrabold text-stone-800 text-xs mb-1">🔑 تغيير الرمز السري للمدير (Yosri)</h3>
@@ -6361,6 +7434,10 @@ export default function App() {
         onSelectProduct={(item) => handleQuickAddItemToCart(item)}
         onUpdateItemImage={handleUpdateItemImage}
         onAddNewItemWithImage={handleAddNewItemWithImage}
+        onAttachPhotoToForm={(img) => {
+          setNewItem(prev => ({ ...prev, imageUrl: img }));
+          triggerToast('📸 تم إرفاق صورة السلعة لنموذج الإضافة بنجاح!');
+        }}
         targetItemToUpdate={targetItemToCapturePhoto}
         mode={visualRecognitionMode}
       />
@@ -6438,7 +7515,9 @@ export default function App() {
                       </div>
                       <div className="flex justify-between items-center text-[11px] text-stone-600 mt-2 pt-2 border-t border-red-200/60 font-medium">
                         <span>العمليات: <b>{opCount}</b></span>
-                        <span className="text-[10px] text-red-800 font-mono">رصيد: {forfaitBalance.Ooredoo?.toFixed(3) || '0.000'}</span>
+                        <span className="text-[10px] text-red-800 font-mono" title={`حساب 1005: ${(forfaitBalance.Ooredoo_1005 || 0).toFixed(3)} د.ت | حساب 1006: ${(forfaitBalance.Ooredoo_1006 || 0).toFixed(3)} د.ت`}>
+                          رصيد: {((forfaitBalance.Ooredoo_1005 || 0) + (forfaitBalance.Ooredoo_1006 || 0) || (forfaitBalance.Ooredoo || 0)).toFixed(3)} (1005: {(forfaitBalance.Ooredoo_1005 || 0).toFixed(3)} | 1006: {(forfaitBalance.Ooredoo_1006 || 0).toFixed(3)})
+                        </span>
                       </div>
                     </div>
                   );
@@ -6601,10 +7680,19 @@ export default function App() {
         startingCash={cashRegister}
         currentShiftSales={currentShiftSales}
         currentShiftOtherIncome={currentShiftOtherIncome}
+        currentShiftManagerDebtIncome={currentShiftManagerDebtIncome}
         currentShiftExpenses={currentShiftExpenses}
         outboxCount={outboxCount}
         onFlushOutbox={handleManualFlushOutbox}
         onPerformReset={handlePerformShiftReset}
+      />
+
+      {/* Pay Debt Modal */}
+      <PayDebtModal
+        isOpen={!!payDebtTarget}
+        onClose={() => setPayDebtTarget(null)}
+        target={payDebtTarget}
+        onConfirmPayment={handleExecuteDebtPayment}
       />
 
       {/* Custom Confirmation Modal Dialog */}

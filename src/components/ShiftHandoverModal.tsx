@@ -9,6 +9,7 @@ interface ShiftHandoverModalProps {
   currentShiftSales: Sale[];
   currentShiftOtherIncome: OtherIncome[];
   currentShiftExpenses: Expense[];
+  currentShiftManagerDebtIncome?: OtherIncome[];
   outboxCount?: number;
   onFlushOutbox?: () => Promise<any>;
   onPerformReset: (data: {
@@ -32,6 +33,7 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
   currentShiftSales,
   currentShiftOtherIncome,
   currentShiftExpenses,
+  currentShiftManagerDebtIncome = [],
   outboxCount = 0,
   onFlushOutbox,
   onPerformReset
@@ -41,6 +43,7 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
   const salesTotal = currentShiftSales.reduce((sum, s) => sum + s.total, 0);
   const otherIncomeTotal = currentShiftOtherIncome.reduce((sum, o) => sum + o.amount, 0);
   const expensesTotal = currentShiftExpenses.reduce((sum, e) => sum + e.amount, 0);
+  const managerDebtTotal = currentShiftManagerDebtIncome.reduce((sum, o) => sum + o.amount, 0);
   
   const expectedCash = startingCash + salesTotal + otherIncomeTotal - expensesTotal;
 
@@ -160,6 +163,18 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
               <span className="font-mono font-black text-rose-700 text-sm">{expensesTotal.toFixed(3)} د.ت</span>
             </div>
           </div>
+
+          {/* Manager debt collection notice if any during shift */}
+          {managerDebtTotal > 0 && (
+            <div className="bg-amber-50 border border-amber-200/80 p-2.5 rounded-xl text-xs flex justify-between items-center text-amber-900">
+              <span className="font-bold flex items-center gap-1">
+                <span>💼 ديون استلمها المدير (خارج الكاسة):</span>
+              </span>
+              <span className="font-mono font-black text-amber-800 bg-amber-100/80 px-2 py-0.5 rounded-lg text-xs">
+                {managerDebtTotal.toFixed(3)} د.ت
+              </span>
+            </div>
+          )}
 
           {/* Expected Cash in Drawer Card */}
           <div className="bg-amber-500 text-white p-4 rounded-2xl shadow-md text-center">

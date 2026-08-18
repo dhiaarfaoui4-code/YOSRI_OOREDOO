@@ -32,6 +32,7 @@ export interface OtherIncome {
   cardValue?: string | null;
   qty?: number | null;
   debtId?: string | null; // Fix 3: Linking payment back to debt
+  destination?: 'drawer' | 'manager'; // 'drawer' = الكاسة (included in cash register & shift), 'manager' = جيب المدير (excluded from cash register & sales)
 }
 
 export interface DebtLine {
@@ -87,10 +88,12 @@ export interface AuditLogEntry {
 }
 
 export interface ForfaitBalance {
-  Ooredoo: number;
+  Ooredoo?: number;
+  Ooredoo_1005?: number;
+  Ooredoo_1006?: number;
   Orange: number;
   'Tunisie Telecom': number;
-  [key: string]: number;
+  [key: string]: number | undefined;
 }
 
 export interface SparePart {
