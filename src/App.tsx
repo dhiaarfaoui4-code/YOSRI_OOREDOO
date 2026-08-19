@@ -418,7 +418,7 @@ export default function App() {
   const [rechargeValOpt, setRechargeValOpt] = useState('1|1.3|0.3'); // face|sellPrice|commission
   const [rechargeQty, setRechargeQty] = useState('1');
   const [rechargePriceOverride, setRechargePriceOverride] = useState('');
-  const [forfaitOp, setForfaitOp] = useState('Ooredoo');
+  const [forfaitOp, setForfaitOp] = useState('Ooredoo 1005');
   const [forfaitPlanId, setForfaitPlanId] = useState('');
   const [forfaitPriceOverride, setForfaitPriceOverride] = useState('');
   const [forfaitCustomerPhone, setForfaitCustomerPhone] = useState('');
@@ -728,7 +728,9 @@ export default function App() {
           fetch(dbUrl(`/forfaitPlans/${p.id}.json`), { method: 'PUT', body: JSON.stringify(p) }).catch(() => {});
         });
       } else {
-        setForfaitPlans(parseRawWithKeys<ForfaitPlan>(plansRaw));
+        const loadedPlans = parseRawWithKeys<ForfaitPlan>(plansRaw);
+        loadedPlans.sort((a, b) => a.price - b.price);
+        setForfaitPlans(loadedPlans);
       }
 
       if (balanceRaw) {
@@ -2511,15 +2513,19 @@ export default function App() {
       if (Object.keys(forfaitIncrements).length > 0) {
         const updatedBalance: ForfaitBalance = { ...forfaitBalance };
         for (const op of Object.keys(forfaitIncrements)) {
-          if (op === 'Ooredoo') {
-            const inc = forfaitIncrements[op];
+          const inc = forfaitIncrements[op];
+          if (op === 'Ooredoo 1005' || op === 'Ooredoo_1005') {
             updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + inc;
-            updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
+          } else if (op === 'Ooredoo 1006' || op === 'Ooredoo_1006') {
+            updatedBalance.Ooredoo_1006 = (updatedBalance.Ooredoo_1006 || 0) + inc;
+          } else if (op === 'Ooredoo') {
+            updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + inc;
           } else {
             const curBal = updatedBalance[op] || 0;
-            updatedBalance[op] = curBal + forfaitIncrements[op];
+            updatedBalance[op] = curBal + inc;
           }
         }
+        updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
         await putWithOutbox('/forfaitBalance.json', updatedBalance);
         setForfaitBalance(updatedBalance);
       }
@@ -3134,8 +3140,15 @@ export default function App() {
       if (Object.keys(forfaitDepletions).length > 0) {
         const updatedBalance: ForfaitBalance = { ...forfaitBalance };
         for (const op of Object.keys(forfaitDepletions)) {
-          if (op === 'Ooredoo') {
-            let rem = forfaitDepletions[op];
+          const amt = forfaitDepletions[op];
+          if (op === 'Ooredoo 1005' || op === 'Ooredoo_1005') {
+            const cur = updatedBalance.Ooredoo_1005 || 0;
+            updatedBalance.Ooredoo_1005 = Math.max(0, cur - amt);
+          } else if (op === 'Ooredoo 1006' || op === 'Ooredoo_1006') {
+            const cur = updatedBalance.Ooredoo_1006 || 0;
+            updatedBalance.Ooredoo_1006 = Math.max(0, cur - amt);
+          } else if (op === 'Ooredoo') {
+            let rem = amt;
             const cur1005 = updatedBalance.Ooredoo_1005 ?? 0;
             const cur1006 = updatedBalance.Ooredoo_1006 ?? 0;
 
@@ -3147,12 +3160,12 @@ export default function App() {
               rem -= cur1005;
               updatedBalance.Ooredoo_1006 = Math.max(0, cur1006 - rem);
             }
-            updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
           } else {
             const curBal = updatedBalance[op] || 0;
-            updatedBalance[op] = Math.max(0, curBal - forfaitDepletions[op]);
+            updatedBalance[op] = Math.max(0, curBal - amt);
           }
         }
+        updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
         await putWithOutbox('/forfaitBalance.json', updatedBalance);
         setForfaitBalance(updatedBalance);
       }
@@ -3391,13 +3404,17 @@ export default function App() {
             if (record.category === 'forfait' && record.cardOperator) {
               const op = record.cardOperator;
               const updatedBalance: ForfaitBalance = { ...forfaitBalance };
-              if (op === 'Ooredoo') {
+              if (op === 'Ooredoo 1005' || op === 'Ooredoo_1005') {
                 updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + record.amount;
-                updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
+              } else if (op === 'Ooredoo 1006' || op === 'Ooredoo_1006') {
+                updatedBalance.Ooredoo_1006 = (updatedBalance.Ooredoo_1006 || 0) + record.amount;
+              } else if (op === 'Ooredoo') {
+                updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + record.amount;
               } else {
                 const curBal = updatedBalance[op] || 0;
                 updatedBalance[op] = curBal + record.amount;
               }
+              updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
               await putWithOutbox('/forfaitBalance.json', updatedBalance);
               setForfaitBalance(updatedBalance);
             }
@@ -5306,7 +5323,10 @@ export default function App() {
                   )}
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto">
-                    {forfaitPlans.map((p, idx) => (
+                    {forfaitPlans
+                      .slice()
+                      .sort((a, b) => a.price - b.price)
+                      .map((p, idx) => (
                       <div key={idx} className="flex justify-between items-center p-2.5 bg-stone-50 rounded-xl border border-stone-100">
                         <div>
                           <div className="font-bold text-xs text-stone-800">{p.name}</div>
@@ -5953,16 +5973,21 @@ export default function App() {
                               <select 
                                 value={forfaitOp} 
                                 onChange={e => setForfaitOp(e.target.value)} 
-                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
+                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-bold"
                               >
-                                <option value="Ooredoo">Ooredoo</option>
-                                <option value="Orange">Orange</option>
-                                <option value="Tunisie Telecom">Tunisie Telecom</option>
+                                <option value="Ooredoo 1005">🔴 Ooredoo 1005</option>
+                                <option value="Ooredoo 1006">🔴 Ooredoo 1006</option>
+                                <option value="Orange">🟠 Orange</option>
+                                <option value="Tunisie Telecom">🔵 اتصالات تونس (Tunisie Telecom)</option>
                               </select>
                               <span className="text-[9px] text-stone-500 block mt-1 font-mono font-medium">
                                 الرصيد المتوفر: {
-                                  forfaitOp === 'Ooredoo' 
-                                    ? `${((forfaitBalance.Ooredoo_1005 || 0) + (forfaitBalance.Ooredoo_1006 || 0) || (forfaitBalance.Ooredoo || 0)).toFixed(3)} د.ت (1005: ${(forfaitBalance.Ooredoo_1005 || 0).toFixed(3)} | 1006: ${(forfaitBalance.Ooredoo_1006 || 0).toFixed(3)})`
+                                  forfaitOp === 'Ooredoo 1005'
+                                    ? `${(forfaitBalance.Ooredoo_1005 || 0).toFixed(3)} د.ت`
+                                    : forfaitOp === 'Ooredoo 1006'
+                                    ? `${(forfaitBalance.Ooredoo_1006 || 0).toFixed(3)} د.ت`
+                                    : forfaitOp === 'Ooredoo'
+                                    ? `${((forfaitBalance.Ooredoo_1005 || 0) + (forfaitBalance.Ooredoo_1006 || 0) || (forfaitBalance.Ooredoo || 0)).toFixed(3)} د.ت`
                                     : `${(forfaitBalance[forfaitOp] || 0).toFixed(3)} د.ت`
                                 }
                               </span>
@@ -5972,14 +5997,18 @@ export default function App() {
                               <select 
                                 value={forfaitPlanId} 
                                 onChange={e => setForfaitPlanId(e.target.value)} 
-                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
+                                dir="ltr"
+                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 text-left font-mono font-medium"
                               >
-                                <option value="">-- اختر الباقة --</option>
-                                {forfaitPlans.map((p, idx) => (
-                                  <option key={idx} value={p.id}>
-                                    {p.name} ({p.validity}) — {p.price.toFixed(3)} د.ت
-                                  </option>
-                                ))}
+                                <option value="" dir="rtl" className="font-sans">-- اختر الباقة --</option>
+                                {forfaitPlans
+                                  .slice()
+                                  .sort((a, b) => a.price - b.price)
+                                  .map((p, idx) => (
+                                    <option key={idx} value={p.id} dir="ltr">
+                                      {p.name} {p.validity ? `(${p.validity})` : ''} ── {p.price.toFixed(3)} DT
+                                    </option>
+                                  ))}
                               </select>
                             </div>
                           </div>
@@ -7491,11 +7520,14 @@ export default function App() {
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 {/* Ooredoo */}
                 {(() => {
+                  const isOor = (o: OtherIncome) => o.category === 'forfait' && (
+                    (o.cardOperator && o.cardOperator.includes('Ooredoo')) || (!o.cardOperator && o.label.includes('Ooredoo'))
+                  );
                   const opSales = dOther
-                    .filter(o => o.category === 'forfait' && (o.cardOperator === 'Ooredoo' || (!o.cardOperator && o.label.includes('Ooredoo'))))
+                    .filter(isOor)
                     .reduce((s, c) => s + c.amount, 0);
                   const opCount = dOther
-                    .filter(o => o.category === 'forfait' && (o.cardOperator === 'Ooredoo' || (!o.cardOperator && o.label.includes('Ooredoo'))))
+                    .filter(isOor)
                     .length;
                   const pct = totalForfaitSales > 0 ? ((opSales / totalForfaitSales) * 100).toFixed(1) : '0';
 
@@ -7515,8 +7547,8 @@ export default function App() {
                       </div>
                       <div className="flex justify-between items-center text-[11px] text-stone-600 mt-2 pt-2 border-t border-red-200/60 font-medium">
                         <span>العمليات: <b>{opCount}</b></span>
-                        <span className="text-[10px] text-red-800 font-mono" title={`حساب 1005: ${(forfaitBalance.Ooredoo_1005 || 0).toFixed(3)} د.ت | حساب 1006: ${(forfaitBalance.Ooredoo_1006 || 0).toFixed(3)} د.ت`}>
-                          رصيد: {((forfaitBalance.Ooredoo_1005 || 0) + (forfaitBalance.Ooredoo_1006 || 0) || (forfaitBalance.Ooredoo || 0)).toFixed(3)} (1005: {(forfaitBalance.Ooredoo_1005 || 0).toFixed(3)} | 1006: {(forfaitBalance.Ooredoo_1006 || 0).toFixed(3)})
+                        <span className="text-[10px] text-red-800 font-mono">
+                          رصيد: {((forfaitBalance.Ooredoo_1005 || 0) + (forfaitBalance.Ooredoo_1006 || 0) || (forfaitBalance.Ooredoo || 0)).toFixed(3)} د.ت
                         </span>
                       </div>
                     </div>
@@ -7618,6 +7650,7 @@ export default function App() {
                     .filter(o => {
                       if (forfaitFilterOp === 'all') return true;
                       const op = o.cardOperator || (o.label.includes('Ooredoo') ? 'Ooredoo' : o.label.includes('Orange') ? 'Orange' : 'Tunisie Telecom');
+                      if (forfaitFilterOp === 'Ooredoo') return op.includes('Ooredoo');
                       return op === forfaitFilterOp;
                     })
                     .length === 0 ? (
@@ -7630,6 +7663,7 @@ export default function App() {
                         .filter(o => {
                           if (forfaitFilterOp === 'all') return true;
                           const op = o.cardOperator || (o.label.includes('Ooredoo') ? 'Ooredoo' : o.label.includes('Orange') ? 'Orange' : 'Tunisie Telecom');
+                          if (forfaitFilterOp === 'Ooredoo') return op.includes('Ooredoo');
                           return op === forfaitFilterOp;
                         })
                         .slice(0, 40)
@@ -7640,7 +7674,7 @@ export default function App() {
                               <div>
                                 <div className="font-bold text-stone-800 flex items-center gap-1.5">
                                   <span className={`w-2 h-2 rounded-full ${
-                                    opName === 'Ooredoo' ? 'bg-red-500' : opName === 'Orange' ? 'bg-orange-500' : 'bg-sky-500'
+                                    opName.includes('Ooredoo') ? 'bg-red-500' : opName === 'Orange' ? 'bg-orange-500' : 'bg-sky-500'
                                   }`} />
                                   {entry.label}
                                 </div>
