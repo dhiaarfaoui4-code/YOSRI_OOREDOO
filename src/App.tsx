@@ -2590,17 +2590,17 @@ export default function App() {
     }
   };
 
-  // Unify / Standardize Customer Name & Phone across all debts in the group
-  const handleUnifyCustomerName = async (group: CustomerDebtGroup) => {
+  // Edit / Standardize Customer Name & Phone across all debts in the group
+  const handleEditCustomer = async (group: CustomerDebtGroup) => {
     if (currentRole !== 'manager') return;
     const standardName = prompt(
-      `أدخل الاسم الموحد المعتمد لجميع ديون هذا الحريف (${group.debts.length} ديون مسجلة):\nالأسماء المسجلة حالياً: ${group.allNames.join(' ، ')}`,
+      `تعديل اسم الحريف لجميع الديون المسجلة (${group.debts.length} ديون مسجلة):\n${group.allNames.length > 1 ? `الأسماء المسجلة حالياً: ${group.allNames.join(' ، ')}` : ''}`,
       group.canonicalName
     );
     if (!standardName || !standardName.trim()) return;
 
     const trimmed = standardName.trim();
-    const phonePrompt = prompt(`رقم الهاتف المعتمد للحريف (اختياري):`, group.phone || '');
+    const phonePrompt = prompt(`تعديل رقم هاتف الحريف (اختياري):`, group.phone || '');
     const updatedPhone = phonePrompt !== null ? phonePrompt.trim() || undefined : group.phone;
 
     const updatedDebts = group.debts.map(d => ({
@@ -2619,8 +2619,8 @@ export default function App() {
       await putWithOutbox(`/debts/${d.id}.json`, d);
     }
 
-    triggerToast(`✅ تم توحيد الاسم إلى "${trimmed}" في كافة ديون الحريف (${group.debts.length})`);
-    logAudit('edit', `توحيد أسماء ديون الحريف ${group.canonicalName} إلى ${trimmed}`);
+    triggerToast(`✅ تم تعديل اسم الحريف إلى "${trimmed}" في كافة ديونه (${group.debts.length})`);
+    logAudit('edit', `تعديل اسم ديون الحريف ${group.canonicalName} إلى ${trimmed}`);
     loadAllData();
   };
 
@@ -6756,6 +6756,16 @@ export default function App() {
                                           👤
                                         </span>
                                         <span>{group.canonicalName}</span>
+                                        {currentRole === 'manager' && (
+                                          <button
+                                            type="button"
+                                            onClick={() => handleEditCustomer(group)}
+                                            className="text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 transition-colors cursor-pointer"
+                                            title="تعديل اسم أو هاتف الحريف"
+                                          >
+                                            <Pencil size={12} />
+                                          </button>
+                                        )}
                                       </div>
 
                                       {group.openDebts.length > 1 && (
@@ -6782,7 +6792,7 @@ export default function App() {
                                         {currentRole === 'manager' && (
                                           <button
                                             type="button"
-                                            onClick={() => handleUnifyCustomerName(group)}
+                                            onClick={() => handleEditCustomer(group)}
                                             className="mr-auto font-bold text-amber-900 dark:text-amber-200 underline hover:text-amber-700 cursor-pointer text-[10px]"
                                           >
                                             توحيد الاسم 🪄
