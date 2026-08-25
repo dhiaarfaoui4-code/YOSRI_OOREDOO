@@ -5,7 +5,12 @@ import { Debt } from '../types';
  */
 export function normalizeArabicName(name: string): string {
   if (!name) return '';
-  let str = name.toLowerCase().trim();
+  let str = name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .normalize("NFC")
+    .toLowerCase()
+    .trim();
 
   // 1. Remove Arabic diacritics (tashkeel)
   str = str.replace(/[\u064B-\u0652\u0670\u0640]/g, '');

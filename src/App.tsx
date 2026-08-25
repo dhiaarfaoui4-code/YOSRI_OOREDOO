@@ -37,6 +37,9 @@ import {
 // Helper to normalize Arabic
 function normalizeArabic(str: string): string {
   return (str || '')
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .normalize("NFC")
     .toLowerCase()
     .replace(/[أإآا]/g, 'ا')
     .replace(/[ىي]/g, 'ي')
@@ -50,7 +53,11 @@ function normalizeArabic(str: string): string {
 // Smart multilingual search normalization
 function smartNormalize(str: string): string {
   if (!str) return '';
-  let s = str.toLowerCase();
+  let s = str
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .normalize("NFC")
+    .toLowerCase();
   s = s.replace(/[أإآا]/g, 'ا')
        .replace(/[ىي]/g, 'ي')
        .replace(/ة/g, 'ه')
