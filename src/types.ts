@@ -40,6 +40,8 @@ export interface DebtLine {
   itemId?: string | null;
   itemName?: string | null;
   qty: number;
+  unitBuy?: number;
+  unitPrice?: number;
   cardOperator?: string | null;
   cardValue?: string | null;
   total: number;
@@ -125,3 +127,107 @@ export interface ShiftLog {
 
 export type AppTab = 'dashboard' | 'stock' | 'income' | 'debts' | 'history' | 'settings';
 export type AppRole = 'manager' | 'seller';
+
+export interface PendingSaleLine {
+  id: string;
+  type: 'item' | 'recharge' | 'forfait' | 'photo' | 'service';
+  itemId?: string;
+  label: string;
+  qty: number;
+  unitPrice: number;
+  unitBuy?: number;
+  total: number;
+  commission?: number;
+  cardOperator?: string;
+  cardValue?: string;
+  customerPhone?: string;
+}
+
+export type PendingSaleStatus = 
+  | 'created'
+  | 'started'
+  | 'stock_in_progress'
+  | 'stock_decremented'
+  | 'stock_completed'
+  | 'records_in_progress'
+  | 'completed'
+  | 'rollback_in_progress'
+  | 'rolled_back';
+
+export interface PendingStockStep {
+  kind: 'item' | 'card' | 'forfait' | 'photo' | 'debt_pay';
+  targetId: string;
+  qty: number;
+  label?: string;
+  opId: string;
+  revertOpId: string;
+  status: 'pending' | 'completed' | 'failed' | 'rolled_back';
+  payload?: Record<string, number>;
+}
+
+export type PendingDebtPaymentStatus = 
+  | 'created'
+  | 'debt_in_progress'
+  | 'debt_completed'
+  | 'income_in_progress'
+  | 'completed';
+
+
+
+export type PendingDeleteHistorySaleStatus =
+  | 'created'
+  | 'stock_restore_in_progress'
+  | 'stock_restore_completed'
+  | 'sale_delete_in_progress'
+  | 'completed';
+
+export interface PendingDeleteHistorySale {
+  id: string; // The opId for the deletion
+  createdAt: number;
+  saleId: string;
+  isSaleRecord: boolean;
+  stockSteps: PendingStockStep[];
+  status: PendingDeleteHistorySaleStatus;
+}
+
+export type PendingDeleteDebtStatus =
+  | 'created'
+  | 'stock_rollback_in_progress'
+  | 'stock_rollback_completed'
+  | 'income_delete_in_progress'
+  | 'debt_delete_in_progress'
+  | 'completed';
+
+export interface PendingDeleteDebt {
+  id: string; // The opId for the deletion
+  createdAt: number;
+  debtId: string;
+  stockSteps: PendingStockStep[];
+  incomeIdsToDelete: string[];
+  status: PendingDeleteDebtStatus;
+}
+
+export interface PendingDebtPayment {
+  id: string; // The opId for the payment
+  createdAt: number;
+  debtId: string;
+  payAmount: number;
+  incomeId: string;
+  incomeEntry: OtherIncome;
+  updatedDebtStatus: string; // 'open' or 'paid'
+  status: PendingDebtPaymentStatus;
+}
+
+export interface PendingSale {
+  transactionId: string;
+  createdAt: number;
+  date: string;
+  cart: PendingSaleLine[];
+  grandTotal: number;
+  isDebt: boolean;
+  customerName?: string;
+  customerPhone?: string;
+  initialPayment?: string;
+  status: PendingSaleStatus;
+  stockSteps?: PendingStockStep[];
+}

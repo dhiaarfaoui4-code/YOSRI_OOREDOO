@@ -11,10 +11,12 @@ export const BarcodeScannerPopup: React.FC<BarcodeScannerPopupProps> = ({ onScan
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
   const [currentCamIdx, setCurrentCamIdx] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
+  const [scanNotice, setScanNotice] = useState('');
   const [isSwitching, setIsSwitching] = useState(false);
   const [showFlash, setShowFlash] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const qrScannerRef = useRef<Html5Qrcode | null>(null);
+  const scanNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerId = 'qr-reader-target';
   const hasScannedRef = useRef(false);
 
@@ -44,6 +46,9 @@ export const BarcodeScannerPopup: React.FC<BarcodeScannerPopupProps> = ({ onScan
       osc.connect(gain);
       gain.connect(ctx.destination);
       
+      osc.onended = () => {
+        ctx.close().catch(() => {});
+      };
       osc.start();
       osc.stop(ctx.currentTime + 0.1);
     } catch (e) {
@@ -116,6 +121,10 @@ export const BarcodeScannerPopup: React.FC<BarcodeScannerPopupProps> = ({ onScan
 
     return () => {
       active = false;
+      if (scanNoticeTimerRef.current) {
+        clearTimeout(scanNoticeTimerRef.current);
+        scanNoticeTimerRef.current = null;
+      }
       if (scannerInstance) {
         const inst = scannerInstance;
         if (inst.isScanning) {
@@ -238,10 +247,13 @@ export const BarcodeScannerPopup: React.FC<BarcodeScannerPopupProps> = ({ onScan
       
       // 4. Return results or notify
       if (detectedCodes.length > 0) {
+        setScanNotice('');
         const uniqueCodes = Array.from(new Set(detectedCodes));
         onScanRef.current(uniqueCodes.join(', '));
       } else {
-        alert('لم يتم العثور على أي باركود في الصورة الملتقطة. يرجى محاذاة الكود جيداً والمحاولة مجدداً.');
+        setScanNotice('لم يتم العثور على أي باركود في الصورة الملتقطة. يرجى محاذاة الكود جيداً والمحاولة مجدداً.');
+        if (scanNoticeTimerRef.current) clearTimeout(scanNoticeTimerRef.current);
+        scanNoticeTimerRef.current = setTimeout(() => setScanNotice(''), 4000);
       }
     } catch (err) {
       console.error('Capture and analyze failed:', err);
@@ -284,6 +296,12 @@ export const BarcodeScannerPopup: React.FC<BarcodeScannerPopupProps> = ({ onScan
             {showFlash && (
               <div className="absolute inset-0 bg-white z-10 transition-opacity duration-150 opacity-100" />
             )}
+          </div>
+        )}
+
+        {scanNotice && !errorMessage && (
+          <div className="bg-amber-50 text-amber-900 text-xs font-bold p-2.5 rounded-xl border border-amber-200 text-center mt-2">
+            {scanNotice}
           </div>
         )}
 

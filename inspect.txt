@@ -1,0 +1,301 @@
+  2900	
+  2901	      if (updatedDebtsToSave.length === 0) return;
+  2902	
+  2903	      const pendingPayments: PendingDebtPayment[] = [];
+  2904	      for (let i = 0; i < updatedDebtsToSave.length; i++) {
+  2905	        const d = updatedDebtsToSave[i];
+  2906	        const inc = incomeEntriesToSave[i];
+  2907	        const originalDebt = debts.find(x => x.id === d.id);
+  2908	        const originalPaid = originalDebt ? originalDebt.paid : 0;
+  2909	        const payDelta = d.paid - originalPaid;
+  2910	        const payOpId = `pay_${inc.id}`;
+  2911	        
+  2912	        const pendingPayment: PendingDebtPayment = {
+  2913	          id: payOpId,
+  2914	          createdAt: Date.now(),
+  2915	          debtId: d.id,
+  2916	          payAmount: payDelta,
+  2917	          incomeId: inc.id,
+  2918	          incomeEntry: inc,
+  2919	          updatedDebtStatus: d.status,
+  2920	          status: 'created'
+  2921	        };
+  2922	        const ok = savePendingDebtPayment(pendingPayment);
+  2923	        if (ok) {
+  2924	           pendingPayments.push(pendingPayment);
+  2925	        }
+  2926	      }
+  2927	
+  2928	      // Optimistically update debts and otherIncome in state
+  2929	      setDebts(prev => {
+  2930	        const map = new Map(updatedDebtsToSave.map(d => [d.id, d]));
+  2931	        return prev.map(d => map.get(d.id) || d);
+  2932	      });
+  2933	      setOtherIncome(prev => [...incomeEntriesToSave, ...prev]);
+  2934	
+  2935	      // Persist each with dependency on debt.id
+  2936	      for (const pendingPayment of pendingPayments) {
+  2937	        if (!trySavePendingDebtPayment(pendingPayment, 'debt_in_progress')) continue;
+  2938	        
+  2939	        const res = await safeIncrementDebtPaid(pendingPayment.debtId, pendingPayment.payAmount, 6, pendingPayment.id, pendingPayment.debtId);
+  2940	        
+  2941	        if (res.reason === 'not_found') {
+  2942	          // Skip updating status and income for deleted debt
+  2943	          setDebts(prev => prev.filter(x => x.id !== pendingPayment.debtId));
+  2944	          trySavePendingDebtPayment(pendingPayment, 'completed');
+  2945	          removePendingDebtPayment(pendingPayment.id);
+  2946	          continue;
+  2947	        }
+  2948	
+  2949	        if (res.success && !res.pending) {
+  2950	          if (!trySavePendingDebtPayment(pendingPayment, 'debt_completed')) continue;
+  2951	        }
+  2952	
+  2953	        if (!trySavePendingDebtPayment(pendingPayment, 'income_in_progress')) continue;
+  2954	
+  2955	        await patchWithOutbox(`/debts/${pendingPayment.debtId}.json`, { status: pendingPayment.updatedDebtStatus }, undefined, pendingPayment.debtId);
+  2956	        const ok2 = await putWithOutbox(`/otherIncome/${pendingPayment.incomeId}.json`, pendingPayment.incomeEntry, pendingPayment.incomeId, pendingPayment.debtId);
+  2957	
+  2958	        if (ok2.success && !ok2.pending) {
+  2959	          if (trySavePendingDebtPayment(pendingPayment, 'completed')) {
+  2960	            removePendingDebtPayment(pendingPayment.id);
+  2961	          }
+  2962	        }
+  2963	      }
+  2964	
+  2965	      triggerToast(
+  2966	        isToManager
+  2967	          ? `💼 تم سداد ${payAmount.toFixed(3)} د.ت لجيب المدير وتوزيعها على ديون "${group.canonicalName}" (خارج الكاسة)`
+  2968	          : `🎉 تم تسجيل دفعة ${payAmount.toFixed(3)} د.ت بالكاسة وتوزيعها على ديون "${group.canonicalName}" بنجاح!`
+  2969	      );
+  2970	      logAudit('sale', `تسديد جماعي لديون الحريف ${group.canonicalName}: ${payAmount.toFixed(3)} د.ت على ${updatedDebtsToSave.length} دين [الوجهة: ${isToManager ? 'جيب المدير خارج الكاسة' : 'صندوق الكاسة'}]`);
+  2971	      loadAllData();
+  2972	    }
+  2973	  };
+  2974	  const handleDeleteDebt = async (id: string) => {
+  2975	    const debt = debts.find(d => d.id === id);
+  2976	    if (!debt) return;
+  2977	    if (!await promptAndVerifyPin(`هل ترغب بحذف ملف دين الحريف "${debt.customerName}" نهائياً؟`)) return;
+  2978	
+  2979	    // 1. Rollback items, recharge cards, and forfait balances to inventory/balances
+  2980	    const itemIncrements: Record<string, number> = {};
+  2981	    const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
+  2982	    const forfaitIncrements: Record<string, number> = {};
+  2983	    let photoIncrement = 0;
+  2984	
+  2985	    if (debt.lines) {
+  2986	      for (const line of debt.lines) {
+  2987	        if (line.type === 'item' && line.itemId) {
+  2988	          itemIncrements[line.itemId] = (itemIncrements[line.itemId] || 0) + line.qty;
+  2989	        }
+  2990	        if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
+  2991	          const normOp = normalizeOpName(line.cardOperator);
+  2992	          const normVal = String(line.cardValue).trim();
+  2993	          let card = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
+  2994	          if (!card) {
+  2995	            card = {
+  2996	              id: `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`,
+  2997	              kind: 'recharge',
+  2998	              operator: normOp,
+  2999	              value: normVal,
+  3000	              qty: 0
+  3001	            };
+  3002	          }
+  3003	          if (!cardIncrements[card.id]) {
+  3004	            cardIncrements[card.id] = { entry: card, totalQty: 0 };
+  3005	          }
+  3006	          cardIncrements[card.id].totalQty += (line.qty || 1);
+  3007	        }
+  3008	        if (line.type === 'forfait' && line.cardOperator) {
+  3009	          let opKey = line.cardOperator;
+  3010	          if (opKey === 'Ooredoo 1005' || opKey === 'Ooredoo_1005') {
+  3011	            opKey = 'Ooredoo_1005';
+  3012	          } else if (opKey === 'Ooredoo 1006' || opKey === 'Ooredoo_1006') {
+  3013	            opKey = 'Ooredoo_1006';
+  3014	          } else if (opKey === 'Ooredoo') {
+  3015	            opKey = 'Ooredoo_1005';
+  3016	          }
+  3017	          forfaitIncrements[opKey] = (forfaitIncrements[opKey] || 0) + (line.total || 0);
+  3018	        }
+  3019	        if (line.type === 'photo') {
+  3020	          photoIncrement += (line.qty || 1);
+  3021	        }
+  3022	      }
+  3023	    }
+  3024	
+  3025	    const stockSteps: PendingStockStep[] = [];
+  3026	    for (const itemId of Object.keys(itemIncrements)) {
+  3027	      stockSteps.push({
+  3028	        kind: 'item',
+  3029	        targetId: itemId,
+  3030	        qty: itemIncrements[itemId],
+  3031	        opId: `revert_inv_item_${id}_${itemId}`,
+  3032	        revertOpId: '',
+  3033	        status: 'pending'
+  3034	      });
+  3035	    }
+  3036	    for (const cardId of Object.keys(cardIncrements)) {
+  3037	      const { totalQty } = cardIncrements[cardId];
+  3038	      stockSteps.push({
+  3039	        kind: 'card',
+  3040	        targetId: cardId,
+  3041	        qty: totalQty,
+  3042	        opId: `revert_inv_card_${id}_${cardId}`,
+  3043	        revertOpId: '',
+  3044	        status: 'pending'
+  3045	      });
+  3046	    }
+  3047	    for (const opKey of Object.keys(forfaitIncrements)) {
+  3048	      stockSteps.push({
+  3049	        kind: 'forfait',
+  3050	        targetId: opKey,
+  3051	        qty: forfaitIncrements[opKey],
+  3052	        opId: `revert_inv_forfait_${id}_${opKey}`,
+  3053	        revertOpId: '',
+  3054	        status: 'pending'
+  3055	      });
+  3056	    }
+  3057	    if (photoIncrement > 0) {
+  3058	      stockSteps.push({
+  3059	        kind: 'photo',
+  3060	        targetId: 'photo',
+  3061	        qty: photoIncrement,
+  3062	        opId: `revert_inv_photo_${id}`,
+  3063	        revertOpId: '',
+  3064	        status: 'pending'
+  3065	      });
+  3066	    }
+  3067	
+  3068	    const relatedIncomes = otherIncome.filter(o => o.debtId === id);
+  3069	    const incomeIdsToDelete = relatedIncomes.map(inc => inc.id);
+  3070	
+  3071	    const pendingDelOpId = `del_debt_${id}`;
+  3072	    const pendingDel: PendingDeleteDebt = {
+  3073	      id: pendingDelOpId,
+  3074	      createdAt: Date.now(),
+  3075	      debtId: id,
+  3076	      stockSteps,
+  3077	      incomeIdsToDelete,
+  3078	      status: 'created'
+  3079	    };
+  3080	
+  3081	    const persistOk = savePendingDeleteDebt(pendingDel);
+  3082	    if (!persistOk) {
+  3083	      return triggerToast('❌ فشل حفظ قيد الحذف محلياً، تم إيقاف العملية');
+  3084	    }
+  3085	
+  3086	    // Optimistically update React state immediately
+  3087	    setDebts(prev => prev.filter(d => d.id !== id));
+  3088	    setOtherIncome(prev => prev.filter(o => o.debtId !== id));
+  3089	
+  3090	    if (Object.keys(itemIncrements).length > 0) {
+  3091	      setItems(prevItems => prevItems.map(item => {
+  3092	        const inc = itemIncrements[item.id];
+  3093	        return inc ? { ...item, qty: item.qty + inc } : item;
+  3094	      }));
+  3095	    }
+  3096	
+  3097	    if (Object.keys(cardIncrements).length > 0) {
+  3098	      setCardStock(prevCards => prevCards.map(card => {
+  3099	        const inc = cardIncrements[card.id];
+  3100	        return inc ? { ...card, qty: card.qty + inc.totalQty } : card;
+  3101	      }));
+  3102	    }
+  3103	
+  3104	    if (Object.keys(forfaitIncrements).length > 0) {
+  3105	      setForfaitBalance(prev => {
+  3106	        const next = { ...prev };
+  3107	        for (const opKey of Object.keys(forfaitIncrements)) {
+  3108	          if (next[opKey] !== undefined) {
+  3109	            next[opKey] += forfaitIncrements[opKey];
+  3110	          }
+  3111	        }
+  3112	        return next;
+  3113	      });
+  3114	    }
+  3115	    if (photoIncrement > 0) {
+  3116	      setPhotoPaperStock(prev => prev + photoIncrement);
+  3117	    }
+  3118	
+  3119	    if (!trySavePendingDeleteDebt(pendingDel, 'stock_rollback_in_progress')) return;
+  3120	
+  3121	    let allStockCompleted = true;
+  3122	    for (const step of pendingDel.stockSteps) {
+  3123	      let res;
+  3124	      if (step.kind === 'item') {
+  3125	        res = await safeIncrementItemQty(step.targetId, step.qty, undefined, 6, step.opId);
+  3126	      } else if (step.kind === 'card') {
+  3127	        res = await safeIncrementCardQty(step.targetId, step.qty, undefined, 6, step.opId);
+  3128	      } else if (step.kind === 'forfait') {
+  3129	        res = await safeIncrementForfait({ [step.targetId]: step.qty }, 6, step.opId);
+  3130	      } else if (step.kind === 'photo') {
+  3131	        res = await safeIncrementPhotoStock(step.qty, undefined, 6, step.opId);
+  3132	      }
+  3133	
+  3134	      if (res && res.success && !res.pending) {
+  3135	        step.status = 'completed';
+  3136	        savePendingDeleteDebt(pendingDel);
+  3137	      } else {
+  3138	        allStockCompleted = false;
+  3139	      }
+  3140	    }
+  3141	
+  3142	    if (allStockCompleted) {
+  3143	      if (!trySavePendingDeleteDebt(pendingDel, 'stock_rollback_completed')) return;
+  3144	    }
+  3145	
+  3146	    if (pendingDel.status === 'stock_rollback_completed') {
+  3147	      if (!trySavePendingDeleteDebt(pendingDel, 'income_delete_in_progress')) return;
+  3148	    }
+  3149	
+  3150	    if (pendingDel.status === 'income_delete_in_progress') {
+  3151	      let allIncomeDeleted = true;
+  3152	      for (const incomeId of pendingDel.incomeIdsToDelete) {
+  3153	        const res = await putWithOutbox(`/otherIncome/${incomeId}.json`, null);
+  3154	        if (!res.success || res.pending) {
+  3155	          allIncomeDeleted = false;
+  3156	        }
+  3157	      }
+  3158	      if (allIncomeDeleted) {
+  3159	         if (!trySavePendingDeleteDebt(pendingDel, 'debt_delete_in_progress')) return;
+  3160	      }
+  3161	    }
+  3162	
+  3163	    if (pendingDel.status === 'debt_delete_in_progress') {
+  3164	      const ok = await putWithOutbox(`/debts/${id}.json`, null);
+  3165	      if (ok.success && !ok.pending) {
+  3166	        if (trySavePendingDeleteDebt(pendingDel, 'completed')) {
+  3167	          removePendingDeleteDebt(pendingDel.id);
+  3168	        }
+  3169	      }
+  3170	      
+  3171	      triggerToast('✅ تم حذف الدين واسترجاع المشتريات للمخزن');
+  3172	      logAudit('delete', `حذف دين الحريف ${debt.customerName} بقيمة ${debt.amount.toFixed(3)} د.ت واسترجاع المشتريات للمخزون`);
+  3173	      loadAllData();
+  3174	    }
+  3175	  };
+  3176	  const handleDeleteHistorySale = async (id: string, isSaleRecord: boolean) => {
+  3177	    if (!id) {
+  3178	      triggerToast('❌ خطأ: لم يتم العثور على معرف العملية للحذف');
+  3179	      return;
+  3180	    }
+  3181	
+  3182	    setConfirmDialog({
+  3183	      isOpen: true,
+  3184	      title: 'إلغاء العملية وحذفها',
+  3185	      message: 'هل تريد إلغاء ومسح هذا المدخول وإرجاع الستوك للمخازن؟',
+  3186	      confirmText: 'تأكيد الحذف 🗑️',
+  3187	      cancelText: 'إلغاء ❌',
+  3188	      isDanger: true,
+  3189	      onConfirm: async () => {
+  3190	        if (isSaleRecord) {
+  3191	          const record = sales.find(s => s.id === id);
+  3192	          if (record) {
+  3193	            if (record.itemId) {
+  3194	              const localItem = items.find(i => i.id === record.itemId);
+  3195	              await safeIncrementItemQty(record.itemId, record.qty, localItem?.qty, 6, `revert_sale_${id}`);
+  3196	              setItems(prev => prev.map(item => item.id === record.itemId ? { ...item, qty: item.qty + record.qty } : item));
+  3197	            }
+  3198	          }
+  3199	          setSales(prev => prev.filter(s => s.id !== id));
+  3200	          const ok = await putWithOutbox(`/sales/${id}.json`, null);

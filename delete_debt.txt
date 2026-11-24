@@ -1,0 +1,97 @@
+  2974	  const handleDeleteDebt = async (id: string) => {
+  2975	    const debt = debts.find(d => d.id === id);
+  2976	    if (!debt) return;
+  2977	    if (!await promptAndVerifyPin(`هل ترغب بحذف ملف دين الحريف "${debt.customerName}" نهائياً؟`)) return;
+  2978	
+  2979	    // 1. Rollback items, recharge cards, and forfait balances to inventory/balances
+  2980	    const itemIncrements: Record<string, number> = {};
+  2981	    const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
+  2982	    const forfaitIncrements: Record<string, number> = {};
+  2983	    let photoIncrement = 0;
+  2984	
+  2985	    if (debt.lines) {
+  2986	      for (const line of debt.lines) {
+  2987	        if (line.type === 'item' && line.itemId) {
+  2988	          itemIncrements[line.itemId] = (itemIncrements[line.itemId] || 0) + line.qty;
+  2989	        }
+  2990	        if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
+  2991	          const normOp = normalizeOpName(line.cardOperator);
+  2992	          const normVal = String(line.cardValue).trim();
+  2993	          let card = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
+  2994	          if (!card) {
+  2995	            card = {
+  2996	              id: `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`,
+  2997	              kind: 'recharge',
+  2998	              operator: normOp,
+  2999	              value: normVal,
+  3000	              qty: 0
+  3001	            };
+  3002	          }
+  3003	          if (!cardIncrements[card.id]) {
+  3004	            cardIncrements[card.id] = { entry: card, totalQty: 0 };
+  3005	          }
+  3006	          cardIncrements[card.id].totalQty += (line.qty || 1);
+  3007	        }
+  3008	        if (line.type === 'forfait' && line.cardOperator) {
+  3009	          let opKey = line.cardOperator;
+  3010	          if (opKey === 'Ooredoo 1005' || opKey === 'Ooredoo_1005') {
+  3011	            opKey = 'Ooredoo_1005';
+  3012	          } else if (opKey === 'Ooredoo 1006' || opKey === 'Ooredoo_1006') {
+  3013	            opKey = 'Ooredoo_1006';
+  3014	          } else if (opKey === 'Ooredoo') {
+  3015	            opKey = 'Ooredoo_1005';
+  3016	          }
+  3017	          forfaitIncrements[opKey] = (forfaitIncrements[opKey] || 0) + (line.total || 0);
+  3018	        }
+  3019	        if (line.type === 'photo') {
+  3020	          photoIncrement += (line.qty || 1);
+  3021	        }
+  3022	      }
+  3023	
+  3024	      // Rollback items
+  3025	      for (const itemId of Object.keys(itemIncrements)) {
+  3026	        await safeIncrementItemQty(itemId, itemIncrements[itemId], undefined, 6, `revert_inv_item_${id}_${itemId}`);
+  3027	      }
+  3028	
+  3029	      // Rollback recharge cards atomically
+  3030	      for (const cardId of Object.keys(cardIncrements)) {
+  3031	        const { entry, totalQty } = cardIncrements[cardId];
+  3032	        await safeIncrementCardQty(cardId, totalQty, entry.qty, 6, `revert_inv_card_${id}_${cardId}`);
+  3033	      }
+  3034	
+  3035	      // Rollback forfait balance
+  3036	      for (const opKey of Object.keys(forfaitIncrements)) {
+  3037	        await safeIncrementForfait({ [opKey]: forfaitIncrements[opKey] }, 6, `revert_inv_forfait_${id}_${opKey}`);
+  3038	      }
+  3039	
+  3040	      // Rollback photo paper stock
+  3041	      if (photoIncrement > 0) {
+  3042	        await safeIncrementPhotoStock(photoIncrement, undefined, 6, `revert_inv_photo_${id}`);
+  3043	        setPhotoPaperStock(prev => prev + photoIncrement);
+  3044	      }
+  3045	    }
+  3046	
+  3047	    // 2. Clean up any associated down payments or debt repayments for this debt
+  3048	    const relatedIncomes = otherIncome.filter(o => o.debtId === id);
+  3049	    for (const inc of relatedIncomes) {
+  3050	      await putWithOutbox(`/otherIncome/${inc.id}.json`, null);
+  3051	    }
+  3052	
+  3053	    // 3. Delete debt record
+  3054	    const ok = await putWithOutbox(`/debts/${id}.json`, null);
+  3055	
+  3056	    // Optimistically update React state immediately
+  3057	    setDebts(prev => prev.filter(d => d.id !== id));
+  3058	    setOtherIncome(prev => prev.filter(o => o.debtId !== id));
+  3059	
+  3060	    if (Object.keys(itemIncrements).length > 0) {
+  3061	      setItems(prevItems => prevItems.map(item => {
+  3062	        const inc = itemIncrements[item.id];
+  3063	        return inc ? { ...item, qty: item.qty + inc } : item;
+  3064	      }));
+  3065	    }
+  3066	
+  3067	    if (Object.keys(cardIncrements).length > 0) {
+  3068	      setCardStock(prevCards => prevCards.map(card => {
+  3069	        const inc = cardIncrements[card.id];
+  3070	        return inc ? { ...card, qty: card.qty + inc.totalQty } : card;

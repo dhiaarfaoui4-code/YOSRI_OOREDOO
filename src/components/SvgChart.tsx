@@ -18,8 +18,11 @@ export const SvgChart: React.FC<SvgChartProps> = ({ sales, otherIncome, expenses
   const revenueByHour = new Array(24).fill(0);
   const profitByHour = new Array(24).fill(0);
 
-  const sameDay = (d: Date) => 
-    d.getFullYear() === year && d.getMonth() === month && d.getDate() === dayNum;
+  const sameDay = (d: Date) =>
+    !isNaN(d.getTime()) &&
+    d.getFullYear() === year &&
+    d.getMonth() === month &&
+    d.getDate() === dayNum;
 
   let hasData = false;
 
@@ -37,7 +40,9 @@ export const SvgChart: React.FC<SvgChartProps> = ({ sales, otherIncome, expenses
     const d = new Date(o.date);
     if (sameDay(d)) {
       const h = d.getHours();
-      revenueByHour[h] += o.amount;
+      if (o.destination !== 'manager') {
+        revenueByHour[h] += o.amount;
+      }
       profitByHour[h] += (o.commission || 0);
       hasData = true;
     }
@@ -90,11 +95,11 @@ export const SvgChart: React.FC<SvgChartProps> = ({ sales, otherIncome, expenses
     <div className="w-full bg-white rounded-xl p-2">
       <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto overflow-visible select-none">
         {/* Horizontal grid lines */}
-        {[0, 0.25, 0.5, 0.75, 1].map((p, i) => {
+        {[0, 0.25, 0.5, 0.75, 1].map((p) => {
           const val = minVal + p * range;
           const y = getY(val);
           return (
-            <g key={i}>
+            <g key={`grid-${p}`}>
               <line 
                 x1={paddingLeft} 
                 y1={y} 
@@ -150,11 +155,11 @@ export const SvgChart: React.FC<SvgChartProps> = ({ sales, otherIncome, expenses
         />
 
         {/* X axis labels (hours) */}
-        {[0, 4, 8, 12, 16, 20, 23].map((h, i) => {
+        {[0, 4, 8, 12, 16, 20, 23].map((h) => {
           const x = getX(h);
           return (
             <text 
-              key={i} 
+              key={`hour-${h}`} 
               x={x} 
               y={height - 5} 
               fontSize="8" 

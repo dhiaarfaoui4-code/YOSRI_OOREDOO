@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Item } from '../types';
 import { SimilarityResult } from '../utils/productSimilarity';
 import { AlertTriangle, CheckCircle, PackagePlus, Plus, Sparkles, X, ArrowLeftRight, Layers, Tag } from 'lucide-react';
@@ -28,18 +28,24 @@ export const DuplicateProductModal: React.FC<DuplicateProductModalProps> = ({
   onConfirmCreateNew,
   onClose
 }) => {
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const newQty = Math.max(1, parseInt(newItemInput.qty) || 1);
+  const [customAddedQty, setCustomAddedQty] = useState<number>(newQty);
+
+  useEffect(() => {
+    if (isOpen) {
+      setSelectedIndex(0);
+      setCustomAddedQty(Math.max(1, parseInt(newItemInput.qty) || 1));
+    }
+  }, [isOpen, newItemInput.qty]);
+
   if (!isOpen || similarCandidates.length === 0) return null;
 
-  // Selected candidate index (default to 0 - highest similarity)
-  const [selectedIndex, setSelectedIndex] = useState(0);
   const currentMatch = similarCandidates[selectedIndex] || similarCandidates[0];
   const existingItem = currentMatch.item;
 
-  const newQty = parseInt(newItemInput.qty) || 1;
   const newBuyPrice = parseFloat(newItemInput.buy) || existingItem.buy;
   const newSellPrice = parseFloat(newItemInput.sell) || existingItem.sell;
-
-  const [customAddedQty, setCustomAddedQty] = useState<number>(newQty);
 
   const getBadgeColor = (score: number) => {
     if (score >= 85) return 'bg-red-100 text-red-800 border-red-300';
@@ -228,8 +234,8 @@ export const DuplicateProductModal: React.FC<DuplicateProductModalProps> = ({
                 عوامل التشابه التي تم رصدها:
               </p>
               <div className="flex flex-wrap gap-1.5">
-                {currentMatch.reasons.map((reason, rIdx) => (
-                  <span key={rIdx} className="text-[11px] font-bold bg-white text-stone-800 border border-stone-200 px-2.5 py-1 rounded-xl">
+                {currentMatch.reasons.map((reason) => (
+                  <span key={`${currentMatch.item.id}-${reason}`} className="text-[11px] font-bold bg-white text-stone-800 border border-stone-200 px-2.5 py-1 rounded-xl">
                     {reason}
                   </span>
                 ))}

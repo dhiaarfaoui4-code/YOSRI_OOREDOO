@@ -1,0 +1,926 @@
+  3170	      
+  3171	      triggerToast('✅ تم حذف الدين واسترجاع المشتريات للمخزن');
+  3172	      logAudit('delete', `حذف دين الحريف ${debt.customerName} بقيمة ${debt.amount.toFixed(3)} د.ت واسترجاع المشتريات للمخزون`);
+  3173	      loadAllData();
+  3174	    }
+  3175	  };
+  3176	  const handleDeleteHistorySale = async (id: string, isSaleRecord: boolean) => {
+  3177	    if (!id) {
+  3178	      triggerToast('❌ خطأ: لم يتم العثور على معرف العملية للحذف');
+  3179	      return;
+  3180	    }
+  3181	
+  3182	    setConfirmDialog({
+  3183	      isOpen: true,
+  3184	      title: 'إلغاء العملية وحذفها',
+  3185	      message: 'هل تريد إلغاء ومسح هذا المدخول وإرجاع الستوك للمخازن؟',
+  3186	      confirmText: 'تأكيد الحذف 🗑️',
+  3187	      cancelText: 'إلغاء ❌',
+  3188	      isDanger: true,
+  3189	      onConfirm: async () => {
+  3190	        if (isSaleRecord) {
+  3191	          const record = sales.find(s => s.id === id);
+  3192	          if (record) {
+  3193	            if (record.itemId) {
+  3194	              const localItem = items.find(i => i.id === record.itemId);
+  3195	              await safeIncrementItemQty(record.itemId, record.qty, localItem?.qty, 6, `revert_sale_${id}`);
+  3196	              setItems(prev => prev.map(item => item.id === record.itemId ? { ...item, qty: item.qty + record.qty } : item));
+  3197	            }
+  3198	          }
+  3199	          setSales(prev => prev.filter(s => s.id !== id));
+  3200	          const ok = await putWithOutbox(`/sales/${id}.json`, null);
+  3201	          if (ok.success) {
+  3202	            triggerToast('✅ تم إلغاء البيع وإعادة الستوك');
+  3203	            logAudit('delete', `إلغاء بيع سلع: ${record?.itemName || 'غير معروف'}`);
+  3204	            loadAllData();
+  3205	          } else {
+  3206	            triggerToast('❌ فشل حذف العملية من الخادم السحابي');
+  3207	          }
+  3208	        } else {
+  3209	          const record = otherIncome.find(o => o.id === id);
+  3210	          if (record) {
+  3211	            // Rollback recharge
+  3212	            if ((record.category === 'recharge' || record.category === 'card') && record.cardOperator && record.cardValue) {
+  3213	              const restoreQty = record.qty || 1;
+  3214	              const normOp = normalizeOpName(record.cardOperator);
+  3215	              const normVal = String(record.cardValue).trim();
+  3216	              const card = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
+  3217	              if (card) {
+  3218	                const res = await safeIncrementCardQty(card.id, restoreQty, card.qty, 6, `revert_card_${id}`);
+  3219	                const newQty = res.newQty !== undefined ? res.newQty : card.qty + restoreQty;
+  3220	                setCardStock(prev => prev.map(c => c.id === card.id ? { ...c, qty: newQty } : c));
+  3221	              } else {
+  3222	                const canonicalId = `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`;
+  3223	                const newCard: CardStockEntry = {
+  3224	                  id: canonicalId,
+  3225	                  kind: 'recharge',
+  3226	                  operator: normOp,
+  3227	                  value: normVal,
+  3228	                  qty: restoreQty
+  3229	                };
+  3230	                await putWithOutbox(`/cardStock/${newCard.id}.json`, newCard);
+  3231	                setCardStock(prev => [...prev, newCard]);
+  3232	              }
+  3233	            }
+  3234	            // Rollback forfait balance
+  3235	            if (record.category === 'forfait' && record.cardOperator) {
+  3236	              const op = record.cardOperator;
+  3237	              const updatedBalance: ForfaitBalance = { ...forfaitBalance };
+  3238	              let actualOp = op;
+  3239	              if (op === 'Ooredoo 1005' || op === 'Ooredoo_1005') {
+  3240	                actualOp = 'Ooredoo_1005';
+  3241	              } else if (op === 'Ooredoo 1006' || op === 'Ooredoo_1006') {
+  3242	                actualOp = 'Ooredoo_1006';
+  3243	              } else if (op === 'Ooredoo') {
+  3244	                actualOp = 'Ooredoo_1005';
+  3245	              }
+  3246	              updatedBalance[actualOp] = (updatedBalance[actualOp] || 0) + record.amount;
+  3247	              updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
+  3248	              
+  3249	              setForfaitBalance(updatedBalance);
+  3250	              await safeIncrementForfait({ [actualOp]: record.amount }, 6, `revert_forfait_${id}`);
+  3251	            }
+  3252	            // Rollback photo paper stock
+  3253	            if (record.category === 'photo') {
+  3254	              const restoreQty = record.qty || 1;
+  3255	              await safeIncrementPhotoStock(restoreQty, photoPaperStock, 6, `revert_photo_${id}`);
+  3256	              setPhotoPaperStock(prev => prev + restoreQty);
+  3257	            }
+  3258	            // Rollback debt payment if linked to a debt
+  3259	            if (record.category === 'debt_payment' && record.debtId) {
+  3260	              const targetDebt = debts.find(d => d.id === record.debtId);
+  3261	              if (targetDebt) {
+  3262	                const newPaid = Math.max(0, targetDebt.paid - record.amount);
+  3263	                const updatedDebt: Debt = {
+  3264	                  ...targetDebt,
+  3265	                  paid: newPaid,
+  3266	                  status: (newPaid >= targetDebt.amount - 0.001) ? 'paid' : 'open'
+  3267	                };
+  3268	                setDebts(prev => prev.map(d => d.id === record.debtId ? updatedDebt : d));
+  3269	                await safeIncrementDebtPaid(record.debtId, -record.amount, 6, `revert_pay_${id}`);
+  3270	                await patchWithOutbox(`/debts/${record.debtId}.json`, { status: updatedDebt.status });
+  3271	              }
+  3272	            }
+  3273	          }
+  3274	          setOtherIncome(prev => prev.filter(o => o.id !== id));
+  3275	          const ok = await putWithOutbox(`/otherIncome/${id}.json`, null);
+  3276	          if (ok.success) {
+  3277	            triggerToast('✅ تم إلغاء وحذف المدخول بنجاح');
+  3278	            logAudit('delete', `إلغاء مدخول: ${record?.label || 'غير معروف'}`);
+  3279	            loadAllData();
+  3280	          } else {
+  3281	            triggerToast('❌ فشل حذف العملية من الخادم السحابي');
+  3282	          }
+  3283	        }
+  3284	      }
+  3285	    });
+  3286	  };
+  3287	
+  3288	  // ---- 7. General Admin resets / utilities ----
+  3289	  const handleSaveStartingCash = async (e: React.FormEvent) => {
+  3290	    e.preventDefault();
+  3291	    if (!await promptAndVerifyPin('أدخل الرمز السري لتسجيل فلوس الكاسة الحالية:')) return;
+  3292	    const inputVal = parseFloat((document.getElementById('starting-cash-inp') as HTMLInputElement)?.value) || 0;
+  3293	    
+  3294	    const okReg = await putWithOutbox('/cashRegister.json', inputVal);
+  3295	    if (okReg.success) {
+  3296	      setCashRegister(inputVal);
+  3297	      // Only set lastCashResetTimestamp if none exists yet, do NOT reset ongoing shift timestamp
+  3298	      if (!lastCashResetTimestamp) {
+  3299	        const newTimestamp = new Date().toISOString();
+  3300	        await putWithOutbox('/lastCashResetTimestamp.json', newTimestamp);
+  3301	        setLastCashResetTimestamp(newTimestamp);
+  3302	      }
+  3303	      triggerToast('✅ تم تحديث كاش البداية بنجاح');
+  3304	      loadAllData();
+  3305	    } else {
+  3306	      triggerToast('❌ تعذر حفظ كاش البداية');
+  3307	    }
+  3308	  };
+  3309	
+  3310	  const handleMergeDuplicates = async () => {
+  3311	    const map: Record<string, Item[]> = {};
+  3312	    items.forEach(i => {
+  3313	      const norm = normalizeArabic(i.name);
+  3314	      if (!map[norm]) map[norm] = [];
+  3315	      map[norm].push(i);
+  3316	    });
+  3317	
+  3318	    const duplicates = Object.values(map).filter(arr => arr.length > 1);
+  3319	    if (duplicates.length === 0) return triggerToast('✅ لا توجد أي سلع مكررة حالياً');
+  3320	
+  3321	    if (!await promptAndVerifyPin('هل ترغب بدمج السلع المكررة وتجميع كمياتها تلقائياً؟')) return;
+  3322	
+  3323	    for (const group of duplicates) {
+  3324	      const keep = group[0];
+  3325	      const totalQty = group.reduce((s, i) => s + i.qty, 0);
+  3326	      const mergedBarcodes = Array.from(new Set(group.flatMap(i => i.barcodes || [])));
+  3327	
+  3328	      await patchWithOutbox(`/items/${keep.id}.json`, { barcodes: mergedBarcodes });
+  3329	      const qtyToAdd = totalQty - keep.qty;
+  3330	      if (qtyToAdd > 0) {
+  3331	        await safeIncrementItemQty(keep.id, qtyToAdd, keep.qty);
+  3332	      }
+  3333	
+  3334	      // Delete other duplicate instances
+  3335	      for (let x = 1; x < group.length; x++) {
+  3336	        await putWithOutbox(`/items/${group[x].id}.json`, null);
+  3337	      }
+  3338	    }
+  3339	
+  3340	    triggerToast('🧹 تم تجميع ودمج السلع المكررة بنجاح!');
+  3341	    loadAllData();
+  3342	  };
+  3343	
+  3344	  const handleResetIncomeHistory = async (days: number) => {
+  3345	    const shiftStartMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : Date.now();
+  3346	    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  3347	
+  3348	    // Only remove archived sales that are strictly older than the active shift start
+  3349	    const salesToRemove = sales.filter(s => {
+  3350	      const t = new Date(s.date).getTime();
+  3351	      return t < shiftStartMs && t >= cutoff;
+  3352	    });
+  3353	    const otherToRemove = otherIncome.filter(o => {
+  3354	      const t = new Date(o.date).getTime();
+  3355	      return t < shiftStartMs && t >= cutoff;
+  3356	    });
+  3357	
+  3358	    if (salesToRemove.length === 0 && otherToRemove.length === 0) {
+  3359	      return triggerToast('❌ لا توجد أي مبيعات أرشيفية سابقة للوردية الحالية في هذه الفترة المحددة');
+  3360	    }
+  3361	
+  3362	    if (!await promptAndVerifyPin(`⚠️ هل أنت متأكد من تنظيف السحابة ومسح ${salesToRemove.length} مبيعة قديمة و ${otherToRemove.length} مدخول أقدم من الوردية الحالية؟`)) return;
+  3363	
+  3364	    // Generate and save/send PDF report before deleting records
+  3365	    triggerToast('📊 جاري توليد تقرير PDF التصفير للأرشيف...');
+  3366	    await generateResetReportPDF(salesToRemove, otherToRemove, days);
+  3367	
+  3368	    if (salesToRemove.length > 0) {
+  3369	      const salesPatch: Record<string, null> = {};
+  3370	      salesToRemove.forEach(s => { salesPatch[s.id] = null; });
+  3371	      await patchWithOutbox('/sales.json', salesPatch);
+  3372	    }
+  3373	    if (otherToRemove.length > 0) {
+  3374	      const otherPatch: Record<string, null> = {};
+  3375	      otherToRemove.forEach(o => { otherPatch[o.id] = null; });
+  3376	      await patchWithOutbox('/otherIncome.json', otherPatch);
+  3377	    }
+  3378	
+  3379	    const removedSalesIds = new Set(salesToRemove.map(s => s.id));
+  3380	    const removedOtherIds = new Set(otherToRemove.map(o => o.id));
+  3381	    setSales(prev => prev.filter(s => !removedSalesIds.has(s.id)));
+  3382	    setOtherIncome(prev => prev.filter(o => !removedOtherIds.has(o.id)));
+  3383	
+  3384	    triggerToast('🧹 تم تنظيف المبيعات الأرشيفية القديمة وتوفير مساحة السحابة دون المساس بالوردية الحالية');
+  3385	    loadAllData();
+  3386	  };
+  3387	
+  3388	  // Change security pin
+  3389	  const handleChangePin = async () => {
+  3390	    const current = prompt('أدخل رمز المدير الحالي:');
+  3391	    if (!current) return;
+  3392	    
+  3393	    const isCurrentOk = await verifyManagerPinViaAuth(current);
+  3394	    const currentH = await sha256Hex(current);
+  3395	    
+  3396	    if (!isCurrentOk && currentH !== managerPin) {
+  3397	      return triggerToast('❌ الرمز الحالي غير صحيح');
+  3398	    }
+  3399	
+  3400	    const next = prompt('أدخل رمز المدير الجديد:');
+  3401	    if (!next || next.trim().length < 4) return triggerToast('❌ يجب أن يتكون الرمز من 4 أرقام على الأقل');
+  3402	
+  3403	    const nextTrimmed = next.trim();
+  3404	    
+  3405	    // Try to update on Firebase Auth first
+  3406	    const updateAuthSuccess = await updateManagerPinViaAuth(nextTrimmed);
+  3407	    
+  3408	    // Also save hash to RTDB /pin.json as backup/offline verification
+  3409	    const nextH = await sha256Hex(nextTrimmed);
+  3410	    let resOk = false;
+  3411	    try {
+  3412	      const res = await fetch(dbUrl('/pin.json'), {
+  3413	        method: 'PUT',
+  3414	        headers: { 'Content-Type': 'application/json' },
+  3415	        body: JSON.stringify(nextH)
+  3416	      });
+  3417	      resOk = res.ok;
+  3418	    } catch (e) {
+  3419	      resOk = false;
+  3420	    }
+  3421	
+  3422	    if (updateAuthSuccess || resOk) {
+  3423	      setManagerPin(nextH);
+  3424	      triggerToast('✅ تم تغيير رمز المدير السري بنجاح');
+  3425	      logAudit('pin', 'تحديث وتغيير رمز المرور السري للمدير');
+  3426	    } else {
+  3427	      triggerToast('❌ فشل تغيير الرمز السري، تأكد من الاتصال بالإنترنت');
+  3428	    }
+  3429	  };
+  3430	
+  3431	  // Backup downloader
+  3432	  const handleDownloadBackup = () => {
+  3433	    const data = {
+  3434	      exportedAt: new Date().toISOString(),
+  3435	      items, sales, otherIncome, debts, cardStock, expenses, cashRegister, forfaitPlans, forfaitBalance
+  3436	    };
+  3437	    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  3438	    const url = URL.createObjectURL(blob);
+  3439	    const a = document.createElement('a');
+  3440	    a.href = url;
+  3441	    a.download = `Yosri_GSM_Backup_${new Date().toISOString().slice(0, 10)}.json`;
+  3442	    document.body.appendChild(a);
+  3443	    a.click();
+  3444	    document.body.removeChild(a);
+  3445	    URL.revokeObjectURL(url);
+  3446	    triggerToast('✅ تم تحميل النسخة الاحتياطية بنجاح');
+  3447	  };
+  3448	
+  3449	  // ---- 8. Barcode Scanning Handling ----
+  3450	  const handleBarcodeScanned = async (code: string) => {
+  3451	    setScannerContext(null); // Close camera popup
+  3452	    const trimmed = code.trim();
+  3453	    if (!trimmed) return;
+  3454	
+  3455	    // Split barcode input by comma and clean whitespace
+  3456	    const codes = trimmed.split(',').map(c => c.trim()).filter(Boolean);
+  3457	    if (codes.length === 0) return;
+  3458	
+  3459	    if (scannerContext === 'stock') {
+  3460	      const newBarcodesToAdd: string[] = [];
+  3461	      for (const singleCode of codes) {
+  3462	        const match = items.find(i => i.barcodes?.includes(singleCode));
+  3463	        if (match) {
+  3464	          const amtStr = prompt(`السلعة "${match.name}" موجودة بالستوك بالباركود (${singleCode}). أدخل الكمية الإضافية لزيادتها:`, '1');
+  3465	          if (amtStr) {
+  3466	            const amt = parseInt(amtStr, 10);
+  3467	            if (amt > 0) {
+  3468	              const result = await safeIncrementItemQty(match.id, amt);
+  3469	              if (result.success) {
+  3470	                triggerToast(`✅ تم تحديث كمية السلعة "${match.name}" بنجاح`);
+  3471	                logAudit('edit', `تحديث ستوك عبر الباركود: ${match.name} (+${amt})`);
+  3472	                loadAllData();
+  3473	              }
+  3474	            }
+  3475	          }
+  3476	        } else {
+  3477	          newBarcodesToAdd.push(singleCode);
+  3478	        }
+  3479	      }
+  3480	      
+  3481	      if (newBarcodesToAdd.length > 0) {
+  3482	        setNewItem(prev => {
+  3483	          const currentBarcode = prev.barcode ? prev.barcode.trim() : '';
+  3484	          const existingList = currentBarcode.split(',').map(x => x.trim()).filter(Boolean);
+  3485	          
+  3486	          const filteredNew = newBarcodesToAdd.filter(b => !existingList.includes(b));
+  3487	          if (filteredNew.length === 0) {
+  3488	            triggerToast('⚠️ الأكواد مضافة بالفعل في الخانة');
+  3489	            return prev;
+  3490	          }
+  3491	          
+  3492	          const updatedList = [...existingList, ...filteredNew];
+  3493	          const finalBarcode = updatedList.join(', ');
+  3494	          return { ...prev, barcode: finalBarcode };
+  3495	        });
+  3496	        triggerToast(`🆕 تم إضافة ${newBarcodesToAdd.length} كود جديد لخانة الباركود`);
+  3497	      }
+  3498	    }
+  3499	
+  3500	    else if (scannerContext === 'sell') {
+  3501	      let addedCount = 0;
+  3502	      let missingCount = 0;
+  3503	      
+  3504	      const newLines: CartLine[] = [];
+  3505	      for (const singleCode of codes) {
+  3506	        const match = items.find(i => i.barcodes?.includes(singleCode));
+  3507	        if (!match) {
+  3508	          missingCount++;
+  3509	          continue;
+  3510	        }
+  3511	        if (match.qty <= 0) {
+  3512	          triggerToast(`❌ السلعة "${match.name}" منتهية من المستودع`);
+  3513	          continue;
+  3514	        }
+  3515	
+  3516	        const cartAlready = [...cart, ...newLines]
+  3517	          .filter(c => c.type === 'item' && c.itemId === match.id)
+  3518	          .reduce((s, c) => s + c.qty, 0);
+  3519	
+  3520	        if (cartAlready >= match.qty) {
+  3521	          triggerToast(`❌ تجاوزت الستوك المتوفر للسلعة "${match.name}"`);
+  3522	          continue;
+  3523	        }
+  3524	
+  3525	        newLines.push({
+  3526	          id: Math.random().toString(36).slice(2, 9),
+  3527	          type: 'item',
+  3528	          itemId: match.id,
+  3529	          label: match.name,
+  3530	          qty: 1,
+  3531	          unitPrice: match.sell,
+  3532	          unitBuy: match.buy,
+  3533	          total: match.sell
+  3534	        });
+  3535	        addedCount++;
+  3536	      }
+  3537	
+  3538	      if (newLines.length > 0) {
+  3539	        setCart(prev => [...prev, ...newLines]);
+  3540	      }
+  3541	
+  3542	      if (addedCount > 0) {
+  3543	        triggerToast(`🛍️ تم إضافة ${addedCount} سلعة إلى الفاتورة`);
+  3544	        if (document.activeElement instanceof HTMLElement) {
+  3545	          document.activeElement.blur();
+  3546	        }
+  3547	      }
+  3548	      if (missingCount > 0) {
+  3549	        triggerToast(`❌ لم يتم العثور على ${missingCount} من الأكواد الممسوحة`);
+  3550	      }
+  3551	    }
+  3552	
+  3553	    else if (scannerContext?.startsWith('manage-')) {
+  3554	      const itemId = scannerContext.replace('manage-', '');
+  3555	      const match = items.find(i => i.id === itemId);
+  3556	      if (!match) return;
+  3557	
+  3558	      const currentBarcodes = match.barcodes || [];
+  3559	      const updatedBarcodes = [...currentBarcodes];
+  3560	      let addedAny = false;
+  3561	      
+  3562	      for (const singleCode of codes) {
+  3563	        const isTaken = items.find(i => i.barcodes?.includes(singleCode) && i.id !== itemId);
+  3564	        if (isTaken) {
+  3565	          triggerToast(`❌ الباركود ${singleCode} مستخدم بالفعل مع سلعة أخرى: "${isTaken.name}"`);
+  3566	          continue;
+  3567	        }
+  3568	        
+  3569	        if (updatedBarcodes.includes(singleCode)) {
+  3570	          triggerToast(`⚠️ الباركود ${singleCode} مسجل مسبقاً لهذه السلعة`);
+  3571	          continue;
+  3572	        }
+  3573	        
+  3574	        updatedBarcodes.push(singleCode);
+  3575	        addedAny = true;
+  3576	      }
+  3577	      
+  3578	      if (addedAny) {
+  3579	        const ok = await patchWithOutbox(`/items/${match.id}.json`, { barcodes: updatedBarcodes });
+  3580	        if (ok.success) {
+  3581	          triggerToast(`✅ تم ربط الباركود الإضافي لـ "${match.name}"`);
+  3582	          loadAllData();
+  3583	        }
+  3584	      }
+  3585	    }
+  3586	  };
+  3587	
+  3588	  // ---- 9. Dashboard Financial Calculations ----
+  3589	  const currentShiftSales = useMemo(() => {
+  3590	    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
+  3591	    return sales.filter(s => new Date(s.date).getTime() >= resetTimeMs);
+  3592	  }, [sales, lastCashResetTimestamp]);
+  3593	
+  3594	  const currentShiftOtherIncome = useMemo(() => {
+  3595	    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
+  3596	    return otherIncome.filter(o => new Date(o.date).getTime() >= resetTimeMs && o.destination !== 'manager');
+  3597	  }, [otherIncome, lastCashResetTimestamp]);
+  3598	
+  3599	  const currentShiftManagerDebtIncome = useMemo(() => {
+  3600	    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
+  3601	    return otherIncome.filter(o => new Date(o.date).getTime() >= resetTimeMs && o.destination === 'manager');
+  3602	  }, [otherIncome, lastCashResetTimestamp]);
+  3603	
+  3604	  const currentShiftExpenses = useMemo(() => {
+  3605	    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
+  3606	    return expenses.filter(e => new Date(e.date).getTime() >= resetTimeMs);
+  3607	  }, [expenses, lastCashResetTimestamp]);
+  3608	
+  3609	  const isResettingShiftRef = useRef<boolean>(false);
+  3610	
+  3611	  const handleDeleteShiftLog = async (logId: string) => {
+  3612	    if (!await promptAndVerifyPin('أدخل الرمز السري لحذف سجل تصفير الوردية:')) return;
+  3613	    const ok = await putWithOutbox(`/shiftLogs/${logId}.json`, null);
+  3614	    if (ok.success) {
+  3615	      setShiftLogs(prev => prev.filter(l => l.id !== logId));
+  3616	      triggerToast('🗑️ تم حذف سجل الوردية بنجاح');
+  3617	      logAudit('delete', `حذف سجل تصفير وردية ID: ${logId}`);
+  3618	    } else {
+  3619	      triggerToast('❌ تعذر حذف السجل');
+  3620	    }
+  3621	  };
+  3622	
+  3623	  const handlePerformShiftReset = async (data: {
+  3624	    sellerName: string;
+  3625	    salesTotal: number;
+  3626	    otherIncomeTotal: number;
+  3627	    expensesTotal: number;
+  3628	    expectedCash: number;
+  3629	    actualCash: number;
+  3630	    cashWithdrawn: number;
+  3631	    newStartingCash: number;
+  3632	    notes: string;
+  3633	  }) => {
+  3634	    if (isResettingShiftRef.current) return;
+  3635	    isResettingShiftRef.current = true;
+  3636	
+  3637	    try {
+  3638	      // 1. Generate & download PDF report for the current shift (and send to Telegram)
+  3639	      triggerToast('📊 جاري توليد تقرير PDF الوردية...');
+  3640	      await generateShiftReportPDF(
+  3641	        {
+  3642	          sellerName: data.sellerName,
+  3643	          startingCash: cashRegister,
+  3644	          salesTotal: data.salesTotal,
+  3645	          otherIncomeTotal: data.otherIncomeTotal,
+  3646	          expensesTotal: data.expensesTotal,
+  3647	          expectedCash: data.expectedCash,
+  3648	          actualCash: data.actualCash,
+  3649	          cashWithdrawn: data.cashWithdrawn,
+  3650	          newStartingCash: data.newStartingCash,
+  3651	          notes: data.notes
+  3652	        },
+  3653	        currentShiftSales,
+  3654	        currentShiftOtherIncome
+  3655	      );
+  3656	
+  3657	      // 2. Clear outbox queue & wipe sales, other income, and expenses from Firebase
+  3658	      triggerToast('🧹 جاري تفريغ سجلات الوردية من السحابة...');
+  3659	      clearOutboxForPaths(['/sales', '/otherIncome', '/expenses']);
+  3660	
+  3661	      // Batch delete from Firebase using fast patch / put operations
+  3662	      if (sales.length > 0) {
+  3663	        const salesPatch: Record<string, null> = {};
+  3664	        sales.forEach(s => { salesPatch[s.id] = null; });
+  3665	        await patchWithOutbox('/sales.json', salesPatch);
+  3666	      } else {
+  3667	        await putWithOutbox('/sales.json', null);
+  3668	      }
+  3669	
+  3670	      if (otherIncome.length > 0) {
+  3671	        const incomePatch: Record<string, null> = {};
+  3672	        otherIncome.forEach(o => { incomePatch[o.id] = null; });
+  3673	        await patchWithOutbox('/otherIncome.json', incomePatch);
+  3674	      } else {
+  3675	        await putWithOutbox('/otherIncome.json', null);
+  3676	      }
+  3677	
+  3678	      if (expenses.length > 0) {
+  3679	        const expensePatch: Record<string, null> = {};
+  3680	        expenses.forEach(e => { expensePatch[e.id] = null; });
+  3681	        await patchWithOutbox('/expenses.json', expensePatch);
+  3682	      } else {
+  3683	        await putWithOutbox('/expenses.json', null);
+  3684	      }
+  3685	
+  3686	      // Clear local state immediately so UI updates cleanly
+  3687	      setSales([]);
+  3688	      setOtherIncome([]);
+  3689	      setExpenses([]);
+  3690	
+  3691	      // 3. Save shift log & new starting cash
+  3692	      const newLog: ShiftLog = {
+  3693	        id: `shift_${Date.now()}`,
+  3694	        timestamp: new Date().toISOString(),
+  3695	        sellerName: data.sellerName,
+  3696	        salesTotal: data.salesTotal,
+  3697	        otherIncomeTotal: data.otherIncomeTotal,
+  3698	        expensesTotal: data.expensesTotal,
+  3699	        expectedCashInDrawer: data.expectedCash,
+  3700	        actualCashInDrawer: data.actualCash,
+  3701	        cashWithdrawn: data.cashWithdrawn,
+  3702	        newStartingCash: data.newStartingCash,
+  3703	        difference: data.actualCash - data.expectedCash,
+  3704	        notes: data.notes
+  3705	      };
+  3706	
+  3707	      const okLog = await putWithOutbox(`/shiftLogs/${newLog.id}.json`, newLog);
+  3708	      const okReg = await putWithOutbox('/cashRegister.json', data.newStartingCash);
+  3709	      const okTime = await putWithOutbox('/lastCashResetTimestamp.json', newLog.timestamp);
+  3710	
+  3711	      if (okReg.success || okLog.success) {
+  3712	        setShiftLogs(prev => [...prev, newLog]);
+  3713	        setCashRegister(data.newStartingCash);
+  3714	        setLastCashResetTimestamp(newLog.timestamp);
+  3715	        setShowShiftHandoverModal(false);
+  3716	        triggerToast('✅ تم تصفير الكاسة، حفظ تقرير PDF، ومسح السجلات من الفايربيز بنجاح');
+  3717	        logAudit('reset', `تصفير الوردية وتفريغ السحابة: ${data.sellerName} (كاش مفرغ: ${data.cashWithdrawn.toFixed(3)} د.ت)`);
+  3718	        loadAllData();
+  3719	      } else {
+  3720	        triggerToast('❌ حدث خطأ أثناء تصفير الكاسة وتسليم الوردية');
+  3721	      }
+  3722	    } finally {
+  3723	      isResettingShiftRef.current = false;
+  3724	    }
+  3725	  };
+  3726	
+  3727	  const filteredDashboardData = useMemo(() => {
+  3728	    const now = new Date();
+  3729	    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  3730	    const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000;
+  3731	    const startOf7Days = startOfToday - 6 * 24 * 60 * 60 * 1000;
+  3732	    const startOf30Days = startOfToday - 29 * 24 * 60 * 60 * 1000;
+  3733	
+  3734	    const resetTimeMs = lastCashResetTimestamp ? new Date(lastCashResetTimestamp).getTime() : 0;
+  3735	
+  3736	    const inRange = (dateStr: string) => {
+  3737	      if (!dateStr) return false;
+  3738	      const t = new Date(dateStr).getTime();
+  3739	      if (dashboardDateFilter === 'shift') {
+  3740	        return t >= resetTimeMs;
+  3741	      }
+  3742	      if (dashboardDateFilter === 'today') return t >= startOfToday;
+  3743	      if (dashboardDateFilter === 'yesterday') return t >= startOfYesterday && t < startOfToday;
+  3744	      if (dashboardDateFilter === '7days') return t >= startOf7Days;
+  3745	      if (dashboardDateFilter === '30days') return t >= startOf30Days;
+  3746	      return true; // 'all'
+  3747	    };
+  3748	
+  3749	    const dSales = sales.filter(s => inRange(s.date));
+  3750	    const dOtherAll = otherIncome.filter(o => inRange(o.date));
+  3751	    const dOther = dOtherAll.filter(o => o.destination !== 'manager'); // Only drawer income
+  3752	    const dManagerDebts = dOtherAll.filter(o => o.destination === 'manager'); // Manager collected debts
+  3753	    const dExpenses = expenses.filter(e => inRange(e.date));
+  3754	
+  3755	    const totalSalesVal = dSales.reduce((s, c) => s + c.total, 0);
+  3756	    const totalForfaitSalesVal = dOther.filter(o => o.category === 'forfait').reduce((s, c) => s + c.amount, 0);
+  3757	    const totalRechargeSalesVal = dOther.filter(o => o.category === 'recharge').reduce((s, c) => s + c.amount, 0);
+  3758	    const totalPhotoSalesVal = dOther.filter(o => o.category === 'photo').reduce((s, c) => s + c.amount, 0);
+  3759	    const totalServiceSalesVal = dOther.filter(o => o.category === 'service').reduce((s, c) => s + c.amount, 0);
+  3760	    const totalDebtPaymentSalesVal = dOther.filter(o => o.category === 'debt_payment').reduce((s, c) => s + c.amount, 0);
+  3761	    const totalManagerDebtPaymentVal = dManagerDebts.reduce((s, c) => s + c.amount, 0);
+  3762	    
+  3763	    const totalServicesAndOthersVal = dOther.filter(o => o.category !== 'forfait' && o.category !== 'recharge').reduce((s, c) => s + c.amount, 0);
+  3764	    const totalOtherVal = dOther.reduce((s, c) => s + c.amount, 0);
+  3765	    const totalExpensesVal = dExpenses.reduce((s, c) => s + c.amount, 0);
+  3766	
+  3767	    // Profit calculations for selected period (includes commissions from all categories and all destinations)
+  3768	    const totalBuyCostOfSalesVal = dSales.reduce((s, c) => s + ((c.unitBuy || 0) * c.qty), 0);
+  3769	    const totalItemProfitsVal = totalSalesVal - totalBuyCostOfSalesVal;
+  3770	    const totalOtherProfitsVal = dOtherAll.reduce((s, c) => s + (c.commission || 0), 0);
+  3771	    const netProfitVal = totalItemProfitsVal + totalOtherProfitsVal - totalExpensesVal;
+  3772	
+  3773	    const totalCashInflow = totalSalesVal + totalOtherVal;
+  3774	    
+  3775	    // Expected Cash in register calculation:
+  3776	    let expectedCashInHandVal = 0;
+  3777	    let withdrawnAmountForFormula = 0;
+  3778	
+  3779	    if (dashboardDateFilter === 'shift') {
+  3780	      expectedCashInHandVal = cashRegister + totalCashInflow - totalExpensesVal;
+  3781	    } else if (dashboardDateFilter === 'today') {
+  3782	      const todayLogs = shiftLogs.filter(s => new Date(s.timestamp).getTime() >= startOfToday);
+  3783	      withdrawnAmountForFormula = todayLogs.reduce((sum, s) => sum + (s.cashWithdrawn || 0), 0);
+  3784	      expectedCashInHandVal = cashRegister + totalCashInflow - totalExpensesVal - withdrawnAmountForFormula;
+  3785	    } else if (dashboardDateFilter === 'all') {
+  3786	      withdrawnAmountForFormula = shiftLogs.reduce((sum, s) => sum + (s.cashWithdrawn || 0), 0);
+  3787	      expectedCashInHandVal = cashRegister + totalCashInflow - totalExpensesVal - withdrawnAmountForFormula;
+  3788	    } else {
+  3789	      expectedCashInHandVal = totalCashInflow - totalExpensesVal;
+  3790	    }
+  3791	
+  3792	    return {
+  3793	      dSales,
+  3794	      dOther,
+  3795	      dManagerDebts,
+  3796	      dExpenses,
+  3797	      totalSales: totalSalesVal,
+  3798	      totalForfaitSales: totalForfaitSalesVal,
+  3799	      totalRechargeSales: totalRechargeSalesVal,
+  3800	      totalPhotoSales: totalPhotoSalesVal,
+  3801	      totalServiceSales: totalServiceSalesVal,
+  3802	      totalDebtPaymentSales: totalDebtPaymentSalesVal,
+  3803	      totalManagerDebtPayment: totalManagerDebtPaymentVal,
+  3804	      totalServicesAndOthers: totalServicesAndOthersVal,
+  3805	      totalOther: totalOtherVal,
+  3806	      totalExpenses: totalExpensesVal,
+  3807	      totalCashInflow,
+  3808	      totalBuyCostOfSales: totalBuyCostOfSalesVal,
+  3809	      netProfit: netProfitVal,
+  3810	      expectedCashInHand: expectedCashInHandVal,
+  3811	      withdrawnAmountForFormula
+  3812	    };
+  3813	  }, [sales, otherIncome, expenses, cashRegister, dashboardDateFilter, lastCashResetTimestamp, shiftLogs]);
+  3814	
+  3815	  const {
+  3816	    dOther,
+  3817	    totalSales,
+  3818	    totalForfaitSales,
+  3819	    totalRechargeSales,
+  3820	    totalPhotoSales,
+  3821	    totalServiceSales,
+  3822	    totalDebtPaymentSales,
+  3823	    totalManagerDebtPayment,
+  3824	    totalServicesAndOthers,
+  3825	    totalOther,
+  3826	    totalExpenses,
+  3827	    totalCashInflow,
+  3828	    totalBuyCostOfSales,
+  3829	    netProfit,
+  3830	    expectedCashInHand
+  3831	  } = filteredDashboardData;
+  3832	
+  3833	  const totalOwed = debts.filter(d => d.status === 'open').reduce((s, d) => s + (d.amount - d.paid), 0);
+  3834	
+  3835	  // Smart Customer Grouping and Debt Calculations
+  3836	  const groupedCustomerDebts = useMemo(() => {
+  3837	    return groupDebtsByCustomer(debts);
+  3838	  }, [debts]);
+  3839	
+  3840	  const openCustomerGroups = useMemo(() => {
+  3841	    return groupedCustomerDebts.filter(g => g.totalRemaining > 0.001 && (
+  3842	      !debtSearch || 
+  3843	      g.allNames.some(n => normalizeArabic(n).includes(normalizeArabic(debtSearch))) ||
+  3844	      (g.phone && g.phone.includes(debtSearch))
+  3845	    ));
+  3846	  }, [groupedCustomerDebts, debtSearch]);
+  3847	
+  3848	  const paidCustomerGroups = useMemo(() => {
+  3849	    return groupedCustomerDebts.filter(g => g.totalRemaining <= 0.001);
+  3850	  }, [groupedCustomerDebts]);
+  3851	
+  3852	  // Real-time suggestions for manual debt input
+  3853	  const manualDebtSuggestions = useMemo(() => {
+  3854	    return findCustomerSuggestions(manualDebt.name, manualDebt.phone, debts, 45);
+  3855	  }, [manualDebt.name, manualDebt.phone, debts]);
+  3856	
+  3857	  // Top fuzzy match for manual debt (for smart detection alert)
+  3858	  const topManualDebtMatch = useMemo(() => {
+  3859	    if (!manualDebt.name || manualDebt.name.trim().length < 2) return null;
+  3860	    const suggestions = findCustomerSuggestions(manualDebt.name, manualDebt.phone, debts, 60);
+  3861	    if (suggestions.length === 0) return null;
+  3862	    const top = suggestions[0];
+  3863	    // If exact name string is already typed, don't show the "Did you mean" prompt
+  3864	    if (top.canonicalName.trim().toLowerCase() === manualDebt.name.trim().toLowerCase()) {
+  3865	      return null;
+  3866	    }
+  3867	    return top;
+  3868	  }, [manualDebt.name, manualDebt.phone, debts]);
+  3869	
+  3870	  // Real-time suggestions for POS cart credit/debt input
+  3871	  const invoiceCustomerSuggestions = useMemo(() => {
+  3872	    return findCustomerSuggestions(invoiceCustomerName, invoiceCustomerPhone, debts, 45);
+  3873	  }, [invoiceCustomerName, invoiceCustomerPhone, debts]);
+  3874	
+  3875	  const topInvoiceCustomerMatch = useMemo(() => {
+  3876	    if (!invoiceCustomerName || invoiceCustomerName.trim().length < 2) return null;
+  3877	    const suggestions = findCustomerSuggestions(invoiceCustomerName, invoiceCustomerPhone, debts, 60);
+  3878	    if (suggestions.length === 0) return null;
+  3879	    const top = suggestions[0];
+  3880	    if (top.canonicalName.trim().toLowerCase() === invoiceCustomerName.trim().toLowerCase()) {
+  3881	      return null;
+  3882	    }
+  3883	    return top;
+  3884	  }, [invoiceCustomerName, invoiceCustomerPhone, debts]);
+  3885	
+  3886	  // Render variables
+  3887	  const openDebts = debts.filter(d => d.status === 'open' && (!debtSearch || normalizeArabic(d.customerName).includes(normalizeArabic(debtSearch))));
+  3888	  const paidDebts = debts.filter(d => d.status === 'paid').slice(-8).reverse();
+  3889	  const lowStockItems = items.filter(i => i.qty <= 3);
+  3890	
+  3891	  // Grouped counters for each category
+  3892	  const categoryTotals = useMemo(() => {
+  3893	    const totals = {
+  3894	      phone: { count: 0, qty: 0 },
+  3895	      battery: { count: 0, qty: 0 },
+  3896	      speaker: { count: 0, qty: 0 },
+  3897	      bluetooth: { count: 0, qty: 0 },
+  3898	      accessory: { count: 0, qty: 0 }
+  3899	    };
+  3900	    items.forEach(i => {
+  3901	      const cat = (i.category || 'accessory') as keyof typeof totals;
+  3902	      if (totals[cat]) {
+  3903	        totals[cat].count += 1;
+  3904	        totals[cat].qty += i.qty;
+  3905	      } else {
+  3906	        totals.accessory.count += 1;
+  3907	        totals.accessory.qty += i.qty;
+  3908	      }
+  3909	    });
+  3910	    return totals;
+  3911	  }, [items]);
+  3912	
+  3913	  const filteredItems = items.filter(i => {
+  3914	    const matchesSearch = !stockSearch || normalizeArabic(i.name).includes(normalizeArabic(stockSearch));
+  3915	    const cat = i.category || 'accessory';
+  3916	    const matchesCategory = selectedStockCategory === 'all' || cat === selectedStockCategory;
+  3917	    return matchesSearch && matchesCategory;
+  3918	  });
+  3919	
+  3920	  // Calculate popularity map based on sales history
+  3921	  const salesCountMap = useMemo(() => {
+  3922	    const map: Record<string, number> = {};
+  3923	    for (const s of sales) {
+  3924	      if (s.itemId) {
+  3925	        map[s.itemId] = (map[s.itemId] || 0) + (s.qty || 1);
+  3926	      }
+  3927	    }
+  3928	    return map;
+  3929	  }, [sales]);
+  3930	
+  3931	  // Smart Multilingual & Popularity Ranked Items Search for Selling
+  3932	  const smartFilteredSellItems = useMemo(() => {
+  3933	    if (!sellSearch.trim() && selectedSellCategory === 'all') {
+  3934	      return [...items].sort((a, b) => {
+  3935	        const popA = salesCountMap[a.id] || 0;
+  3936	        const popB = salesCountMap[b.id] || 0;
+  3937	        if (popB !== popA) return popB - popA;
+  3938	        return b.qty - a.qty;
+  3939	      });
+  3940	    }
+  3941	
+  3942	    return items
+  3943	      .map(item => {
+  3944	        const cat = item.category || 'accessory';
+  3945	        if (selectedSellCategory !== 'all' && cat !== selectedSellCategory) {
+  3946	          return { item, score: 0 };
+  3947	        }
+  3948	        const score = calculateSmartMatchScore(item, sellSearch, salesCountMap);
+  3949	        return { item, score };
+  3950	      })
+  3951	      .filter(x => x.score > 0)
+  3952	      .sort((a, b) => b.score - a.score)
+  3953	      .map(x => x.item);
+  3954	  }, [items, sellSearch, selectedSellCategory, salesCountMap]);
+  3955	
+  3956	  const sellFilteredItems = smartFilteredSellItems;
+  3957	
+  3958	  // Quick Add Item to Cart & Auto-focus for continuous keyboard workflow
+  3959	  const handleQuickAddItemToCart = (item: Item, customQty?: number) => {
+  3960	    if (!item) return;
+  3961	    const qtyVal = customQty || parseInt(sellQty) || 1;
+  3962	    if (qtyVal <= 0) return triggerToast('❌ كمية غير صالحة');
+  3963	
+  3964	    const cartAlready = cart.filter(c => c.type === 'item' && c.itemId === item.id).reduce((s, c) => s + c.qty, 0);
+  3965	    if (qtyVal + cartAlready > item.qty) {
+  3966	      return triggerToast(`❌ المخزن غير كافي! المتوفر حالياً: ${item.qty - cartAlready}`);
+  3967	    }
+  3968	
+  3969	    const override = parseFloat(sellPriceOverride);
+  3970	    const finalPrice = !isNaN(override) && override >= 0 ? override : item.sell;
+  3971	
+  3972	    const newLine: CartLine = {
+  3973	      id: Math.random().toString(36).slice(2, 9),
+  3974	      type: 'item',
+  3975	      itemId: item.id,
+  3976	      label: item.name,
+  3977	      qty: qtyVal,
+  3978	      unitPrice: finalPrice,
+  3979	      unitBuy: item.buy,
+  3980	      total: qtyVal * finalPrice
+  3981	    };
+  3982	
+  3983	    setCart(prev => [...prev, newLine]);
+  3984	    setSellQty('1');
+  3985	    setSellPriceOverride('');
+  3986	    setSellSearch('');
+  3987	    setSearchSelectedIndex(-1);
+  3988	    setSellItemId(item.id);
+  3989	    triggerToast(`⚡ تم إضافة "${item.name}" للفاتورة`);
+  3990	
+  3991	    if (document.activeElement instanceof HTMLElement) {
+  3992	      document.activeElement.blur();
+  3993	    }
+  3994	  };
+  3995	
+  3996	  // Keyboard navigation on search input
+  3997	  const handleSellSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  3998	    if (smartFilteredSellItems.length === 0) return;
+  3999	
+  4000	    if (e.key === 'ArrowDown') {
+  4001	      e.preventDefault();
+  4002	      setSearchSelectedIndex(prev => Math.min(prev + 1, smartFilteredSellItems.length - 1));
+  4003	    } else if (e.key === 'ArrowUp') {
+  4004	      e.preventDefault();
+  4005	      setSearchSelectedIndex(prev => Math.max(prev - 1, 0));
+  4006	    } else if (e.key === 'Enter') {
+  4007	      e.preventDefault();
+  4008	      let targetItem: Item | null = null;
+  4009	
+  4010	      if (searchSelectedIndex >= 0 && searchSelectedIndex < smartFilteredSellItems.length) {
+  4011	        targetItem = smartFilteredSellItems[searchSelectedIndex];
+  4012	      } else if (smartFilteredSellItems.length === 1) {
+  4013	        targetItem = smartFilteredSellItems[0];
+  4014	      } else if (smartFilteredSellItems.length > 0) {
+  4015	        targetItem = smartFilteredSellItems[0];
+  4016	      }
+  4017	
+  4018	      if (targetItem) {
+  4019	        handleQuickAddItemToCart(targetItem);
+  4020	      }
+  4021	    } else if (e.key === 'Escape') {
+  4022	      setSellSearch('');
+  4023	      setSearchSelectedIndex(-1);
+  4024	    }
+  4025	  };
+  4026	
+  4027	  // Filtered History for Manager
+  4028	  const filteredHistory = useMemo(() => {
+  4029	    const rawSales = sales.map(s => ({
+  4030	      id: s.id,
+  4031	      itemId: s.itemId,
+  4032	      itemName: s.itemName,
+  4033	      qty: s.qty,
+  4034	      unitPrice: s.unitPrice,
+  4035	      unitBuy: s.unitBuy,
+  4036	      total: s.total,
+  4037	      date: s.date,
+  4038	      isSale: true,
+  4039	      category: 'item',
+  4040	      label: `${s.itemName} × ${s.qty}`,
+  4041	      icon: '🛍️'
+  4042	    }));
+  4043	
+  4044	    const rawOther = otherIncome.map(o => ({
+  4045	      id: o.id,
+  4046	      category: o.category,
+  4047	      label: o.label,
+  4048	      amount: o.amount,
+  4049	      commission: o.commission,
+  4050	      date: o.date,
+  4051	      isSale: false,
+  4052	      total: o.amount,
+  4053	      icon: o.category === 'recharge' ? '📶' : o.category === 'forfait' ? '🌐' : o.category === 'photo' ? '🪪' : '🔧'
+  4054	    }));
+  4055	
+  4056	    let combined = [...rawSales, ...rawOther];
+  4057	
+  4058	    // 1. Search Filter
+  4059	    if (historySearch.trim()) {
+  4060	      const q = normalizeArabic(historySearch.trim());
+  4061	      combined = combined.filter(item => normalizeArabic(item.label || '').includes(q));
+  4062	    }
+  4063	
+  4064	    // 2. Category Filter
+  4065	    if (historyCategory !== 'all') {
+  4066	      combined = combined.filter(item => item.category === historyCategory);
+  4067	    }
+  4068	
+  4069	    // 3. Date Filter
+  4070	    if (historyDateFilter !== 'all') {
+  4071	      const now = new Date();
+  4072	      const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  4073	      const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000;
+  4074	      const startOf7Days = startOfToday - 7 * 24 * 60 * 60 * 1000;
+  4075	      const startOf30Days = startOfToday - 30 * 24 * 60 * 60 * 1000;
+  4076	
+  4077	      combined = combined.filter(item => {
+  4078	        const itemTime = new Date(item.date).getTime();
+  4079	        if (historyDateFilter === 'today') {
+  4080	          return itemTime >= startOfToday;
+  4081	        } else if (historyDateFilter === 'yesterday') {
+  4082	          return itemTime >= startOfYesterday && itemTime < startOfToday;
+  4083	        } else if (historyDateFilter === '7days') {
+  4084	          return itemTime >= startOf7Days;
+  4085	        } else if (historyDateFilter === '30days') {
+  4086	          return itemTime >= startOf30Days;
+  4087	        }
+  4088	        return true;
+  4089	      });
+  4090	    }
+  4091	
+  4092	    return combined.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+  4093	  }, [sales, otherIncome, historySearch, historyCategory, historyDateFilter]);
+  4094	
+  4095	  return (

@@ -1,0 +1,98 @@
+1 1   const handleDeleteDebt = async (id: string) => {
+2 1     const debt = debts.find(d => d.id === id);
+3 1     if (!debt) return;
+4 1     if (!await promptAndVerifyPin(\`هل ترغب بحذف ملف دين الحريف "\${debt.customerName}" نهائياً؟\`)) return;
+5 1 
+6 1     // 1. Rollback items, recharge cards, and forfait balances to inventory/balances
+7 1     const itemIncrements: Record<string, number> = {};
+8 1     const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
+9 1     const forfaitIncrements: Record<string, number> = {};
+10 1     let photoIncrement = 0;
+11 1 
+12 2     if (debt.lines) {
+13 3       for (const line of debt.lines) {
+14 4         if (line.type === 'item' && line.itemId) {
+15 4           itemIncrements[line.itemId] = (itemIncrements[line.itemId] || 0) + line.qty;
+16 3         }
+17 4         if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
+18 4           const normOp = normalizeOpName(line.cardOperator);
+19 4           const normVal = String(line.cardValue).trim();
+20 4           let card = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
+21 5           if (!card) {
+22 6             card = {
+23 6               id: \`std_card_\${normOp.replace(/\\s+/g, '')}_\${normVal}\`,
+24 6               kind: 'recharge',
+25 6               operator: normOp,
+26 6               value: normVal,
+27 6               qty: 0
+28 5             };
+29 4           }
+30 5           if (!cardIncrements[card.id]) {
+31 5             cardIncrements[card.id] = { entry: card, totalQty: 0 };
+32 4           }
+33 4           cardIncrements[card.id].totalQty += (line.qty || 1);
+34 3         }
+35 4         if (line.type === 'forfait' && line.cardOperator) {
+36 4           let opKey = line.cardOperator;
+37 5           if (opKey === 'Ooredoo 1005' || opKey === 'Ooredoo_1005') {
+38 5             opKey = 'Ooredoo_1005';
+39 5           } else if (opKey === 'Ooredoo 1006' || opKey === 'Ooredoo_1006') {
+40 5             opKey = 'Ooredoo_1006';
+41 5           } else if (opKey === 'Ooredoo') {
+42 5             opKey = 'Ooredoo_1005';
+43 4           }
+44 4           forfaitIncrements[opKey] = (forfaitIncrements[opKey] || 0) + (line.total || 0);
+45 3         }
+46 4         if (line.type === 'photo') {
+47 4           photoIncrement += (line.qty || 1);
+48 3         }
+49 2       }
+50 1     }
+51 1 
+52 1     const stockSteps: PendingStockStep[] = [];
+53 2     for (const itemId of Object.keys(itemIncrements)) {
+54 3       stockSteps.push({
+55 3         kind: 'item',
+56 3         targetId: itemId,
+57 3         qty: itemIncrements[itemId],
+58 3         opId: \`revert_inv_item_\${id}_\${itemId}\`,
+59 3         revertOpId: '',
+60 3         status: 'pending'
+61 2       });
+62 1     }
+63 2     for (const cardId of Object.keys(cardIncrements)) {
+64 2       const { totalQty } = cardIncrements[cardId];
+65 3       stockSteps.push({
+66 3         kind: 'card',
+67 3         targetId: cardId,
+68 3         qty: totalQty,
+69 3         opId: \`revert_inv_card_\${id}_\${cardId}\`,
+70 3         revertOpId: '',
+71 3         status: 'pending'
+72 2       });
+73 1     }
+74 2     for (const opKey of Object.keys(forfaitIncrements)) {
+75 3       stockSteps.push({
+76 3         kind: 'forfait',
+77 3         targetId: opKey,
+78 3         qty: forfaitIncrements[opKey],
+79 3         opId: \`revert_inv_forfait_\${id}_\${opKey}\`,
+80 3         revertOpId: '',
+81 3         status: 'pending'
+82 2       });
+83 1     }
+84 2     if (photoIncrement > 0) {
+85 3       stockSteps.push({
+86 3         kind: 'photo',
+87 3         targetId: 'photo',
+88 3         qty: photoIncrement,
+89 3         opId: \`revert_inv_photo_\${id}\`,
+90 3         revertOpId: '',
+91 3         status: 'pending'
+92 2       });
+93 1     }
+94 1 
+95 1     const relatedIncomes = otherIncome.filter(o => o.debtId === id);
+96 1     const incomeIdsToDelete = relatedIncomes.map(inc => inc.id);
+97 1 
+98 1     const pendingDelOpId = \`del_debt_\${id}\

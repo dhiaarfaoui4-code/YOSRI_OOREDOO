@@ -71,6 +71,8 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
   const [selectedItemToBind, setSelectedItemToBind] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [autoSelectedProduct, setAutoSelectedProduct] = useState<Item | null>(null);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [quickAddError, setQuickAddError] = useState<string | null>(null);
   
   // New Item Quick Add State
   const [showQuickAddForm, setShowQuickAddForm] = useState<boolean>(false);
@@ -84,6 +86,7 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const autoSelectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Start camera
   const startCamera = async () => {
@@ -124,14 +127,26 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
     if (isOpen) {
       startCamera();
     } else {
+      if (autoSelectTimerRef.current) {
+        clearTimeout(autoSelectTimerRef.current);
+        autoSelectTimerRef.current = null;
+      }
       stopCamera();
       setCapturedImage(null);
       setMatchResults([]);
       setShowQuickAddForm(false);
       setAutoSelectedProduct(null);
+      setAnalysisError(null);
+      setQuickAddError(null);
       setSearchQuery('');
     }
-    return () => stopCamera();
+    return () => {
+      if (autoSelectTimerRef.current) {
+        clearTimeout(autoSelectTimerRef.current);
+        autoSelectTimerRef.current = null;
+      }
+      stopCamera();
+    };
   }, [isOpen]);
 
   // Handle image capture from live camera stream
@@ -165,9 +180,14 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
 
   // Run Gemini Vision recognition via server-side endpoint
   const analyzeCapturedImage = async (dataUrl: string) => {
+    if (autoSelectTimerRef.current) {
+      clearTimeout(autoSelectTimerRef.current);
+      autoSelectTimerRef.current = null;
+    }
     setIsScanning(true);
     setMatchResults([]);
     setAutoSelectedProduct(null);
+    setAnalysisError(null);
     setScanStepMessage('⚡ جاري التحليل الفائق للسلعة بواسطة Gemini Vision...');
 
     try {
@@ -231,14 +251,15 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
       if (mode === 'sell' && results.length > 0 && results[0].overallScore >= 90) {
         const top = results[0];
         setAutoSelectedProduct(top.item);
-        setTimeout(() => {
+        autoSelectTimerRef.current = setTimeout(() => {
+          autoSelectTimerRef.current = null;
           onSelectProduct(top.item);
           onClose();
         }, 900);
       }
     } catch (err: any) {
       console.error('Gemini Vision analysis error:', err);
-      alert(`خطأ في التعرف على المنتج: ${err.message || 'يرجى المحاولة مجدداً'}`);
+      setAnalysisError(`خطأ في التعرف على المنتج: ${err.message || 'يرجى المحاولة مجدداً'}`);
     } finally {
       setIsScanning(false);
       setScanStepMessage('');
@@ -544,13 +565,24 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
                       <button
                         type="button"
                         onClick={() => {
-                          if (!newItemName.trim() || !newItemSell) return alert('الرجاء إدخال الاسم وسعر البيع');
+                          const sellVal = parseFloat(newItemSell);
+                          const buyVal = newItemBuy ? parseFloat(newItemBuy) : 0;
+                          const qtyVal = newItemQty ? parseInt(newItemQty, 10) : 1;
+                          if (!newItemName.trim() || !Number.isFinite(sellVal) || sellVal <= 0) {
+                            setQuickAddError('الرجاء إدخال الاسم وسعر بيع صحيح أكبر من 0.');
+                            return;
+                          }
+                          if ((Number.isFinite(buyVal) && buyVal < 0) || !Number.isFinite(qtyVal) || qtyVal < 0) {
+                            setQuickAddError('لا يمكن إدخال سعر أو كمية سالبة.');
+                            return;
+                          }
+                          setQuickAddError(null);
                           if (onAddNewItemWithImage && capturedImage) {
                             onAddNewItemWithImage(
                               newItemName.trim(),
-                              parseFloat(newItemSell) || 0,
-                              parseFloat(newItemBuy) || 0,
-                              parseInt(newItemQty) || 1,
+                              sellVal,
+                              Number.isFinite(buyVal) ? buyVal : 0,
+                              qtyVal,
                               newItemCategory,
                               capturedImage,
                               newItemBarcode.trim()
@@ -568,6 +600,12 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
                         <Plus size={14} /> إضافة للستوك
                       </button>
                     </div>
+                    {quickAddError && (
+                      <div className="bg-rose-50 border border-rose-300 text-rose-800 rounded-lg px-2.5 py-1.5 text-[11px] font-bold flex items-center gap-1.5">
+                        <AlertCircle size={13} className="shrink-0" />
+                        <span>{quickAddError}</span>
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div className="flex gap-2">
@@ -608,6 +646,13 @@ export const VisualProductRecognitionModal: React.FC<VisualProductRecognitionMod
                 {matchResults.length} مرشح
               </span>
             </div>
+
+            {analysisError && (
+              <div className="bg-rose-50 border border-rose-300 p-3 rounded-2xl text-rose-900 flex items-start gap-2 text-xs font-bold">
+                <AlertCircle size={16} className="text-rose-600 shrink-0 mt-0.5" />
+                <span>{analysisError}</span>
+              </div>
+            )}
 
             {/* Threshold Banner 1: > 90% Auto Selected */}
             {autoSelectedProduct && (

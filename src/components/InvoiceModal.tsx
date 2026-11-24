@@ -16,6 +16,7 @@ export interface InvoiceData {
   date: string;
   isDebt: boolean;
   customerName?: string;
+  customerPhone?: string;
   downPayment?: number;
 }
 
@@ -35,6 +36,7 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({ invoice, onClose }) 
     `فاتورة: ${invoice.id || ''}`,
     `التاريخ: ${dateStr}`,
     invoice.customerName ? `الحريف: ${invoice.customerName}` : null,
+    invoice.customerPhone ? `الهاتف: ${invoice.customerPhone}` : null,
     `المجموع: ${invoice.grandTotal.toFixed(3)} د.ت`,
     invoice.isDebt ? 'بيع بالدين' : 'بيع نقدي'
   ].filter(Boolean).join('\n');
@@ -46,7 +48,6 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({ invoice, onClose }) 
 
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
-      // If window.open is blocked, fallback to standard window.print() on the main page
       window.print();
       return;
     }
@@ -58,33 +59,85 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({ invoice, onClose }) 
         <meta charset="UTF-8">
         <title>فاتورة - Yosri GSM</title>
         <style>
-          body { font-family: system-ui, -apple-system, sans-serif; padding: 24px; color: #1c1a17; direction: rtl; }
-          h1 { color: #8c0a20; margin-bottom: 0; }
-          .shop-sub { color: #4a453d; font-size: 14px; margin-top: 2px; font-weight: 600; }
-          .sub { color: #8a8172; font-size: 13px; margin-top: 4px; }
-          .shop-info { margin-top: 10px; padding: 12px 16px; background: #f8f5ef; border-radius: 10px; font-size: 13px; color: #4a453d; line-height: 1.9; }
-          .shop-info b { color: #1c1a17; }
-          .customer-tag { display: inline-block; margin-top: 10px; background: #eef6f0; color: #2d6a3e; padding: 4px 12px; border-radius: 20px; font-size: 13px; }
+          * { box-sizing: border-box; }
+          body { font-family: system-ui, -apple-system, 'Segoe UI', Tahoma, Arial, sans-serif; padding: 24px; color: #1c1917; direction: rtl; margin: 0; }
+          .ltr-num, [dir="ltr"] { direction: ltr !important; unicode-bidi: isolate !important; display: inline-block; }
+          .text-center { text-align: center; }
+          .text-right { text-align: right; }
+          .text-left { text-align: left; }
+          .font-bold { font-weight: 700; }
+          .font-extrabold { font-weight: 800; }
+          .font-semibold { font-weight: 600; }
+          .font-medium { font-weight: 500; }
+          .font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+          .text-2xl { font-size: 22px; margin: 0; }
+          .text-sm { font-size: 14px; }
+          .text-xs { font-size: 12px; }
+          .text-\\[11px\\] { font-size: 11px; }
+          .text-\\[10px\\] { font-size: 10px; }
+          .text-red-700 { color: #b91c1c; }
+          .text-stone-800 { color: #292524; }
+          .text-stone-700 { color: #44403c; }
+          .text-stone-600 { color: #57534e; }
+          .text-stone-400 { color: #a8a29e; }
+          .text-emerald-700, .text-emerald-800 { color: #047857; }
+          .text-rose-700, .text-rose-800 { color: #be123c; }
+          .text-white { color: #ffffff; }
+          .bg-stone-50 { background-color: #fafaf9; }
+          .bg-stone-100 { background-color: #f5f5f4; }
+          .bg-emerald-50, .bg-emerald-50\\/50 { background-color: #ecfdf5; }
+          .bg-rose-50, .bg-rose-50\\/50 { background-color: #fff1f2; }
+          .bg-amber-50\\/50 { background-color: #fffbeb; }
+          .bg-red-700 { background-color: #b91c1c; }
+          .border { border: 1px solid #e7e5e4; }
+          .border-b { border-bottom: 1px solid #f5f5f4; }
+          .border-stone-100 { border-color: #f5f5f4; }
+          .border-stone-200 { border-color: #e7e5e4; }
+          .border-emerald-100 { border-color: #d1fae5; }
+          .border-rose-100 { border-color: #ffe4e6; }
+          .rounded-xl { border-radius: 12px; }
+          .rounded-lg { border-radius: 8px; }
+          .rounded-full { border-radius: 9999px; }
+          .p-1 { padding: 4px; }
+          .p-2 { padding: 8px; }
+          .p-3 { padding: 12px; }
+          .px-3 { padding-left: 12px; padding-right: 12px; }
+          .py-1 { padding-top: 4px; padding-bottom: 4px; }
+          .mt-1 { margin-top: 4px; }
+          .mt-3 { margin-top: 12px; }
+          .mt-4 { margin-top: 16px; }
+          .mt-5 { margin-top: 20px; }
+          .mt-6 { margin-top: 24px; }
+          .leading-relaxed { line-height: 1.75; }
+          .inline-block { display: inline-block; }
+          .flex { display: flex; }
+          .flex-wrap { flex-wrap: wrap; }
+          .flex-col { flex-direction: column; }
+          .items-center { align-items: center; }
+          .justify-center { justify-content: center; }
+          .gap-2 { gap: 8px; }
+          .w-full { width: 100%; }
+          .w-28 { width: 112px; }
+          .h-28 { height: 112px; }
           table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-          th { background: #8c0a20; color: #fff; padding: 8px; text-align: right; }
+          th { background: #b91c1c; color: #fff; padding: 8px; }
           td { padding: 8px; border-bottom: 1px solid #eee; }
-          .total-row td { font-weight: bold; font-size: 16px; padding-top: 14px; border-top: 2px solid #8c0a20; }
-          .debt-tag { display: inline-block; margin-top: 10px; background: #fbe9e5; color: #b3452f; padding: 4px 12px; border-radius: 20px; font-size: 13px; }
-          .qr-wrap { margin-top: 28px; text-align: center; }
-          .qr-wrap img { width: 130px; height: 130px; }
-          .qr-wrap .qr-label { color: #8a8172; font-size: 11px; margin-top: 6px; }
-          @media print { .no-print { display: none; } }
+          @media print {
+            body { padding: 12px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            .no-print { display: none !important; }
+          }
         </style>
       </head>
       <body>
         ${printContent.innerHTML}
         <div style="margin-top: 24px; text-align: center;" class="no-print">
-          <button onclick="window.print()" style="background: #8c0a20; color: white; border: none; padding: 10px 20px; border-radius: 8px; font-size: 14px; cursor: pointer;">🖨️ طباعة الفاتورة</button>
+          <button onclick="window.print()" style="background: #b91c1c; color: white; border: none; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer;">🖨️ طباعة الفاتورة</button>
         </div>
       </body>
       </html>
     `);
     printWindow.document.close();
+    printWindow.focus();
   };
 
   return (
@@ -107,18 +160,28 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({ invoice, onClose }) 
           <div className="text-center">
             <h1 className="text-2xl font-bold text-red-700 tracking-tight">Yosri GSM</h1>
             <div className="text-stone-700 font-semibold text-xs mt-1">بيع و تصليح الهاتف الجوال</div>
-            <div className="text-stone-400 text-[11px] mt-1">فاتورة بيع — {dateStr}</div>
+            <div className="text-stone-400 text-[11px] mt-1">
+              فاتورة بيع — <span dir="ltr" className="ltr-num inline-block">{dateStr}</span>
+            </div>
           </div>
 
           <div className="mt-4 p-3 bg-stone-50 rounded-xl text-stone-600 text-xs leading-relaxed border border-stone-100">
             📍 <span className="font-bold text-stone-800">العنوان:</span> نبر، الكاف<br />
-            📞 <span className="font-bold text-stone-800">الهاتف:</span> 41 444 355 — 98 674 871
+            📞 <span className="font-bold text-stone-800">الهاتف:</span>{' '}
+            <span dir="ltr" className="ltr-num inline-block font-mono font-semibold text-stone-800">41 444 355</span>
+            {' — '}
+            <span dir="ltr" className="ltr-num inline-block font-mono font-semibold text-stone-800">98 674 871</span>
           </div>
 
           <div className="flex flex-wrap gap-2 mt-3">
             {invoice.customerName && (
               <span className="inline-block bg-emerald-50 text-emerald-700 px-3 py-1 rounded-full text-xs font-medium border border-emerald-100">
                 👤 الحريف: {invoice.customerName}
+              </span>
+            )}
+            {invoice.customerPhone && (
+              <span className="inline-block bg-stone-100 text-stone-700 px-3 py-1 rounded-full text-xs font-medium border border-stone-200">
+                📞 <span dir="ltr" className="ltr-num inline-block font-mono">{invoice.customerPhone}</span>
               </span>
             )}
             {invoice.isDebt ? (
@@ -144,26 +207,32 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({ invoice, onClose }) 
             </thead>
             <tbody>
               {invoice.lines.map((l, idx) => (
-                <tr key={idx} className="border-b border-stone-100">
+                <tr key={`${idx}-${l.name}-${l.qty}-${l.total}`} className="border-b border-stone-100">
                   <td className="p-2 font-medium text-stone-800">{l.name}</td>
-                  <td className="p-2 text-center text-stone-600">{l.qty}</td>
-                  <td className="p-2 text-center text-stone-600">{l.unitPrice.toFixed(3)}</td>
-                  <td className="p-2 text-left text-stone-800 font-bold">{l.total.toFixed(3)}</td>
+                  <td className="p-2 text-center text-stone-600"><span dir="ltr" className="ltr-num inline-block font-mono">{l.qty}</span></td>
+                  <td className="p-2 text-center text-stone-600"><span dir="ltr" className="ltr-num inline-block font-mono">{l.unitPrice.toFixed(3)}</span></td>
+                  <td className="p-2 text-left text-stone-800 font-bold"><span dir="ltr" className="ltr-num inline-block font-mono">{l.total.toFixed(3)}</span></td>
                 </tr>
               ))}
               <tr className="font-bold text-stone-900 bg-amber-50/50">
                 <td colSpan={3} className="p-3 text-right text-stone-700 text-sm">المجموع الكلي</td>
-                <td className="p-3 text-left text-red-700 text-sm font-extrabold">{invoice.grandTotal.toFixed(3)} د.ت</td>
+                <td className="p-3 text-left text-red-700 text-sm font-extrabold">
+                  <span dir="ltr" className="ltr-num inline-block font-mono">{invoice.grandTotal.toFixed(3)}</span> د.ت
+                </td>
               </tr>
               {invoice.isDebt && invoice.downPayment !== undefined && invoice.downPayment > 0 && (
                 <>
                   <tr className="text-stone-700 bg-emerald-50/50 text-xs font-bold">
                     <td colSpan={3} className="p-2 text-right text-emerald-800">الدفعة الأولى (تسبيق نقدي)</td>
-                    <td className="p-2 text-left text-emerald-800 font-extrabold">{invoice.downPayment.toFixed(3)} د.ت</td>
+                    <td className="p-2 text-left text-emerald-800 font-extrabold">
+                      <span dir="ltr" className="ltr-num inline-block font-mono">{invoice.downPayment.toFixed(3)}</span> د.ت
+                    </td>
                   </tr>
                   <tr className="text-stone-900 bg-rose-50/50 text-xs font-bold">
                     <td colSpan={3} className="p-2 text-right text-rose-800">المتبقي بالدين</td>
-                    <td className="p-2 text-left text-rose-800 font-extrabold">{Math.max(0, invoice.grandTotal - invoice.downPayment).toFixed(3)} د.ت</td>
+                    <td className="p-2 text-left text-rose-800 font-extrabold">
+                      <span dir="ltr" className="ltr-num inline-block font-mono">{Math.max(0, invoice.grandTotal - invoice.downPayment).toFixed(3)}</span> د.ت
+                    </td>
                   </tr>
                 </>
               )}
@@ -173,7 +242,9 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({ invoice, onClose }) 
           {/* QR Code */}
           <div className="mt-6 flex flex-col items-center justify-center">
             <img src={qrImgUrl} alt="QR Code" className="w-28 h-28 border border-stone-200 p-1 rounded-lg shadow-xs" />
-            <span className="text-[10px] text-stone-400 mt-1">رمز الفاتورة: {invoice.id}</span>
+            <span className="text-[10px] text-stone-400 mt-1">
+              رمز الفاتورة: <span dir="ltr" className="ltr-num inline-block font-mono">{invoice.id}</span>
+            </span>
           </div>
         </div>
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Sale, OtherIncome, Expense } from '../types';
 
 interface ShiftHandoverModalProps {
@@ -38,13 +38,11 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
   onFlushOutbox,
   onPerformReset
 }) => {
-  if (!isOpen) return null;
-
   const salesTotal = currentShiftSales.reduce((sum, s) => sum + s.total, 0);
   const otherIncomeTotal = currentShiftOtherIncome.reduce((sum, o) => sum + o.amount, 0);
   const expensesTotal = currentShiftExpenses.reduce((sum, e) => sum + e.amount, 0);
   const managerDebtTotal = currentShiftManagerDebtIncome.reduce((sum, o) => sum + o.amount, 0);
-  
+
   const expectedCash = startingCash + salesTotal + otherIncomeTotal - expensesTotal;
 
   const [sellerName, setSellerName] = useState('الوردية الصباحية');
@@ -52,6 +50,26 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
   const [newStartingCashInput, setNewStartingCashInput] = useState('0.000');
   const [notes, setNotes] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [confirmOutboxForce, setConfirmOutboxForce] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      setSellerName('الوردية الصباحية');
+      setActualCashInput(expectedCash.toFixed(3));
+      setNewStartingCashInput('0.000');
+      setNotes('');
+      setIsSubmitting(false);
+      setConfirmOutboxForce(false);
+    }
+  }, [isOpen, expectedCash]);
+
+  useEffect(() => {
+    if (outboxCount === 0) {
+      setConfirmOutboxForce(false);
+    }
+  }, [outboxCount]);
+
+  if (!isOpen) return null;
 
   const actualCash = parseFloat(actualCashInput) || 0;
   const newStartingCash = parseFloat(newStartingCashInput) || 0;
@@ -62,14 +80,9 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
     e.preventDefault();
     if (isSubmitting) return;
 
-    if (outboxCount > 0) {
-      const confirmForce = window.confirm(
-        `⚠️ تحذير هام جداً:\nيوجد ${outboxCount} عملية مسجلة محلياً ولم تُرسل بعد للسحابة من هذا الجهاز!\n\n` +
-        `إذا قمت بالتصفير الآن دون إرسالها، فلن تُحسب هذه المبيعات في السيرفر السحابي وقد تسبب فارقاً في الكاش.\n\n` +
-        `يرجى التأكد من تشغيل الإنترنت والضغط على زر "إعادة محاولة إرسال العمليات".\n\n` +
-        `هل تريد التصفير والتسليم رغم ذلك؟`
-      );
-      if (!confirmForce) return;
+    if (outboxCount > 0 && !confirmOutboxForce) {
+      setConfirmOutboxForce(true);
+      return;
     }
 
     try {
@@ -139,6 +152,20 @@ export const ShiftHandoverModal: React.FC<ShiftHandoverModalProps> = ({
               <p className="leading-relaxed opacity-95">
                 هذه العمليات مسجلة محلياً على هذا الجهاز فقط. يرجى التأكد من تشغيل الواي فاي والضغط على زر الإرسال قبل التصفير لتفادي أي فارق بالصندوق.
               </p>
+              {confirmOutboxForce && (
+                <div className="bg-rose-900/90 border border-rose-300 rounded-xl p-2.5 space-y-2">
+                  <p className="font-black text-amber-200">
+                    ⚠️ تنبيه نهائي: التصفير قبل إرسال العمليات المعلقة قد يسبب فارقاً في حساب الكاش على السحابة. اضغط "تأكيد التصفير" مرة أخرى للمتابعة رغم ذلك.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmOutboxForce(false)}
+                    className="bg-white/20 hover:bg-white/30 text-white font-bold px-2.5 py-1 rounded-lg text-[10px] cursor-pointer"
+                  >
+                    تراجع عن التصفير القسري
+                  </button>
+                </div>
+              )}
             </div>
           )}
 

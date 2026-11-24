@@ -1,0 +1,186 @@
+  2615	
+  2616	  const handleExecuteDebtPayment = async (params: {
+  2617	    target: PayDebtModalTarget;
+  2618	    amount: number;
+  2619	    destination: 'drawer' | 'manager';
+  2620	    notes?: string;
+  2621	  }) => {
+  2622	    const { target, amount: payAmount, destination } = params;
+  2623	    if (payAmount <= 0) return;
+  2624	    const isToManager = destination === 'manager';
+  2625	
+  2626	    if (target.type === 'single' && target.debt) {
+  2627	      const debt = debts.find(d => d.id === target.debt!.id) || target.debt;
+  2628	      const remaining = Math.max(0, debt.amount - debt.paid);
+  2629	      const actualPayAmount = Math.min(payAmount, remaining);
+  2630	
+  2631	      // Calculate accurate profit portion for the payment based on historical debt line buy costs
+  2632	      let totalDebtCost = 0;
+  2633	      if (debt.lines) {
+  2634	        for (const line of debt.lines) {
+  2635	          if (line.type === 'item') {
+  2636	            const historicalBuy = typeof line.unitBuy === 'number'
+  2637	              ? line.unitBuy
+  2638	              : (line.itemId ? (items.find(i => i.id === line.itemId)?.buy || 0) : 0);
+  2639	            totalDebtCost += historicalBuy * (line.qty || 1);
+  2640	          }
+  2641	        }
+  2642	      }
+  2643	      const totalDebtAmount = debt.amount || 1;
+  2644	      const profitMarginRatio = Math.max(0, (totalDebtAmount - totalDebtCost) / totalDebtAmount);
+  2645	      const profitCommission = actualPayAmount * profitMarginRatio;
+  2646	
+  2647	      const incomeEntry: OtherIncome = {
+  2648	        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+  2649	        category: 'debt_payment',
+  2650	        label: `خلاص دين ${isToManager ? '(لجيب المدير)' : '(بالكاسة)'} - ${debt.customerName} (${debt.note || ''})`,
+  2651	        amount: actualPayAmount,
+  2652	        commission: profitCommission,
+  2653	        date: new Date().toISOString(),
+  2654	        debtId: debt.id,
+  2655	        destination: destination
+  2656	      };
+  2657	
+  2658	      const updatedDebt: Debt = {
+  2659	        ...debt,
+  2660	        paid: debt.paid + actualPayAmount,
+  2661	        status: (debt.paid + actualPayAmount >= debt.amount - 0.001) ? 'paid' : 'open'
+  2662	      };
+  2663	
+  2664	      // Optimistic local state update
+  2665	      setDebts(prev => prev.map(d => d.id === debt.id ? updatedDebt : d));
+  2666	      setOtherIncome(prev => [incomeEntry, ...prev]);
+  2667	
+  2668	      const payOpId = `pay_${incomeEntry.id}`;
+  2669	      const res1 = await safeIncrementDebtPaid(debt.id, actualPayAmount, 6, payOpId, debt.id);
+  2670	
+  2671	      if (res1.reason === 'not_found') {
+  2672	        // Debt was deleted on the server. Do not create income or phantom debt!
+  2673	        setDebts(prev => prev.filter(d => d.id !== debt.id));
+  2674	        setOtherIncome(prev => prev.filter(o => o.id !== incomeEntry.id));
+  2675	        triggerToast('❌ هذا الدين لم يعد موجوداً بالمخزن السحابي (قد تم حذفه مسبقاً)');
+  2676	        loadAllData();
+  2677	        return;
+  2678	      }
+  2679	
+  2680	      await patchWithOutbox(`/debts/${debt.id}.json`, { status: updatedDebt.status }, undefined, debt.id);
+  2681	      const ok2 = await putWithOutbox(`/otherIncome/${incomeEntry.id}.json`, incomeEntry, incomeEntry.id, debt.id);
+  2682	
+  2683	      if (res1.success && ok2.success) {
+  2684	        triggerToast(
+  2685	          isToManager
+  2686	            ? `💼 تم سداد ${actualPayAmount.toFixed(3)} د.ت لجيب المدير (خارج كاسة الوردية)`
+  2687	            : updatedDebt.status === 'paid' ? '🎉 تم سداد الدين بالكامل في الكاسة!' : `✅ تم تسجيل دفعة ${actualPayAmount.toFixed(3)} د.ت بالكاسة`
+  2688	        );
+  2689	        logAudit('sale', `تسديد دين ${debt.customerName}: ${actualPayAmount.toFixed(3)} د.ت [الوجهة: ${isToManager ? 'جيب المدير خارج الكاسة' : 'صندوق الكاسة'}]`);
+  2690	        loadAllData();
+  2691	      }
+  2692	    } else if (target.type === 'group' && target.group) {
+  2693	      const group = target.group;
+  2694	      let remainingToDistribute = payAmount;
+  2695	      const updatedDebtsToSave: Debt[] = [];
+  2696	      const incomeEntriesToSave: OtherIncome[] = [];
+  2697	
+  2698	      // Sort open debts oldest first
+  2699	      const sortedOpen = [...group.openDebts].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  2700	
+  2701	      for (const debt of sortedOpen) {
+  2702	        if (remainingToDistribute <= 0.0001) break;
+  2703	
+  2704	        const debtRemaining = Math.max(0, debt.amount - debt.paid);
+  2705	        const payForThisDebt = Math.min(debtRemaining, remainingToDistribute);
+  2706	
+  2707	        if (payForThisDebt > 0) {
+  2708	          remainingToDistribute -= payForThisDebt;
+  2709	
+  2710	          // Calculate profit margin ratio using historical debt line unitBuy
+  2711	          let totalDebtCost = 0;
+  2712	          if (debt.lines) {
+  2713	            for (const line of debt.lines) {
+  2714	              if (line.type === 'item') {
+  2715	                const historicalBuy = typeof line.unitBuy === 'number'
+  2716	                  ? line.unitBuy
+  2717	                  : (line.itemId ? (items.find(i => i.id === line.itemId)?.buy || 0) : 0);
+  2718	                totalDebtCost += historicalBuy * (line.qty || 1);
+  2719	              }
+  2720	            }
+  2721	          }
+  2722	          const totalDebtAmount = debt.amount || 1;
+  2723	          const profitMarginRatio = Math.max(0, (totalDebtAmount - totalDebtCost) / totalDebtAmount);
+  2724	          const profitCommission = payForThisDebt * profitMarginRatio;
+  2725	
+  2726	          const incomeEntry: OtherIncome = {
+  2727	            id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6) + Math.floor(Math.random() * 100),
+  2728	            category: 'debt_payment',
+  2729	            label: `خلاص دين ${isToManager ? '(لجيب المدير)' : '(بالكاسة)'} - ${group.canonicalName} (${debt.note || 'دين'})`,
+  2730	            amount: payForThisDebt,
+  2731	            commission: profitCommission,
+  2732	            date: new Date().toISOString(),
+  2733	            debtId: debt.id,
+  2734	            destination: destination
+  2735	          };
+  2736	
+  2737	          const updatedDebt: Debt = {
+  2738	            ...debt,
+  2739	            paid: debt.paid + payForThisDebt,
+  2740	            status: (debt.paid + payForThisDebt >= debt.amount - 0.001) ? 'paid' : 'open'
+  2741	          };
+  2742	
+  2743	          updatedDebtsToSave.push(updatedDebt);
+  2744	          incomeEntriesToSave.push(incomeEntry);
+  2745	        }
+  2746	      }
+  2747	
+  2748	      if (updatedDebtsToSave.length === 0) return;
+  2749	
+  2750	      // Optimistically update debts and otherIncome in state
+  2751	      setDebts(prev => {
+  2752	        const map = new Map(updatedDebtsToSave.map(d => [d.id, d]));
+  2753	        return prev.map(d => map.get(d.id) || d);
+  2754	      });
+  2755	      setOtherIncome(prev => [...incomeEntriesToSave, ...prev]);
+  2756	
+  2757	      // Persist each with dependency on debt.id
+  2758	      for (let i = 0; i < updatedDebtsToSave.length; i++) {
+  2759	        const d = updatedDebtsToSave[i];
+  2760	        const inc = incomeEntriesToSave[i];
+  2761	        const originalDebt = debts.find(x => x.id === d.id);
+  2762	        const originalPaid = originalDebt ? originalDebt.paid : 0;
+  2763	        const payDelta = d.paid - originalPaid;
+  2764	        const payOpId = `pay_${inc.id}`;
+  2765	        const res = await safeIncrementDebtPaid(d.id, payDelta, 6, payOpId, d.id);
+  2766	        if (res.reason === 'not_found') {
+  2767	          // Skip updating status and income for deleted debt
+  2768	          setDebts(prev => prev.filter(x => x.id !== d.id));
+  2769	          continue;
+  2770	        }
+  2771	        await patchWithOutbox(`/debts/${d.id}.json`, { status: d.status }, undefined, d.id);
+  2772	        await putWithOutbox(`/otherIncome/${inc.id}.json`, inc, inc.id, d.id);
+  2773	      }
+  2774	
+  2775	      triggerToast(
+  2776	        isToManager
+  2777	          ? `💼 تم سداد ${payAmount.toFixed(3)} د.ت لجيب المدير وتوزيعها على ديون "${group.canonicalName}" (خارج الكاسة)`
+  2778	          : `🎉 تم تسجيل دفعة ${payAmount.toFixed(3)} د.ت بالكاسة وتوزيعها على ديون "${group.canonicalName}" بنجاح!`
+  2779	      );
+  2780	      logAudit('sale', `تسديد جماعي لديون الحريف ${group.canonicalName}: ${payAmount.toFixed(3)} د.ت على ${updatedDebtsToSave.length} دين [الوجهة: ${isToManager ? 'جيب المدير خارج الكاسة' : 'صندوق الكاسة'}]`);
+  2781	      loadAllData();
+  2782	    }
+  2783	  };
+  2784	
+  2785	  const handleDeleteDebt = async (id: string) => {
+  2786	    const debt = debts.find(d => d.id === id);
+  2787	    if (!debt) return;
+  2788	    if (!await promptAndVerifyPin(`هل ترغب بحذف ملف دين الحريف "${debt.customerName}" نهائياً؟`)) return;
+  2789	
+  2790	    // 1. Rollback items, recharge cards, and forfait balances to inventory/balances
+  2791	    const itemIncrements: Record<string, number> = {};
+  2792	    const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
+  2793	    const forfaitIncrements: Record<string, number> = {};
+  2794	    let photoIncrement = 0;
+  2795	
+  2796	    if (debt.lines) {
+  2797	      for (const line of debt.lines) {
+  2798	        if (line.type === 'item' && line.itemId) {
+  2799	          itemIncrements[line.itemId] = (itemIncrements[line.itemId] || 0) + line.qty;
+  2800	        }

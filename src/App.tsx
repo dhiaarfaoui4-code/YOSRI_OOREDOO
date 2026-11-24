@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback, useDeferredValue } from 'react';
 import { 
   TrendingUp, Plus, Minus, Search, Trash2, ShieldAlert, CreditCard, 
   History, Settings as SettingsIcon, Package, Phone, FileText, Check, 
@@ -9,16 +9,20 @@ import {
   MessageCircle, Link2, Briefcase, Building2
 } from 'lucide-react';
 import { 
-  Item, Sale, OtherIncome, Debt, CardStockEntry, Expense, 
-  ForfaitPlan, ForfaitBalance, AuditLogEntry, AppTab, AppRole, SparePart, ShiftLog 
+  Item, Sale, OtherIncome, Debt, DebtLine, CardStockEntry, Expense, 
+  ForfaitPlan, ForfaitBalance, AuditLogEntry, AppTab, AppRole, SparePart,
+  PendingSale, PendingSaleLine, PendingStockStep, PendingDebtPayment, PendingDebtPaymentStatus, PendingDeleteDebt, PendingDeleteDebtStatus, PendingDeleteHistorySale, PendingDeleteHistorySaleStatus
 } from './types';
 import {
   ensureAuth, signInManager, resumeManagerSession, logoutManager,
   fetchJsonWithRetry, safeDecrementItemQty, safeIncrementItemQty,
+  safeDecrementForfait, safeIncrementForfait,
+  safeIncrementSparePartQty, safeDecrementSparePartQty, safeIncrementDebtPaid,
   safeDecrementCardQty, safeIncrementCardQty,
   safeDecrementPhotoStock, safeIncrementPhotoStock,
   putWithOutbox, patchWithOutbox, flushOutbox, dbUrl, verifyManagerPinViaAuth,
-  updateManagerPinViaAuth, subscribeOutboxChange, loadOutbox, clearOutboxForPaths
+  updateManagerPinViaAuth, subscribeOutboxChange, loadOutbox, clearOutboxForPaths, saveOutboxList,
+  loadPendingSales, savePendingSale, removePendingSale, loadPendingDebtPayments, savePendingDebtPayment, removePendingDebtPayment, loadPendingDeleteDebts, savePendingDeleteDebt, removePendingDeleteDebt, loadPendingDeleteHistorySales, savePendingDeleteHistorySale, removePendingDeleteHistorySale
 } from './firebase';
 import { SvgChart } from './components/SvgChart';
 import { InvoiceModal, InvoiceData } from './components/InvoiceModal';
@@ -28,15 +32,22 @@ import { VisualProductRecognitionModal } from './components/VisualProductRecogni
 import { DuplicateProductModal } from './components/DuplicateProductModal';
 import { ShiftHandoverModal } from './components/ShiftHandoverModal';
 import { PayDebtModal, PayDebtModalTarget } from './components/PayDebtModal';
+import { DebtsTab } from './components/DebtsTab';
 import { findSimilarProducts, recordLearningDecision, SimilarityResult } from './utils/productSimilarity';
 import { 
-  groupDebtsByCustomer, findCustomerSuggestions, assessCustomerSimilarity,
+  groupDebtsByCustomer, findCustomerSuggestionsFromGroups, assessCustomerSimilarity,
   CustomerDebtGroup, CustomerSuggestion
 } from './utils/customerDebtMatcher';
 
-// Helper to normalize Arabic
+const APP_NORM_ARABIC_CACHE = new Map<string, string>();
+
+// Helper to normalize Arabic (memoized)
 function normalizeArabic(str: string): string {
-  return (str || '')
+  if (!str) return '';
+  const cached = APP_NORM_ARABIC_CACHE.get(str);
+  if (cached !== undefined) return cached;
+
+  const res = str
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .normalize("NFC")
@@ -48,6 +59,12 @@ function normalizeArabic(str: string): string {
     .replace(/ئ/g, 'ي')
     .replace(/[\u064B-\u0652]/g, '')
     .trim();
+
+  if (APP_NORM_ARABIC_CACHE.size >= 3000) {
+    APP_NORM_ARABIC_CACHE.clear();
+  }
+  APP_NORM_ARABIC_CACHE.set(str, res);
+  return res;
 }
 
 // Smart multilingual search normalization
@@ -260,6 +277,8 @@ export const normalizeOpName = (op?: string | null): string => {
   return t || 'Ooredoo';
 };
 
+export const roundTND = (n: number): number => Math.round((n + Number.EPSILON) * 1000) / 1000;
+
 export default function App() {
   // ---- Core States ----
   const [items, setItems] = useState<Item[]>([]);
@@ -268,8 +287,8 @@ export default function App() {
   const [debts, setDebts] = useState<Debt[]>([]);
   const [cardStock, setCardStock] = useState<CardStockEntry[]>([]);
   const [cashRegister, setCashRegister] = useState<number>(0);
+  const [startingCashInput, setStartingCashInput] = useState<string>('');
   const [lastCashResetTimestamp, setLastCashResetTimestamp] = useState<string | null>(null);
-  const [shiftLogs, setShiftLogs] = useState<ShiftLog[]>([]);
   const [showShiftHandoverModal, setShowShiftHandoverModal] = useState<boolean>(false);
   const [dashboardDateFilter, setDashboardDateFilter] = useState<'shift' | 'today' | 'yesterday' | '7days' | '30days' | 'all'>('shift');
   const [expenses, setExpenses] = useState<Expense[]>([]);
@@ -382,6 +401,65 @@ export default function App() {
     onConfirm: () => {},
   });
 
+  const [inputDialog, setInputDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    inputType: 'text' | 'number' | 'password' | 'select';
+    value: string;
+    placeholder?: string;
+    step?: string;
+    min?: string;
+    options?: { value: string; label: string; icon?: string }[];
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    inputType: 'text',
+    value: ''
+  });
+  const inputResolverRef = useRef<((val: string | null) => void) | null>(null);
+
+  const openInputDialog = useCallback((opts: {
+    title: string;
+    message: string;
+    inputType?: 'text' | 'number' | 'password' | 'select';
+    defaultValue?: string;
+    placeholder?: string;
+    step?: string;
+    min?: string;
+    options?: { value: string; label: string; icon?: string }[];
+  }): Promise<string | null> => {
+    if (inputResolverRef.current) {
+      inputResolverRef.current(null);
+      inputResolverRef.current = null;
+    }
+    return new Promise((resolve) => {
+      inputResolverRef.current = resolve;
+      setInputDialog({
+        isOpen: true,
+        title: opts.title,
+        message: opts.message,
+        inputType: opts.inputType || 'text',
+        value: opts.defaultValue ?? '',
+        placeholder: opts.placeholder,
+        step: opts.step,
+        min: opts.min,
+        options: opts.options
+      });
+    });
+  }, []);
+
+  const resolveInputDialog = useCallback((result: string | null) => {
+    const resolver = inputResolverRef.current;
+    inputResolverRef.current = null;
+    setInputDialog(prev => ({ ...prev, isOpen: false }));
+    if (resolver) resolver(result);
+  }, []);
+
+  const isSyncingRef = useRef<boolean>(false);
+  const isMergingCardsRef = useRef<boolean>(false);
+
   // ---- Form Inputs ----
   const [newItem, setNewItem] = useState({ name: '', barcode: '', buy: '', sell: '', qty: '', category: 'accessory', imageUrl: '' });
   const [duplicateCandidates, setDuplicateCandidates] = useState<SimilarityResult[]>([]);
@@ -394,7 +472,6 @@ export default function App() {
   const [newPlanName, setNewPlanName] = useState('');
   const [newPlanValidity, setNewPlanValidity] = useState('');
   const [newPlanPrice, setNewPlanPrice] = useState('');
-  const [manualDebt, setManualDebt] = useState({ name: '', phone: '', amount: '', note: '' });
   const [expenseInput, setExpenseInput] = useState({ desc: '', amount: '' });
   const [whatsappConfig, setWhatsappConfig] = useState<{ enabled: boolean; phone: string; apiKey: string }>({
     enabled: false,
@@ -453,9 +530,6 @@ export default function App() {
   const [stockSearch, setStockSearch] = useState('');
   const [selectedStockCategory, setSelectedStockCategory] = useState<string>('all');
   const [selectedSellCategory, setSelectedSellCategory] = useState<string>('all');
-  const [debtSearch, setDebtSearch] = useState('');
-  const [debtViewMode, setDebtViewMode] = useState<'grouped' | 'list'>('grouped');
-  const [expandedCustomerGroups, setExpandedCustomerGroups] = useState<Record<string, boolean>>({});
   const [auditLogSearch, setAuditLogSearch] = useState('');
   const [historySearch, setHistorySearch] = useState('');
   const [historyCategory, setHistoryCategory] = useState<'all' | 'item' | 'recharge' | 'forfait' | 'photo' | 'service'>('all');
@@ -486,7 +560,6 @@ export default function App() {
   const [historyLimit, setHistoryLimit] = useState(20);
   const [expensesLimit, setExpensesLimit] = useState(20);
   const [auditLimit, setAuditLimit] = useState(20);
-  const [shiftLogsLimit, setShiftLogsLimit] = useState(5);
 
   const triggerToast = (msg: string) => {
     setToastMsg(msg);
@@ -498,12 +571,486 @@ export default function App() {
     // Disabled to save Firebase database storage
   };
 
-  // First initialization load
+  // Helper to execute and verify rollbacks safely (BUG-4B-02)
+  
+  
+  const trySavePendingDebtPayment = (payment: PendingDebtPayment, newStatus: PendingDebtPaymentStatus): boolean => {
+    const prevStatus = payment.status;
+    payment.status = newStatus;
+    const ok = savePendingDebtPayment(payment);
+    if (!ok) {
+      payment.status = prevStatus;
+    }
+    return ok;
+  };
+
+  const trySavePendingSale = (pending: PendingSale, newStatus: PendingSale['status']): boolean => {
+    const old = pending.status;
+    pending.status = newStatus;
+    if (savePendingSale(pending)) return true;
+    pending.status = old;
+    return false;
+  };
+  const trySavePendingSaleStep = (pending: PendingSale, step: any, newStatus: string): boolean => {
+    const old = step.status;
+    step.status = newStatus;
+    if (savePendingSale(pending)) return true;
+    step.status = old;
+    return false;
+  };
+
+  const executeRollback = async (pending: PendingSale): Promise<boolean> => {
+    if (!pending.stockSteps || pending.stockSteps.length === 0) {
+      if (!trySavePendingSale(pending, 'rolled_back')) return false;
+      const removed = removePendingSale(pending.transactionId);
+      if (!removed) console.warn('Failed to remove rolled_back pending sale:', pending.transactionId);
+      return true;
+    }
+
+    if (!trySavePendingSale(pending, 'rollback_in_progress')) return false;
+
+    let allReversed = true;
+    for (const step of pending.stockSteps) {
+      if (step.status === 'completed') {
+        let revertOk = false;
+        try {
+          if (step.kind === 'item') {
+            const res = await safeIncrementItemQty(step.targetId, step.qty, undefined, 6, step.revertOpId);
+            revertOk = res?.success === true && !res?.pending;
+          } else if (step.kind === 'card') {
+            const res = await safeIncrementCardQty(step.targetId, step.qty, undefined, 6, step.revertOpId);
+            revertOk = res?.success === true && !res?.pending;
+          } else if (step.kind === 'forfait' && step.payload) {
+            const res = await safeIncrementForfait(step.payload, 6, step.revertOpId);
+            revertOk = res?.success === true && !res?.pending;
+          } else if (step.kind === 'photo') {
+            const res = await safeIncrementPhotoStock(step.qty, undefined, 6, step.revertOpId);
+            revertOk = res?.success === true && !res?.pending;
+          }
+        } catch (err) {
+          console.error('Error executing step reversal:', step, err);
+          revertOk = false;
+        }
+
+        if (revertOk) {
+          if (!trySavePendingSaleStep(pending, step, 'rolled_back')) { allReversed = false; }
+        } else {
+          allReversed = false;
+        }
+      }
+    }
+
+    if (allReversed) {
+      if (!trySavePendingSale(pending, 'rolled_back')) return false;
+      const removed = removePendingSale(pending.transactionId);
+      if (!removed) console.warn('Failed to remove rolled_back pending sale:', pending.transactionId);
+      return true;
+    }
+    return false;
+  };
+
+  // Helper to resume / recover incomplete sales after browser crash / refresh (State Machine Recovery)
+  
+  
+  const trySavePendingDeleteDebt = (del: PendingDeleteDebt, newStatus: PendingDeleteDebtStatus): boolean => {
+    const prev = del.status;
+    del.status = newStatus;
+    if (!savePendingDeleteDebt(del)) {
+      del.status = prev;
+      return false;
+    }
+    return true;
+  };
+
+  
+  const trySavePendingDeleteHistorySale = (del: PendingDeleteHistorySale, newStatus: PendingDeleteHistorySaleStatus): boolean => {
+    const prev = del.status;
+    del.status = newStatus;
+    if (!savePendingDeleteHistorySale(del)) {
+      del.status = prev;
+      return false;
+    }
+    return true;
+  };
+
+  const resumePendingDeleteHistorySales = async () => {
+    const pendings = loadPendingDeleteHistorySales();
+    for (const pending of pendings) {
+      try {
+        if (pending.status === 'created' || pending.status === 'stock_restore_in_progress') {
+          if (!trySavePendingDeleteHistorySale(pending, 'stock_restore_in_progress')) continue;
+          
+          let allStockCompleted = true;
+          for (const step of pending.stockSteps) {
+            if (step.status === 'completed') continue;
+            let res;
+            if (step.kind === 'item') {
+              res = await safeIncrementItemQty(step.targetId, step.qty, undefined, 6, step.opId);
+            } else if (step.kind === 'card') {
+              res = await safeIncrementCardQty(step.targetId, step.qty, undefined, 6, step.opId);
+            } else if (step.kind === 'forfait') {
+              res = await safeIncrementForfait({ [step.targetId]: step.qty }, 6, step.opId);
+            } else if (step.kind === 'photo') {
+              res = await safeIncrementPhotoStock(step.qty, undefined, 6, step.opId);
+            } else if (step.kind === 'debt_pay') {
+              // TargetId is debtId. qty is amount
+              // We pass amount as negative, safeIncrementDebtPaid takes amount. We should just pass it.
+              // Wait, safeIncrementDebtPaid takes `amount` (delta). In step.qty we will put -record.amount.
+              res = await safeIncrementDebtPaid(step.targetId, step.qty, 6, step.opId);
+            }
+            if (res && res.success && !res.pending) {
+              step.status = 'completed';
+              savePendingDeleteHistorySale(pending);
+            } else {
+              allStockCompleted = false;
+            }
+          }
+          if (allStockCompleted) {
+            if (!trySavePendingDeleteHistorySale(pending, 'stock_restore_completed')) continue;
+          } else {
+            continue; // Wait for network
+          }
+        }
+        
+        if (pending.status === 'stock_restore_completed' || pending.status === 'sale_delete_in_progress') {
+          if (!trySavePendingDeleteHistorySale(pending, 'sale_delete_in_progress')) continue;
+          
+          const path = pending.isSaleRecord ? `/sales/${pending.saleId}.json` : `/otherIncome/${pending.saleId}.json`;
+          const ok = await putWithOutbox(path, null);
+          
+          if (ok.success && !ok.pending) {
+            if (trySavePendingDeleteHistorySale(pending, 'completed')) {
+              removePendingDeleteHistorySale(pending.id);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Error resuming delete history sale', err);
+      }
+    }
+  };
+
+  const resumePendingDeleteDebts = async () => {
+    const pendings = loadPendingDeleteDebts();
+    for (const pending of pendings) {
+      try {
+        if (pending.status === 'created' || pending.status === 'stock_rollback_in_progress') {
+          if (!trySavePendingDeleteDebt(pending, 'stock_rollback_in_progress')) continue;
+          
+          let allStockCompleted = true;
+          for (const step of pending.stockSteps) {
+            if (step.status === 'completed') continue;
+            let res;
+            if (step.kind === 'item') {
+              res = await safeIncrementItemQty(step.targetId, step.qty, undefined, 6, step.opId);
+            } else if (step.kind === 'card') {
+              res = await safeIncrementCardQty(step.targetId, step.qty, undefined, 6, step.opId);
+            } else if (step.kind === 'forfait') {
+              res = await safeIncrementForfait({ [step.targetId]: step.qty }, 6, step.opId);
+            } else if (step.kind === 'photo') {
+              res = await safeIncrementPhotoStock(step.qty, undefined, 6, step.opId);
+            }
+            if (res && res.success && !res.pending) {
+              step.status = 'completed';
+              savePendingDeleteDebt(pending);
+            } else {
+              allStockCompleted = false;
+            }
+          }
+          if (allStockCompleted) {
+            if (!trySavePendingDeleteDebt(pending, 'stock_rollback_completed')) continue;
+          } else {
+            continue; // Wait for network
+          }
+        }
+        
+        if (pending.status === 'stock_rollback_completed' || pending.status === 'income_delete_in_progress') {
+          if (!trySavePendingDeleteDebt(pending, 'income_delete_in_progress')) continue;
+          let allIncomeDeleted = true;
+          for (const incId of pending.incomeIdsToDelete) {
+             const res = await putWithOutbox(`/otherIncome/${incId}.json`, null);
+             if (!res.success || res.pending) {
+                allIncomeDeleted = false;
+             }
+          }
+          if (allIncomeDeleted) {
+            if (!trySavePendingDeleteDebt(pending, 'debt_delete_in_progress')) continue;
+          } else {
+            continue; // Wait for network
+          }
+        }
+        
+        if (pending.status === 'debt_delete_in_progress') {
+           const ok = await putWithOutbox(`/debts/${pending.debtId}.json`, null);
+           if (ok.success && !ok.pending) {
+              if (trySavePendingDeleteDebt(pending, 'completed')) {
+                 removePendingDeleteDebt(pending.id);
+              }
+           }
+        }
+      } catch (err) {
+         console.error('Error resuming delete debt', err);
+      }
+    }
+  };
+
+  const resumePendingDebtPayments = async () => {
+    const pendings = loadPendingDebtPayments();
+    for (const pending of pendings) {
+      try {
+        if (pending.status === 'created' || pending.status === 'debt_in_progress') {
+          if (!trySavePendingDebtPayment(pending, 'debt_in_progress')) continue;
+          
+          const res1 = await safeIncrementDebtPaid(pending.debtId, pending.payAmount, 6, pending.id, pending.debtId);
+          if (res1.reason === 'not_found') {
+            // Debt was deleted, we can't pay it
+            if (!trySavePendingDebtPayment(pending, 'completed')) continue;
+            removePendingDebtPayment(pending.id);
+            continue;
+          }
+          if (res1.success && !res1.pending) {
+            if (!trySavePendingDebtPayment(pending, 'debt_completed')) continue;
+          } else {
+            continue; // Wait for network
+          }
+        }
+
+        if (pending.status === 'debt_completed' || pending.status === 'income_in_progress') {
+          if (!trySavePendingDebtPayment(pending, 'income_in_progress')) continue;
+          
+          await patchWithOutbox(`/debts/${pending.debtId}.json`, { status: pending.updatedDebtStatus }, undefined, pending.debtId);
+          const ok2 = await putWithOutbox(`/otherIncome/${pending.incomeId}.json`, pending.incomeEntry, pending.incomeId, pending.debtId);
+          
+          if (ok2.success && !ok2.pending) {
+            if (!trySavePendingDebtPayment(pending, 'completed')) continue;
+            removePendingDebtPayment(pending.id);
+          }
+        }
+      } catch (err) {
+        console.error('Error recovering pending debt payment:', pending, err);
+      }
+    }
+  };
+
+  const resumePendingSales = async () => {
+    const pendingList = loadPendingSales();
+    if (pendingList.length === 0) return;
+
+    for (const pending of pendingList) {
+      try {
+        const { transactionId, date, cart: pendingCart, grandTotal, isDebt, customerName, customerPhone, initialPayment, status } = pending;
+        
+        // 1. If in rollback state, attempt completing the reversal
+        if (status === 'rollback_in_progress') {
+          await executeRollback(pending);
+          continue;
+        }
+
+        // 2. Already finished or rolled back
+        if (status === 'rolled_back' || status === 'completed') {
+          const removed = removePendingSale(transactionId);
+          if (!removed) console.warn('Failed to verify deletion of pending sale', transactionId);
+          continue;
+        }
+
+        // 3. If in created / started / stock_in_progress, verify and execute remaining stock steps
+        if (status === 'created' || status === 'started' || status === 'stock_in_progress') {
+          let stockAllOk = true;
+          if (pending.stockSteps && pending.stockSteps.length > 0) {
+            for (const step of pending.stockSteps) {
+              if (step.status === 'pending') {
+                let stepRes: { success: boolean; pending?: boolean; reason?: string } = { success: false };
+                if (step.kind === 'item') {
+                  stepRes = await safeDecrementItemQty(step.targetId, step.qty, undefined, 6, step.opId);
+                } else if (step.kind === 'card') {
+                  stepRes = await safeDecrementCardQty(step.targetId, step.qty, undefined, 6, step.opId);
+                } else if (step.kind === 'forfait' && step.payload) {
+                  stepRes = await safeDecrementForfait(step.payload, 6, step.opId);
+                } else if (step.kind === 'photo') {
+                  stepRes = await safeDecrementPhotoStock(step.qty, undefined, 6, step.opId);
+                }
+
+                if (stepRes.success && !stepRes.pending) {
+                  if (!trySavePendingSaleStep(pending, step, 'completed')) { stockAllOk = false; break; }
+                } else if (!stepRes.success) {
+                  step.status = 'failed';
+                  stockAllOk = false;
+                  if (stepRes.reason === 'insufficient') {
+                    if (!trySavePendingSale(pending, 'rollback_in_progress')) return false;
+                    await executeRollback(pending);
+                    break;
+                  }
+                  break;
+                } else {
+                  // stepRes.success is true but pending is true (queued in outbox, not yet confirmed by Firebase)
+                  // Keep step.status as 'pending', do not mark completed or rollback
+                  stockAllOk = false;
+                  break;
+                }
+              }
+            }
+          }
+
+          const hasRemainingUncompleted = pending.stockSteps?.some(s => s.status === 'pending' || s.status === 'failed');
+          if (hasRemainingUncompleted || !stockAllOk || pending.status === 'rollback_in_progress') {
+            continue; // Stop recovery of this transaction until network is back or rollback completes
+          }
+
+          if (!trySavePendingSale(pending, 'stock_completed')) continue;
+        }
+
+        // 4. If stock is confirmed completed, proceed to write sales/debt records
+        if (pending.status === 'stock_completed' || pending.status === 'stock_decremented' || pending.status === 'records_in_progress') {
+          if (!trySavePendingSale(pending, 'records_in_progress')) continue;
+
+          let recordsAllOk = true;
+
+          if (isDebt) {
+            const initialPayVal = Math.min(grandTotal, Math.max(0, parseFloat(initialPayment || '') || 0));
+            const debtLines: DebtLine[] = pendingCart.map(c => {
+              let lineBuy = 0;
+              if (c.type === 'item') {
+                lineBuy = typeof c.unitBuy === 'number' ? c.unitBuy : (c.itemId ? (items.find(i => i.id === c.itemId)?.buy || 0) : 0);
+              }
+              return {
+                type: c.type,
+                itemId: c.itemId || null,
+                itemName: c.type === 'item' ? c.label : null,
+                qty: c.qty,
+                unitBuy: c.type === 'item' ? lineBuy : undefined,
+                unitPrice: c.unitPrice,
+                cardOperator: c.cardOperator || null,
+                cardValue: c.cardValue || null,
+                total: c.total
+              };
+            });
+
+            const newDebt: Debt = {
+              id: `${transactionId}_debt`,
+              customerName: customerName || 'حريف بدون اسم',
+              customerPhone: customerPhone || undefined,
+              note: pendingCart.map(c => c.label).join(' + '),
+              lines: debtLines,
+              amount: grandTotal,
+              paid: initialPayVal,
+              date,
+              status: (initialPayVal >= grandTotal - 0.001) ? 'paid' : 'open'
+            };
+
+            const resDebt = await putWithOutbox(`/debts/${newDebt.id}.json`, newDebt, newDebt.id);
+            if (!resDebt.success || resDebt.pending) {
+              recordsAllOk = false;
+            }
+
+            if (initialPayVal > 0) {
+              const totalDebtCost = debtLines.reduce((s, line) => {
+                if (line.type === 'item') {
+                  return s + ((line.unitBuy || 0) * (line.qty || 1));
+                }
+                return s;
+              }, 0);
+              const profitRatio = grandTotal > 0 ? Math.max(0, (grandTotal - totalDebtCost) / grandTotal) : 1;
+              const downPaymentCommission = initialPayVal * profitRatio;
+
+              const downPaymentIncome: OtherIncome = {
+                id: `${transactionId}_downpay`,
+                category: 'debt_payment',
+                label: `دفعة أولى / تسبيق دين - ${customerName || 'حريف'} (${pendingCart.map(c => c.label).join(' + ')})`,
+                amount: initialPayVal,
+                commission: downPaymentCommission,
+                date,
+                debtId: newDebt.id
+              };
+              const resDownpay = await putWithOutbox(`/otherIncome/${downPaymentIncome.id}.json`, downPaymentIncome, downPaymentIncome.id, newDebt.id);
+              if (!resDownpay.success || resDownpay.pending) {
+                recordsAllOk = false;
+              }
+            }
+          } else {
+            let lineIdx = 0;
+            for (const line of pendingCart) {
+              lineIdx++;
+              if (line.type === 'item') {
+                const sale: Sale = {
+                  id: `${transactionId}_s_${lineIdx}`,
+                  itemId: line.itemId || null,
+                  itemName: line.label,
+                  qty: line.qty,
+                  unitPrice: line.unitPrice,
+                  unitBuy: line.unitBuy || 0,
+                  total: line.total,
+                  date
+                };
+                const resSale = await putWithOutbox(`/sales/${sale.id}.json`, sale, sale.id);
+                if (!resSale.success || resSale.pending) {
+                  recordsAllOk = false;
+                }
+              } else {
+                const income: OtherIncome = {
+                  id: `${transactionId}_inc_${lineIdx}`,
+                  category: line.type,
+                  label: line.label,
+                  amount: line.total,
+                  commission: line.commission || 0,
+                  date,
+                  cardOperator: line.cardOperator || null,
+                  cardValue: line.cardValue || null,
+                  qty: line.qty || null
+                };
+                const resInc = await putWithOutbox(`/otherIncome/${income.id}.json`, income, income.id);
+                if (!resInc.success || resInc.pending) {
+                  recordsAllOk = false;
+                }
+              }
+            }
+          }
+
+          if (recordsAllOk) {
+            // Operation records are safely registered in Outbox/Firebase. Remove durable log entry!
+            if (!trySavePendingSale(pending, 'completed')) continue;
+            const removed = removePendingSale(transactionId);
+        if (!removed) console.warn('Failed to verify deletion of pending sale', transactionId);
+          } else {
+            // Keep pending sale alive in 'records_in_progress' for future retry
+          }
+        }
+      } catch (err) {
+        console.error('Error recovering pending sale:', pending, err);
+      }
+    }
+  };
+
+  const syncHandlersRef = useRef({
+    resumePendingDeleteHistorySales,
+    resumePendingDeleteDebts,
+    resumePendingDebtPayments,
+    resumePendingSales,
+    loadAllData: async () => {}
+  });
+
+  // First initialization load & periodic sync
   useEffect(() => {
     let active = true;
     const unsubOutbox = subscribeOutboxChange((count) => {
       if (active) setOutboxCount(count);
     });
+
+    async function runRecoveryAndSync() {
+      if (isSyncingRef.current) return;
+      isSyncingRef.current = true;
+      try {
+        await syncHandlersRef.current.resumePendingDeleteHistorySales();
+        await syncHandlersRef.current.resumePendingDeleteDebts();
+        await syncHandlersRef.current.resumePendingDebtPayments();
+        await syncHandlersRef.current.resumePendingSales();
+        await flushOutbox((sent) => {
+          if (active && sent > 0) triggerToast(`✅ تم إرسال ${sent} عملية معلقة من وضع عدم الاتصال`);
+        });
+        await syncHandlersRef.current.loadAllData();
+      } finally {
+        isSyncingRef.current = false;
+      }
+    }
 
     async function init() {
       setConnectionStatus('checking');
@@ -528,20 +1075,13 @@ export default function App() {
         await ensureAuth(2);
       }
 
-      // Try flushing outbox immediately
-      await flushOutbox((sent) => {
-        if (active) triggerToast(`✅ تم إرسال ${sent} عملية معلقة من وضع عدم الاتصال`);
-      });
-
-      // Load all data
-      await loadAllData();
+      await runRecoveryAndSync();
     }
     init();
 
-    // Setup periodic sync
+    // Setup periodic sync using live refs so state closures never go stale
     const interval = setInterval(() => {
-      loadAllData();
-      flushOutbox();
+      runRecoveryAndSync();
     }, 15000);
 
     return () => {
@@ -549,7 +1089,7 @@ export default function App() {
       unsubOutbox();
       clearInterval(interval);
     };
-  }, [currentRole]);
+  }, []);
 
   const handleManualFlushOutbox = async () => {
     triggerToast('🔄 جاري محاولة إرسال العمليات المعلقة بالسحابة...');
@@ -565,217 +1105,255 @@ export default function App() {
   };
 
   const loadAllData = async () => {
+    const safeFetch = async (path: string): Promise<{ ok: boolean; data: any }> => {
+      try {
+        const data = await fetchJsonWithRetry(path);
+        return { ok: true, data };
+      } catch {
+        return { ok: false, data: null };
+      }
+    };
+
     try {
       const results = await Promise.all([
-        fetchJsonWithRetry('/items.json').catch(() => null),
-        fetchJsonWithRetry('/sales.json').catch(() => null),
-        fetchJsonWithRetry('/otherIncome.json').catch(() => null),
-        fetchJsonWithRetry('/debts.json').catch(() => null),
-        fetchJsonWithRetry('/cardStock.json').catch(() => null),
-        fetchJsonWithRetry('/cashRegister.json').catch(() => 0),
-        fetchJsonWithRetry('/expenses.json').catch(() => null),
-        fetchJsonWithRetry('/forfaitPlans.json').catch(() => null),
-        fetchJsonWithRetry('/forfaitBalance.json').catch(() => null),
-        fetchJsonWithRetry('/photoPaperStock.json').catch(() => 0),
-        Promise.resolve(null),
-        fetchJsonWithRetry('/pin.json').catch(() => '1234'),
-        fetchJsonWithRetry('/whatsappConfig.json').catch(() => null),
-        fetchJsonWithRetry('/spareParts.json').catch(() => null),
-        fetchJsonWithRetry('/telegramConfig.json').catch(() => null),
-        fetchJsonWithRetry('/lastCashResetTimestamp.json').catch(() => null),
-        fetchJsonWithRetry('/shiftLogs.json').catch(() => null)
+        safeFetch('/items.json'),
+        safeFetch('/sales.json'),
+        safeFetch('/otherIncome.json'),
+        safeFetch('/debts.json'),
+        safeFetch('/cardStock.json'),
+        safeFetch('/cashRegister.json'),
+        safeFetch('/expenses.json'),
+        safeFetch('/forfaitPlans.json'),
+        safeFetch('/forfaitBalance.json'),
+        safeFetch('/photoPaperStock.json'),
+        Promise.resolve({ ok: true, data: null }),
+        safeFetch('/pin.json'),
+        safeFetch('/whatsappConfig.json'),
+        safeFetch('/spareParts.json'),
+        safeFetch('/telegramConfig.json'),
+        safeFetch('/lastCashResetTimestamp.json')
       ]);
 
       const [
-        itemsRaw, salesRaw, otherIncomeRaw, debtsRaw, cardStockRaw,
-        cashRegisterRaw, expensesRaw, plansRaw, balanceRaw, photoPaperStockRaw, auditRaw, pinRaw, whatsappConfigRaw,
-        sparePartsRaw, telegramConfigRaw, lastResetRaw, shiftLogsRaw
+        itemsRes, salesRes, otherIncomeRes, debtsRes, cardStockRes,
+        cashRegisterRes, expensesRes, plansRes, balanceRes, photoPaperStockRes, auditRes, pinRes, whatsappConfigRes,
+        sparePartsRes, telegramConfigRes, lastResetRes
       ] = results;
 
-      if (typeof lastResetRaw === 'string') {
-        setLastCashResetTimestamp(lastResetRaw);
+      const anyNetworkSuccess = [
+        itemsRes, salesRes, otherIncomeRes, debtsRes, cardStockRes,
+        cashRegisterRes, expensesRes, plansRes, balanceRes, photoPaperStockRes
+      ].some(r => r.ok);
+
+      if (!anyNetworkSuccess) {
+        setConnectionStatus('offline');
+        return;
       }
-      
-      const parsedLogs = parseRawWithKeys<ShiftLog>(shiftLogsRaw);
-      // Deduplicate shift logs created accidentally within 30 seconds with identical seller and expected cash
-      const uniqueLogs: ShiftLog[] = [];
-      const dupLogIdsToDelete: string[] = [];
-      parsedLogs.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
-      for (const log of parsedLogs) {
-        const isDup = uniqueLogs.some(existing => {
-          const timeDiff = Math.abs(new Date(existing.timestamp).getTime() - new Date(log.timestamp).getTime());
-          const sameSeller = (existing.sellerName || '') === (log.sellerName || '');
-          const sameSales = Math.abs((existing.salesTotal || 0) - (log.salesTotal || 0)) < 0.001;
-          const sameActual = Math.abs((existing.actualCashInDrawer || 0) - (log.actualCashInDrawer || 0)) < 0.001;
-          return timeDiff < 30000 && sameSeller && sameSales && sameActual;
-        });
+      if (lastResetRes.ok && typeof lastResetRes.data === 'string') {
+        setLastCashResetTimestamp(lastResetRes.data);
+      }
 
-        if (isDup) {
-          dupLogIdsToDelete.push(log.id);
-        } else {
-          uniqueLogs.push(log);
+      if (itemsRes.ok) setItems(parseRawWithKeys<Item>(itemsRes.data));
+      if (salesRes.ok) setSales(parseRawWithKeys<Sale>(salesRes.data));
+      if (otherIncomeRes.ok) setOtherIncome(parseRawWithKeys<OtherIncome>(otherIncomeRes.data));
+      if (debtsRes.ok) setDebts(parseRawWithKeys<Debt>(debtsRes.data));
+
+      if (cardStockRes.ok) {
+        const parsedCards = parseRawWithKeys<CardStockEntry>(cardStockRes.data);
+
+        // Group card stock by normalized operator and face value
+        const cardGroups: Record<string, CardStockEntry[]> = {};
+        for (const card of parsedCards) {
+          const normOp = normalizeOpName(card.operator);
+          const normVal = String(card.value).trim();
+          const groupKey = `${normOp}_${normVal}`;
+          if (!cardGroups[groupKey]) {
+            cardGroups[groupKey] = [];
+          }
+          cardGroups[groupKey].push(card);
         }
-      }
 
-      for (const dupId of dupLogIdsToDelete) {
-        putWithOutbox(`/shiftLogs/${dupId}.json`, null);
-      }
-      setShiftLogs(uniqueLogs);
+        const standardCardPairs = [
+          { operator: 'Ooredoo', value: '1' },
+          { operator: 'Ooredoo', value: '5' },
+          { operator: 'Orange', value: '1' },
+          { operator: 'Orange', value: '5' },
+          { operator: 'Tunisie Telecom', value: '1' },
+          { operator: 'Tunisie Telecom', value: '5' }
+        ];
 
-      setItems(parseRawWithKeys<Item>(itemsRaw));
-      setSales(parseRawWithKeys<Sale>(salesRaw));
-      setOtherIncome(parseRawWithKeys<OtherIncome>(otherIncomeRaw));
-      setDebts(parseRawWithKeys<Debt>(debtsRaw));
-
-      const parsedCards = parseRawWithKeys<CardStockEntry>(cardStockRaw);
-      
-      // Group card stock by normalized operator and face value
-      const cardGroups: Record<string, CardStockEntry[]> = {};
-      for (const card of parsedCards) {
-        const normOp = normalizeOpName(card.operator);
-        const normVal = String(card.value).trim();
-        const groupKey = `${normOp}_${normVal}`;
-        if (!cardGroups[groupKey]) {
-          cardGroups[groupKey] = [];
+        for (const std of standardCardPairs) {
+          const groupKey = `${std.operator}_${std.value}`;
+          if (!cardGroups[groupKey]) {
+            cardGroups[groupKey] = [];
+          }
         }
-        cardGroups[groupKey].push(card);
-      }
 
-      const standardCardPairs = [
-        { operator: 'Ooredoo', value: '1' },
-        { operator: 'Ooredoo', value: '5' },
-        { operator: 'Orange', value: '1' },
-        { operator: 'Orange', value: '5' },
-        { operator: 'Tunisie Telecom', value: '1' },
-        { operator: 'Tunisie Telecom', value: '5' }
-      ];
+        const consolidatedCards: CardStockEntry[] = [];
+        for (const groupKey of Object.keys(cardGroups)) {
+          const entries = cardGroups[groupKey];
+          const [op, val] = groupKey.split('_');
+          const canonicalId = `std_card_${op.replace(/\s+/g, '')}_${val}`;
 
-      for (const std of standardCardPairs) {
-        const groupKey = `${std.operator}_${std.value}`;
-        if (!cardGroups[groupKey]) {
-          cardGroups[groupKey] = [];
-        }
-      }
+          if (entries.length === 0) {
+            consolidatedCards.push({
+              id: canonicalId,
+              kind: 'recharge',
+              operator: op,
+              value: val,
+              qty: 0
+            });
+          } else if (entries.length === 1) {
+            const single = entries[0];
+            consolidatedCards.push({
+              ...single,
+              operator: op,
+              value: val
+            });
+          } else {
+            const totalSum = entries.reduce((s, c) => s + (c.qty || 0), 0);
+            const canonicalEntry = entries.find(e => e.id === canonicalId) || entries[0];
 
-      const consolidatedCards: CardStockEntry[] = [];
-      for (const groupKey of Object.keys(cardGroups)) {
-        const entries = cardGroups[groupKey];
-        const [op, val] = groupKey.split('_');
-        const canonicalId = `std_card_${op.replace(/\s+/g, '')}_${val}`;
+            const updatedCanonical: CardStockEntry = {
+              ...canonicalEntry,
+              id: canonicalEntry.id,
+              kind: 'recharge',
+              operator: op,
+              value: val,
+              qty: totalSum
+            };
+            consolidatedCards.push(updatedCanonical);
 
-        if (entries.length === 0) {
-          consolidatedCards.push({
-            id: canonicalId,
-            kind: 'recharge',
-            operator: op,
-            value: val,
-            qty: 0
-          });
-        } else if (entries.length === 1) {
-          const single = entries[0];
-          consolidatedCards.push({
-            ...single,
-            operator: op,
-            value: val
-          });
-        } else {
-          // Merge duplicates and clean up Firebase DB
-          const totalSum = entries.reduce((s, c) => s + (c.qty || 0), 0);
-          const canonicalEntry = entries.find(e => e.id === canonicalId) || entries[0];
-          const updatedCanonical: CardStockEntry = {
-            ...canonicalEntry,
-            id: canonicalEntry.id,
-            kind: 'recharge',
-            operator: op,
-            value: val,
-            qty: totalSum
-          };
-          consolidatedCards.push(updatedCanonical);
-
-          putWithOutbox(`/cardStock/${canonicalEntry.id}.json`, updatedCanonical);
-          for (const dup of entries) {
-            if (dup.id !== canonicalEntry.id) {
-              putWithOutbox(`/cardStock/${dup.id}.json`, null);
+            // Atomic stock merge to Firebase guarded against concurrent refreshes
+            if (!isMergingCardsRef.current) {
+              isMergingCardsRef.current = true;
+              (async () => {
+                try {
+                  for (const dup of entries) {
+                    if (dup.id !== canonicalEntry.id) {
+                      if (dup.qty > 0) {
+                        const incRes = await safeIncrementCardQty(canonicalEntry.id, dup.qty, canonicalEntry.qty);
+                        if (incRes.success && !incRes.pending) {
+                          await putWithOutbox(`/cardStock/${dup.id}.json`, null);
+                        }
+                      } else {
+                        await putWithOutbox(`/cardStock/${dup.id}.json`, null);
+                      }
+                    }
+                  }
+                } finally {
+                  isMergingCardsRef.current = false;
+                }
+              })();
             }
           }
         }
+        setCardStock(consolidatedCards);
       }
-      setCardStock(consolidatedCards);
-      setCashRegister(typeof cashRegisterRaw === 'number' ? cashRegisterRaw : 0);
-      setExpenses(parseRawWithKeys<Expense>(expensesRaw));
-      setSpareParts(parseRawWithKeys<SparePart>(sparePartsRaw));
-      if (whatsappConfigRaw) {
+
+      if (cashRegisterRes.ok) {
+        setCashRegister(typeof cashRegisterRes.data === 'number' ? cashRegisterRes.data : 0);
+      }
+      if (expensesRes.ok) setExpenses(parseRawWithKeys<Expense>(expensesRes.data));
+      if (sparePartsRes.ok) setSpareParts(parseRawWithKeys<SparePart>(sparePartsRes.data));
+
+      if (whatsappConfigRes.ok && whatsappConfigRes.data) {
         setWhatsappConfig({
-          enabled: whatsappConfigRaw.enabled !== false,
-          phone: whatsappConfigRaw.phone || '+21641444355',
-          apiKey: whatsappConfigRaw.apiKey || ''
+          enabled: whatsappConfigRes.data.enabled !== false,
+          phone: whatsappConfigRes.data.phone || '+21641444355',
+          apiKey: whatsappConfigRes.data.apiKey || ''
         });
       }
-      if (telegramConfigRaw) {
+      if (telegramConfigRes.ok && telegramConfigRes.data) {
         setTelegramConfig({
-          enabled: telegramConfigRaw.enabled !== false,
-          botToken: telegramConfigRaw.botToken || '',
-          chatId: telegramConfigRaw.chatId || ''
+          enabled: telegramConfigRes.data.enabled !== false,
+          botToken: telegramConfigRes.data.botToken || '',
+          chatId: telegramConfigRes.data.chatId || ''
         });
       }
-      setAuditLog(parseRawWithKeys<AuditLogEntry>(auditRaw).reverse());
+      if (auditRes.ok) setAuditLog(parseRawWithKeys<AuditLogEntry>(auditRes.data).reverse());
 
-      // If forfait plans are empty, generate default ones
-      if (!plansRaw) {
-        const defaultPlans = [
-          { id: 'p1', name: '220 Mo', validity: '4 jours', price: 1.0 },
-          { id: 'p2', name: '1.25 Go', validity: '30 jours', price: 5.0 },
-          { id: 'p3', name: '25 Go', validity: '30 jours', price: 30.0 },
-          { id: 'p4', name: '55 Go', validity: '55 jours', price: 55.0 }
-        ];
-        setForfaitPlans(defaultPlans);
-        // Save back
-        defaultPlans.forEach(p => {
-          fetch(dbUrl(`/forfaitPlans/${p.id}.json`), { method: 'PUT', body: JSON.stringify(p) }).catch(() => {});
-        });
-      } else {
-        const loadedPlans = parseRawWithKeys<ForfaitPlan>(plansRaw);
-        loadedPlans.sort((a, b) => a.price - b.price);
-        setForfaitPlans(loadedPlans);
+      // If forfait plans are confirmed empty in Firebase, generate default ones
+      if (plansRes.ok) {
+        if (!plansRes.data) {
+          const defaultPlans = [
+            { id: 'p1', name: '220 Mo', validity: '4 jours', price: 1.0 },
+            { id: 'p2', name: '1.25 Go', validity: '30 jours', price: 5.0 },
+            { id: 'p3', name: '25 Go', validity: '30 jours', price: 30.0 },
+            { id: 'p4', name: '55 Go', validity: '55 jours', price: 55.0 }
+          ];
+          setForfaitPlans(defaultPlans);
+          defaultPlans.forEach(p => {
+            putWithOutbox(`/forfaitPlans/${p.id}.json`, p);
+          });
+        } else {
+          const loadedPlans = parseRawWithKeys<ForfaitPlan>(plansRes.data);
+          loadedPlans.sort((a, b) => a.price - b.price);
+          setForfaitPlans(loadedPlans);
+        }
       }
 
-      if (balanceRaw) {
-        const raw1005 = balanceRaw.Ooredoo_1005 !== undefined ? balanceRaw.Ooredoo_1005 : (balanceRaw.Ooredoo || 0);
-        const raw1006 = balanceRaw.Ooredoo_1006 !== undefined ? balanceRaw.Ooredoo_1006 : 0;
-        const ooredooTotal = raw1005 + raw1006;
-        setForfaitBalance({
-          ...balanceRaw,
-          Ooredoo: ooredooTotal,
-          Ooredoo_1005: raw1005,
-          Ooredoo_1006: raw1006,
-          Orange: balanceRaw.Orange || 0,
-          'Tunisie Telecom': balanceRaw['Tunisie Telecom'] || 0
-        });
-      } else {
-        setForfaitBalance({
-          Ooredoo: 0,
-          Ooredoo_1005: 0,
-          Ooredoo_1006: 0,
-          Orange: 0,
-          'Tunisie Telecom': 0
-        });
+      if (balanceRes.ok) {
+        const balanceRaw = balanceRes.data;
+        if (balanceRaw) {
+          const raw1005 = balanceRaw.Ooredoo_1005 !== undefined ? balanceRaw.Ooredoo_1005 : (balanceRaw.Ooredoo || 0);
+          const raw1006 = balanceRaw.Ooredoo_1006 !== undefined ? balanceRaw.Ooredoo_1006 : 0;
+          const ooredooTotal = roundTND(raw1005 + raw1006);
+          setForfaitBalance({
+            ...balanceRaw,
+            Ooredoo: ooredooTotal,
+            Ooredoo_1005: raw1005,
+            Ooredoo_1006: raw1006,
+            Orange: balanceRaw.Orange || 0,
+            'Tunisie Telecom': balanceRaw['Tunisie Telecom'] || 0
+          });
+        } else {
+          setForfaitBalance({
+            Ooredoo: 0,
+            Ooredoo_1005: 0,
+            Ooredoo_1006: 0,
+            Orange: 0,
+            'Tunisie Telecom': 0
+          });
+        }
       }
-      setPhotoPaperStock(typeof photoPaperStockRaw === 'number' ? photoPaperStockRaw : 0);
 
-      // Handle legacy raw PIN hashing
-      const finalPin = typeof pinRaw === 'object' ? (pinRaw.owner || '1234') : pinRaw;
-      if (finalPin.length === 64) {
-        setManagerPin(finalPin);
-      } else {
-        const hash = await sha256Hex(finalPin);
-        setManagerPin(hash);
+      if (photoPaperStockRes.ok) {
+        const photoPaperStockRaw = photoPaperStockRes.data;
+        let parsedPhotoStock = 0;
+        if (typeof photoPaperStockRaw === 'number') {
+          parsedPhotoStock = photoPaperStockRaw;
+        } else if (photoPaperStockRaw && typeof photoPaperStockRaw === 'object' && typeof (photoPaperStockRaw as any).qty === 'number') {
+          parsedPhotoStock = (photoPaperStockRaw as any).qty;
+        }
+        setPhotoPaperStock(parsedPhotoStock);
+      }
+
+      // Handle legacy raw PIN hashing safely (typeof null === 'object' guard)
+      if (pinRes.ok) {
+        const pinRaw = pinRes.data;
+        const finalPin = (pinRaw && typeof pinRaw === 'object') ? (pinRaw.owner || '1234') : (pinRaw || '1234');
+        if (typeof finalPin === 'string' && finalPin.length === 64) {
+          setManagerPin(finalPin);
+        } else {
+          const hash = await sha256Hex(String(finalPin));
+          setManagerPin(hash);
+        }
       }
 
       setConnectionStatus('connected');
     } catch (e) {
       setConnectionStatus('offline');
     }
+  };
+
+  syncHandlersRef.current = {
+    resumePendingDeleteHistorySales,
+    resumePendingDeleteDebts,
+    resumePendingDebtPayments,
+    resumePendingSales,
+    loadAllData
   };
 
   // Handle logout
@@ -787,17 +1365,22 @@ export default function App() {
 
   // Verify PIN helper for dangerous manager actions
   const promptAndVerifyPin = async (message = 'أدخل الرمز السري للمدير للتأكيد:'): Promise<boolean> => {
-    const code = prompt(message);
+    const code = await openInputDialog({
+      title: 'تأكيد صلاحية المدير',
+      message,
+      inputType: 'password',
+      placeholder: 'أدخل الرمز السري...'
+    });
     if (!code) return false;
-    
-    // First try secure server-side verification via Firebase Auth
+
+    // First try server-side verification via Firebase Auth
     const isOk = await verifyManagerPinViaAuth(code);
     if (isOk) return true;
-    
-    // Fallback to local SHA-256 comparison for offline support or legacy fallback
+
+    // Fallback to local SHA-256 comparison for offline support
     const hashed = await sha256Hex(code);
     if (hashed === managerPin) return true;
-    
+
     triggerToast('❌ الرمز السري غير صحيح');
     return false;
   };
@@ -808,9 +1391,12 @@ export default function App() {
     const { name, barcode, buy, sell, qty, category } = newItem;
     if (!name) return triggerToast('❌ الرجاء إدخال اسم السلعة');
     
-    const buyVal = parseFloat(buy) || 0;
-    const sellVal = parseFloat(sell) || 0;
-    const qtyVal = parseInt(qty) || 0;
+    const buyVal = parseFloat(buy || '0');
+    const sellVal = parseFloat(sell || '0');
+    const qtyVal = parseInt(qty || '0', 10);
+    if (isNaN(buyVal) || buyVal < 0 || isNaN(sellVal) || sellVal < 0 || isNaN(qtyVal) || qtyVal < 0) {
+      return triggerToast('❌ يرجى إدخال قيم صالحة غير سالبة للأسعار والكمية');
+    }
 
     // Split barcode input by comma and clean whitespace
     const barcodeArray = barcode
@@ -853,6 +1439,9 @@ export default function App() {
     buyVal: number,
     sellVal: number
   ) => {
+    if (!Number.isFinite(addedQty) || addedQty <= 0) {
+      return triggerToast('❌ الكمية المضافة يجب أن تكون أكبر من الصفر');
+    }
     const { barcode } = newItem;
     const barcodeArray = barcode
       ? barcode.split(',').map(b => b.trim()).filter(b => b.length > 0)
@@ -863,9 +1452,7 @@ export default function App() {
       ...barcodeArray
     ]));
 
-    const updated: Item = {
-      ...existingItem,
-      qty: existingItem.qty + addedQty,
+    const patchData: Partial<Item> = {
       buy: buyVal > 0 ? buyVal : existingItem.buy,
       sell: sellVal > 0 ? sellVal : existingItem.sell,
       barcodes: mergedBarcodes,
@@ -873,8 +1460,13 @@ export default function App() {
       imageUrl: existingItem.imageUrl || newItem.imageUrl || undefined
     };
 
-    const ok = await putWithOutbox(`/items/${existingItem.id}.json`, updated);
-    if (ok) {
+    // Increment quantity atomically and verify before patching metadata
+    const qtyRes = await safeIncrementItemQty(existingItem.id, addedQty, existingItem.qty);
+    if (!qtyRes.success) {
+      return triggerToast('❌ تعذر زيادة كمية السلعة، يرجى المحاولة مجدداً');
+    }
+    const ok = await patchWithOutbox(`/items/${existingItem.id}.json`, patchData);
+    if (ok.success) {
       triggerToast(`✅ تم زيادة كمية "${existingItem.name}" بنجاح (+${addedQty} قطعة)`);
       logAudit('edit', `دمج وتحديث ستوك سلعة مشابهة: ${existingItem.name} (+${addedQty})`);
       recordLearningDecision(newItem.name, existingItem.name, true);
@@ -887,9 +1479,9 @@ export default function App() {
 
   const handleCreateNewProductDirectly = async () => {
     const { name, barcode, buy, sell, qty, category } = newItem;
-    const buyVal = parseFloat(buy) || 0;
-    const sellVal = parseFloat(sell) || 0;
-    const qtyVal = parseInt(qty) || 0;
+    const buyVal = Math.max(0, parseFloat(buy || '0') || 0);
+    const sellVal = Math.max(0, parseFloat(sell || '0') || 0);
+    const qtyVal = Math.max(0, parseInt(qty || '0', 10) || 0);
 
     const barcodeArray = barcode
       ? barcode.split(',').map(b => b.trim()).filter(b => b.length > 0)
@@ -907,7 +1499,7 @@ export default function App() {
     };
 
     const ok = await putWithOutbox(`/items/${item.id}.json`, item);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم إضافة السلعة الجديدة للمخزن');
       logAudit('edit', `إضافة سلعة جديدة: ${name} (${qtyVal} قطعة)`);
       if (duplicateCandidates.length > 0) {
@@ -925,8 +1517,8 @@ export default function App() {
     if (!target) return;
     const updated: Item = { ...target, imageUrl };
     setItems(prev => prev.map(i => i.id === itemId ? updated : i));
-    const ok = await putWithOutbox(`/items/${itemId}.json`, updated);
-    if (ok) {
+    const ok = await patchWithOutbox(`/items/${itemId}.json`, { imageUrl });
+    if (ok.success) {
       triggerToast('✅ تم حفظ صورة المنتج بنجاح');
       logAudit('edit', `تحديث صورة السلعة: ${target.name}`);
     }
@@ -959,7 +1551,7 @@ export default function App() {
 
     setItems(prev => [newItemObj, ...prev]);
     const ok = await putWithOutbox(`/items/${newItemObj.id}.json`, newItemObj);
-    if (ok) {
+    if (ok.success) {
       triggerToast(`✨ تم تسجيل "${name}" بالستوك وإرفاق صورتها والباركود بنجاح!`);
       logAudit('edit', `تسجيل سلعة جديدة بالصورة والباركود: ${name}`);
       handleQuickAddItemToCart(newItemObj, 1);
@@ -1018,7 +1610,7 @@ export default function App() {
     setItems(prev => prev.map(i => i.id === itemId ? { ...i, qty: nextQty } : i));
     triggerToast(delta > 0 ? `➕ ${item.name}: ${nextQty} قطعة` : `➖ ${item.name}: ${nextQty} قطعة`);
 
-    // 2. Background Safe Sync
+    // 2. Background Safe Sync (DELTA)
     const result = delta > 0 
       ? await safeIncrementItemQty(itemId, delta, prevQty)
       : await safeDecrementItemQty(itemId, Math.abs(delta), prevQty);
@@ -1035,7 +1627,14 @@ export default function App() {
   const handleEditQtyExact = async (itemId: string) => {
     const item = items.find(i => i.id === itemId);
     if (!item) return;
-    const input = prompt(`أدخل الكمية الدقيقة لـ "${item.name}":`, String(item.qty));
+    const input = await openInputDialog({
+      title: 'تعديل كمية السلعة',
+      message: `أدخل الكمية الدقيقة لـ "${item.name}":`,
+      inputType: 'number',
+      defaultValue: String(item.qty),
+      step: '1',
+      min: '0'
+    });
     if (input === null) return;
     const val = parseInt(input, 10);
     if (isNaN(val) || val < 0) return triggerToast('❌ قيمة غير صالحة');
@@ -1048,29 +1647,38 @@ export default function App() {
     setItems(prev => prev.map(i => i.id === itemId ? { ...i, qty: val } : i));
     triggerToast(`✅ ${item.name}: ${val} قطعة`);
 
-    const result = delta > 0 
-      ? await safeIncrementItemQty(itemId, delta, prevQty)
-      : await safeDecrementItemQty(itemId, Math.abs(delta), prevQty);
+    // 2. Safe Atomic Delta Sync (Prevents overwriting concurrent sales)
+    const opId = `adj_exact_${itemId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    let res: { success: boolean; reason?: string } = { success: false };
+    if (delta > 0) {
+      res = await safeIncrementItemQty(itemId, delta, prevQty, 6, opId);
+    } else {
+      res = await safeDecrementItemQty(itemId, Math.abs(delta), prevQty, 6, opId);
+    }
 
-    if (result.success) {
-      logAudit('edit', `تعديل كمية "${item.name}" للقيمة المحددة: ${val}`);
+    if (res.success) {
+      logAudit('edit', `تعديل كمية "${item.name}" للقيمة المحددة: ${val} (الفرق: ${delta > 0 ? '+' : ''}${delta})`);
     } else {
       setItems(prev => prev.map(i => i.id === itemId ? { ...i, qty: prevQty } : i));
-      triggerToast('❌ فشل حفظ التعديل، تم التراجع');
+      triggerToast(res.reason === 'insufficient' ? '❌ لا يمكن تقليص الكمية لأقل من الصفر (تم البيع بالتزامن)' : '❌ فشل حفظ التعديل، تم التراجع');
     }
   };
 
   const handleEditItemName = async (itemId: string) => {
     const item = items.find(i => i.id === itemId);
     if (!item) return;
-    const newName = prompt(`أدخل الاسم الجديد للسلعة "${item.name}":`, item.name);
+    const newName = await openInputDialog({
+      title: 'تعديل اسم السلعة',
+      message: `أدخل الاسم الجديد للسلعة "${item.name}":`,
+      inputType: 'text',
+      defaultValue: item.name
+    });
     if (newName === null) return;
     const trimmed = newName.trim();
     if (!trimmed) return triggerToast('❌ لا يمكن أن يكون اسم السلعة فارغاً');
 
-    const updated = { ...item, name: trimmed };
-    const ok = await putWithOutbox(`/items/${itemId}.json`, updated);
-    if (ok) {
+    const ok = await patchWithOutbox(`/items/${itemId}.json`, { name: trimmed });
+    if (ok.success) {
       triggerToast('✅ تم تعديل اسم السلعة بنجاح');
       logAudit('edit', `تعديل اسم سلعة: "${item.name}" إلى "${trimmed}"`);
       loadAllData();
@@ -1083,26 +1691,25 @@ export default function App() {
     const item = items.find(i => i.id === itemId);
     if (!item) return;
     const currentCat = item.category || 'accessory';
-    const choice = prompt(
-      `اختر فئة جديدة لـ "${item.name}":\n1 - هواتف 📱\n2 - بطاريات 🔋\n3 - سبيكرات 🔊\n4 - سماعات بلوتوث 🎧\n5 - أكسسوارات أخرى 🔌`, 
-      currentCat === 'phone' ? '1' : currentCat === 'battery' ? '2' : currentCat === 'speaker' ? '3' : currentCat === 'bluetooth' ? '4' : '5'
-    );
-    if (choice === null) return;
-    let newCat = 'accessory';
-    if (choice === '1') newCat = 'phone';
-    else if (choice === '2') newCat = 'battery';
-    else if (choice === '3') newCat = 'speaker';
-    else if (choice === '4') newCat = 'bluetooth';
-    else if (choice === '5') newCat = 'accessory';
-    else {
-      return triggerToast('❌ اختيار غير صحيح');
-    }
+    const newCat = await openInputDialog({
+      title: 'تعديل فئة السلعة',
+      message: `اختر فئة جديدة لـ "${item.name}":`,
+      inputType: 'select',
+      defaultValue: currentCat,
+      options: [
+        { value: 'phone', label: '📱 هواتف' },
+        { value: 'battery', label: '🔋 بطاريات' },
+        { value: 'speaker', label: '🔊 سبيكرات' },
+        { value: 'bluetooth', label: '🎧 سماعات بلوتوث' },
+        { value: 'accessory', label: '🔌 أكسسوارات أخرى' }
+      ]
+    });
+    if (newCat === null || !CATEGORY_MAP[newCat]) return;
 
     if (newCat === currentCat) return;
 
-    const updated = { ...item, category: newCat };
-    const ok = await putWithOutbox(`/items/${itemId}.json`, updated);
-    if (ok) {
+    const ok = await patchWithOutbox(`/items/${itemId}.json`, { category: newCat });
+    if (ok.success) {
       triggerToast('✅ تم تعديل الفئة بنجاح');
       logAudit('edit', `تعديل فئة سلعة "${item.name}" إلى ${CATEGORY_MAP[newCat].label}`);
       loadAllData();
@@ -1120,7 +1727,14 @@ export default function App() {
 
     const currentVal = type === 'sell' ? item.sell : item.buy;
     const label = type === 'sell' ? 'سعر البيع' : 'سعر الشراء (التكلفة)';
-    const input = prompt(`تعديل ${label} للسلعة "${item.name}":`, currentVal.toString());
+    const input = await openInputDialog({
+      title: `تعديل ${label}`,
+      message: `تعديل ${label} للسلعة "${item.name}":`,
+      inputType: 'number',
+      defaultValue: currentVal.toString(),
+      step: '0.001',
+      min: '0'
+    });
     if (input === null) return;
 
     const val = parseFloat(input);
@@ -1128,13 +1742,8 @@ export default function App() {
       return triggerToast('❌ سعر غير صالح');
     }
 
-    const updated = {
-      ...item,
-      [type]: val
-    };
-
-    const ok = await putWithOutbox(`/items/${itemId}.json`, updated);
-    if (ok) {
+    const ok = await patchWithOutbox(`/items/${itemId}.json`, { [type]: val });
+    if (ok.success) {
       triggerToast(`✅ تم تعديل ${label} بنجاح إلى ${val.toFixed(3)} د.ت`);
       logAudit('edit', `تعديل ${label} لسلعة "${item.name}": ${currentVal} ➔ ${val}`);
       loadAllData();
@@ -1300,7 +1909,7 @@ export default function App() {
     };
     setWhatsappConfig(cleanedConfig);
     const ok = await putWithOutbox('/whatsappConfig.json', cleanedConfig);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم حفظ إعدادات واتساب بنجاح');
       logAudit('edit', `تعديل إعدادات إشعارات واتساب: ${cleanedConfig.enabled ? 'مفعلة' : 'معطلة'} للرقم ${cleanedConfig.phone}`);
     } else {
@@ -1598,7 +2207,7 @@ export default function App() {
       ctx.direction = 'rtl';
       ctx.textAlign = 'center';
       ctx.fillText('🛡️ تم تصفير هذا السجل وتوليد هذا التقرير القانوني تلقائياً لحفظ الحقوق والأرشيف.', 620, 1655);
-      ctx.fillText('متجر Yosri GSM - العنوان: تبر، الكاف | هاتف: 41 444 355 | متصل بالخادم السحابي لـ Yosri GSM', 620, 1675);
+      ctx.fillText('متجر Yosri GSM - العنوان: نبر، الكاف | هاتف: \u206641 444 355\u2069 | متصل بالخادم السحابي لـ Yosri GSM', 620, 1675);
 
       // Convert canvas to image and initialize jsPDF
       const { jsPDF } = await import('jspdf');
@@ -1832,7 +2441,7 @@ export default function App() {
       ctx.direction = 'rtl';
       ctx.textAlign = 'center';
       ctx.fillText('🛡️ تم تصفير الكاسة وتوثيق حسابات الوردية بنجاح مع مسح السجلات من الفايربيز لتوفير المساحة المجانية.', 620, 1655);
-      ctx.fillText('متجر Yosri GSM - العنوان: تبر، الكاف | هاتف: 41 444 355 | متصل بالخادم السحابي لـ Yosri GSM', 620, 1675);
+      ctx.fillText('متجر Yosri GSM - العنوان: نبر، الكاف | هاتف: \u206641 444 355\u2069 | متصل بالخادم السحابي لـ Yosri GSM', 620, 1675);
 
       const { jsPDF } = await import('jspdf');
       const pdf = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
@@ -1844,8 +2453,9 @@ export default function App() {
 
       if (telegramConfig.enabled && telegramConfig.botToken && telegramConfig.chatId) {
         const pdfBase64 = pdf.output('datauristring');
+        const safeSeller = escapeHTML(shiftData.sellerName || 'غير مسمى');
         const caption = `📋 <b>تقرير تسليم الوردية وتصفير الكاسة (#${reportId})</b>\n\n` +
-          `• <b>الوردية/البائع:</b> ${shiftData.sellerName}\n` +
+          `• <b>الوردية/البائع:</b> ${safeSeller}\n` +
           `• <b>مداخيل الوردية:</b> ${totalRevenue.toFixed(3)} د.ت\n` +
           `• <b>مصاريف الوردية:</b> ${shiftData.expensesTotal.toFixed(3)} د.ت\n` +
           `• <b>الكاش المفترض بالدرج:</b> ${shiftData.expectedCash.toFixed(3)} د.ت\n` +
@@ -1856,7 +2466,10 @@ export default function App() {
           `<i>تم مسح مبيعات الوردية من الفايربيز وإرسال التقرير لتلغرام بنجاح.</i>`;
 
         triggerToast('📤 جاري إرسال تقرير الوردية PDF لتلغرام...');
-        await sendTelegramPDF(pdfBase64, filename, caption);
+        const tgRes = await sendTelegramPDF(pdfBase64, filename, caption);
+        if (!tgRes.success) {
+          triggerToast(`⚠️ تم حفظ التقرير محلياً لكن تعذر إرساله لتلغرام: ${tgRes.error || ''}`);
+        }
       }
 
       return pdf;
@@ -1960,7 +2573,7 @@ export default function App() {
     };
     setTelegramConfig(cleanedConfig);
     const ok = await putWithOutbox('/telegramConfig.json', cleanedConfig);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم حفظ إعدادات تلغرام بنجاح');
       logAudit('edit', `تعديل إعدادات إشعارات تلغرام: ${cleanedConfig.enabled ? 'مفعلة' : 'معطلة'}`);
     } else {
@@ -1974,7 +2587,7 @@ export default function App() {
     if (!await promptAndVerifyPin(`هل أنت متأكد من مسح السلعة "${item.name}" نهائياً من السيستم؟`)) return;
 
     const ok = await putWithOutbox(`/items/${itemId}.json`, null);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم مسح السلعة بنجاح');
       logAudit('delete', `حذف سلعة نهائياً: ${item.name}`);
       loadAllData();
@@ -2017,17 +2630,37 @@ export default function App() {
   const handleEditCardQty = async (id: string) => {
     const card = cardStock.find(c => c.id === id);
     if (!card) return;
-    const input = prompt(`أدخل الكمية الجديدة لبطاقات ${card.operator} (${card.value} د.ت):`, String(card.qty));
+    const input = await openInputDialog({
+      title: 'تعديل كمية البطاقات',
+      message: `أدخل الكمية الجديدة لبطاقات ${card.operator} (${card.value} د.ت):`,
+      inputType: 'number',
+      defaultValue: String(card.qty),
+      step: '1',
+      min: '0'
+    });
     if (input === null) return;
     const val = parseInt(input, 10);
     if (isNaN(val) || val < 0) return triggerToast('❌ رقم غير صالح');
 
-    const updated = { ...card, qty: val };
-    setCardStock(prev => prev.map(c => c.id === id ? updated : c));
-    const ok = await putWithOutbox(`/cardStock/${card.id}.json`, updated);
+    const prevQty = card.qty;
+    const delta = val - prevQty;
+    setCardStock(prev => prev.map(c => c.id === id ? { ...c, qty: val } : c));
+    let ok = false;
+    if (delta > 0) {
+      const res = await safeIncrementCardQty(id, delta, prevQty);
+      ok = res.success;
+    } else if (delta < 0) {
+      const res = await safeDecrementCardQty(id, Math.abs(delta), prevQty);
+      ok = res.success;
+    } else {
+      ok = true; // no change
+    }
     if (ok) {
       triggerToast('✅ تم تحديث كمية البطاقات');
-      logAudit('edit', `تعديل يدوي لستوك بطاقات ${card.operator} فئة ${card.value}: ${card.qty} ← ${val}`);
+      logAudit('edit', `تعديل يدوي لستوك بطاقات ${card.operator} فئة ${card.value}: ${prevQty} ← ${val}`);
+    } else {
+      setCardStock(prev => prev.map(c => c.id === id ? { ...c, qty: prevQty } : c));
+      triggerToast('❌ فشل تحديث كمية البطاقات، تم التراجع');
     }
   };
 
@@ -2069,12 +2702,14 @@ export default function App() {
     if (!card) return;
     if (!await promptAndVerifyPin(`حذف بطاقات الشحن لـ ${card.operator} (${card.value} د.ت)؟`)) return;
 
+    const prevCards = cardStock;
     setCardStock(prev => prev.filter(c => c.id !== id));
     const ok = await putWithOutbox(`/cardStock/${id}.json`, null);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم حذف كارت الشحن من المخزن');
       logAudit('delete', `حذف ستوك كروت شحن: ${card.operator} فئة ${card.value}`);
     } else {
+      setCardStock(prevCards);
       triggerToast('❌ فشل الحذف، تأكد من الاتصال');
     }
   };
@@ -2087,22 +2722,19 @@ export default function App() {
 
     const updated: ForfaitBalance = {
       ...forfaitBalance,
-      [addBalanceOperator]: (forfaitBalance[addBalanceOperator] || 0) + amt
+      [addBalanceOperator]: roundTND((forfaitBalance[addBalanceOperator] || 0) + amt)
     };
-
-    // Calculate Ooredoo total if either 1005 or 1006 was charged
     if (addBalanceOperator === 'Ooredoo_1005' || addBalanceOperator === 'Ooredoo_1006' || addBalanceOperator === 'Ooredoo') {
-      const b1005 = updated.Ooredoo_1005 || 0;
-      const b1006 = updated.Ooredoo_1006 || 0;
-      updated.Ooredoo = b1005 + b1006;
+      updated.Ooredoo = roundTND((updated.Ooredoo_1005 || 0) + (updated.Ooredoo_1006 || 0));
     }
 
-    const ok = await putWithOutbox('/forfaitBalance.json', updated);
-    if (ok) {
-      const opName = addBalanceOperator === 'Ooredoo_1005' 
-        ? 'Ooredoo (حساب 1005)' 
-        : addBalanceOperator === 'Ooredoo_1006' 
-        ? 'Ooredoo (حساب 1006)' 
+    // DELTA increment safe from overwrite
+    const res = await safeIncrementForfait({ [addBalanceOperator]: amt });
+    if (res.success) {
+      const opName = addBalanceOperator === 'Ooredoo_1005'
+        ? 'Ooredoo (حساب 1005)'
+        : addBalanceOperator === 'Ooredoo_1006'
+        ? 'Ooredoo (حساب 1006)'
         : addBalanceOperator;
       triggerToast(`✅ تم شحن رصيد ${opName} بمبلغ +${amt.toFixed(3)} د.ت`);
       logAudit('edit', `شحن رصيد فورفاي لـ ${opName}: +${amt} د.ت`);
@@ -2114,25 +2746,33 @@ export default function App() {
 
   const handleEditForfaitBalanceExact = async (opKey: string, customLabel?: string) => {
     const label = customLabel || (
-      opKey === 'Ooredoo_1005' ? 'Ooredoo (حساب 1005)' : 
-      opKey === 'Ooredoo_1006' ? 'Ooredoo (حساب 1006)' : 
-      opKey === 'Ooredoo' ? 'Ooredoo (الإجمالي)' : 
+      opKey === 'Ooredoo_1005' ? 'Ooredoo (حساب 1005)' :
+      opKey === 'Ooredoo_1006' ? 'Ooredoo (حساب 1006)' :
+      opKey === 'Ooredoo' ? 'Ooredoo (الإجمالي)' :
       opKey
     );
     const current = forfaitBalance[opKey] || 0;
-    const input = prompt(`أدخل الرصيد الدقيق لـ ${label} بالدينار:`, String(current));
+    const input = await openInputDialog({
+      title: 'تعديل رصيد الفورفاي',
+      message: `أدخل الرصيد الدقيق لـ ${label} بالدينار:`,
+      inputType: 'number',
+      defaultValue: String(current),
+      step: '0.001',
+      min: '0'
+    });
     if (input === null) return;
     const val = parseFloat(input);
     if (isNaN(val) || val < 0) return triggerToast('❌ رقم غير صالح');
 
-    const updated: ForfaitBalance = { ...forfaitBalance, [opKey]: val };
+    const roundedVal = roundTND(val);
+    const updated: ForfaitBalance = { ...forfaitBalance, [opKey]: roundedVal };
     if (opKey === 'Ooredoo_1005' || opKey === 'Ooredoo_1006') {
-      updated.Ooredoo = (updated.Ooredoo_1005 || 0) + (updated.Ooredoo_1006 || 0);
+      updated.Ooredoo = roundTND((updated.Ooredoo_1005 || 0) + (updated.Ooredoo_1006 || 0));
     }
-    const ok = await putWithOutbox('/forfaitBalance.json', updated);
-    if (ok) {
+    const ok = await patchWithOutbox('/forfaitBalance.json', { [opKey]: roundedVal, ...(opKey.startsWith('Ooredoo_') ? { Ooredoo: updated.Ooredoo } : {}) });
+    if (ok.success) {
       triggerToast(`✅ تم تعديل رصيد ${label}`);
-      logAudit('edit', `تعديل رصيد فورفاي لـ ${label}: ${current} ← ${val} د.ت`);
+      logAudit('edit', `تعديل رصيد فورفاي لـ ${label}: ${current} ← ${roundedVal} د.ت`);
       setForfaitBalance(updated);
       loadAllData();
     }
@@ -2144,6 +2784,7 @@ export default function App() {
     const addVal = parseInt(photoStockInput) || 0;
     if (addVal <= 0) return triggerToast('❌ الرجاء إدخال كمية صحيحة');
     const res = await safeIncrementPhotoStock(addVal, photoPaperStock);
+    if (!res.success) return triggerToast('❌ فشل تحديث مخزون ورق الصور في السحابة');
     const newQty = res.newQty !== undefined ? res.newQty : photoPaperStock + addVal;
     setPhotoPaperStock(newQty);
     setPhotoStockInput('');
@@ -2152,14 +2793,31 @@ export default function App() {
   };
 
   const handleEditPhotoStock = async () => {
-    const valStr = prompt('أدخل العدد الكلي المتبقي لصور رولو ورق الصور:', photoPaperStock.toString());
+    const valStr = await openInputDialog({
+      title: 'تعديل مخزون ورق الصور',
+      message: 'أدخل العدد الكلي المتبقي لصور رولو ورق الصور:',
+      inputType: 'number',
+      defaultValue: photoPaperStock.toString(),
+      step: '1',
+      min: '0'
+    });
     if (valStr === null) return;
-    const newQty = parseInt(valStr);
+    const newQty = parseInt(valStr, 10);
     if (isNaN(newQty) || newQty < 0) return triggerToast('❌ كمية غير صالحة');
-    await putWithOutbox('/photoPaperStock.json', newQty);
+    const prevQty = photoPaperStock;
+    const delta = newQty - prevQty;
+    if (delta === 0) return;
+
+    const res = delta > 0
+      ? await safeIncrementPhotoStock(delta, prevQty)
+      : await safeDecrementPhotoStock(Math.abs(delta), prevQty);
+
+    if (!res.success) {
+      return triggerToast('❌ فشل تعديل مخزون ورق الصور في السحابة');
+    }
     setPhotoPaperStock(newQty);
     triggerToast('✅ تم تعديل مخزون ورق الصور');
-    logAudit('edit', `تعديل مخزون ورق الصور الشمسية الدقيق: ${photoPaperStock} ← ${newQty} صورة`);
+    logAudit('edit', `تعديل مخزون ورق الصور الشمسية الدقيق: ${prevQty} ← ${newQty} صورة`);
   };
 
   const handleQuickAdjustPhotoStock = async (delta: number) => {
@@ -2206,7 +2864,7 @@ export default function App() {
     };
 
     const ok = await putWithOutbox(`/forfaitPlans/${newPlan.id}.json`, newPlan);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم إضافة الباقة للكتالوغ');
       setNewPlanName('');
       setNewPlanValidity('');
@@ -2218,7 +2876,7 @@ export default function App() {
   const handleDeletePlan = async (id: string) => {
     if (!await promptAndVerifyPin('حذف هذه الباقة نهائياً من الكتالوغ؟')) return;
     const ok = await putWithOutbox(`/forfaitPlans/${id}.json`, null);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم حذف الباقة');
       loadAllData();
     } else {
@@ -2242,7 +2900,7 @@ export default function App() {
     };
 
     const ok = await putWithOutbox(`/expenses/${exp.id}.json`, exp);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم تسجيل المصروف الجديد');
       logAudit('edit', `تسجيل مصروف يومي: ${desc} (${amtVal} د.ت)`);
       setExpenseInput({ desc: '', amount: '' });
@@ -2256,7 +2914,7 @@ export default function App() {
     if (!await promptAndVerifyPin(`هل ترغب بمسح المصروف "${exp.desc}"؟`)) return;
 
     const ok = await putWithOutbox(`/expenses/${id}.json`, null);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم مسح المصروف');
       logAudit('delete', `حذف مصروف يومي: ${exp.desc} (${exp.amount} د.ت)`);
       loadAllData();
@@ -2266,12 +2924,17 @@ export default function App() {
   };
 
   // ---- 5. Debt Actions ----
-  const handleAddManualDebt = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const { name, phone, amount, note } = manualDebt;
-    if (!name) return triggerToast('❌ أدخل اسم الحريف');
+  const handleAddManualDebt = async (data: { name: string; phone: string; amount: string; note: string }): Promise<boolean> => {
+    const { name, phone, amount, note } = data;
+    if (!name) {
+      triggerToast('❌ أدخل اسم الحريف');
+      return false;
+    }
     const amtVal = parseFloat(amount) || 0;
-    if (amtVal <= 0) return triggerToast('❌ أدخل مبلغاً صحيحاً');
+    if (amtVal <= 0) {
+      triggerToast('❌ أدخل مبلغاً صحيحاً');
+      return false;
+    }
 
     const debt: Debt = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -2285,16 +2948,17 @@ export default function App() {
     };
 
     const ok = await putWithOutbox(`/debts/${debt.id}.json`, debt);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم تسجيل الدين اليدوي بنجاح');
       logAudit('sale', `تسجيل دين يدوي على ${name}: ${amtVal} د.ت`);
       
       // Trigger Telegram Notification for manual debt
       triggerTelegramDebtNotification(name, amtVal, note || 'دين يدوي', phone || undefined);
 
-      setManualDebt({ name: '', phone: '', amount: '', note: '' });
       loadAllData();
+      return true;
     }
+    return false;
   };
 
   const handlePayDebt = (debtId: string, fullPayment: boolean) => {
@@ -2319,7 +2983,7 @@ export default function App() {
     });
   };
 
-  const handleExecuteDebtPayment = async (params: {
+    const handleExecuteDebtPayment = async (params: {
     target: PayDebtModalTarget;
     amount: number;
     destination: 'drawer' | 'manager';
@@ -2331,22 +2995,25 @@ export default function App() {
 
     if (target.type === 'single' && target.debt) {
       const debt = debts.find(d => d.id === target.debt!.id) || target.debt;
-      const remaining = Math.max(0, debt.amount - debt.paid);
-      const actualPayAmount = Math.min(payAmount, remaining);
+      const remaining = Math.max(0, roundTND(debt.amount - debt.paid));
+      const actualPayAmount = roundTND(Math.min(payAmount, remaining));
+      if (actualPayAmount <= 0) return;
 
-      // Calculate accurate profit portion for the payment based on debt line buy costs
+      // Calculate accurate profit portion for the payment based on historical debt line buy costs
       let totalDebtCost = 0;
       if (debt.lines) {
         for (const line of debt.lines) {
-          if (line.type === 'item' && line.itemId) {
-            const it = items.find(i => i.id === line.itemId);
-            totalDebtCost += (it?.buy || 0) * (line.qty || 1);
+          if (line.type === 'item') {
+            const historicalBuy = typeof line.unitBuy === 'number'
+              ? line.unitBuy
+              : (line.itemId ? (items.find(i => i.id === line.itemId)?.buy || 0) : 0);
+            totalDebtCost += historicalBuy * (line.qty || 1);
           }
         }
       }
       const totalDebtAmount = debt.amount || 1;
       const profitMarginRatio = Math.max(0, (totalDebtAmount - totalDebtCost) / totalDebtAmount);
-      const profitCommission = actualPayAmount * profitMarginRatio;
+      const profitCommission = roundTND(actualPayAmount * profitMarginRatio);
 
       const incomeEntry: OtherIncome = {
         id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -2359,20 +3026,68 @@ export default function App() {
         destination: destination
       };
 
+      const nextPaid = roundTND(debt.paid + actualPayAmount);
       const updatedDebt: Debt = {
         ...debt,
-        paid: debt.paid + actualPayAmount,
-        status: (debt.paid + actualPayAmount >= debt.amount - 0.001) ? 'paid' : 'open'
+        paid: nextPaid,
+        status: (nextPaid >= debt.amount - 0.001) ? 'paid' : 'open'
       };
+
+      const payOpId = `pay_${incomeEntry.id}`;
+      const pendingPayment: PendingDebtPayment = {
+        id: payOpId,
+        createdAt: Date.now(),
+        debtId: debt.id,
+        payAmount: actualPayAmount,
+        incomeId: incomeEntry.id,
+        incomeEntry: incomeEntry,
+        updatedDebtStatus: updatedDebt.status,
+        status: 'created'
+      };
+
+      // Durable persistence MUST succeed BEFORE updating UI or mutating state
+      const persistOk = savePendingDebtPayment(pendingPayment);
+      if (!persistOk) {
+        return triggerToast('❌ فشل حفظ قيد العملية محلياً، تم إيقاف الدفع');
+      }
+
+      if (!trySavePendingDebtPayment(pendingPayment, 'debt_in_progress')) return;
 
       // Optimistic local state update
       setDebts(prev => prev.map(d => d.id === debt.id ? updatedDebt : d));
       setOtherIncome(prev => [incomeEntry, ...prev]);
 
-      const ok1 = await putWithOutbox(`/debts/${debt.id}.json`, updatedDebt);
-      const ok2 = await putWithOutbox(`/otherIncome/${incomeEntry.id}.json`, incomeEntry);
+      const res1 = await safeIncrementDebtPaid(debt.id, actualPayAmount, 6, payOpId, debt.id);
 
-      if (ok1 && ok2) {
+      if (res1.reason === 'not_found') {
+        setDebts(prev => prev.filter(d => d.id !== debt.id));
+        setOtherIncome(prev => prev.filter(o => o.id !== incomeEntry.id));
+        trySavePendingDebtPayment(pendingPayment, 'completed');
+        removePendingDebtPayment(payOpId);
+        triggerToast('❌ هذا الدين لم يعد موجوداً بالمخزن السحابي (قد تم حذفه مسبقاً)');
+        loadAllData();
+        return;
+      }
+
+      if (res1.pending) {
+        triggerToast(`⏳ تم حفظ دفعة ${actualPayAmount.toFixed(3)} د.ت في قائمة الانتظار، ستُرفع عند توفر الشبكة`);
+        return;
+      }
+
+      if (!res1.success) {
+        return triggerToast('⚠️ تعذر تأكيد الدفع حالياً، سيعاد تلقائياً من سجل الاستعادة');
+      }
+
+      if (!trySavePendingDebtPayment(pendingPayment, 'debt_completed')) return;
+      if (!trySavePendingDebtPayment(pendingPayment, 'income_in_progress')) return;
+
+      await patchWithOutbox(`/debts/${debt.id}.json`, { status: updatedDebt.status }, undefined, debt.id);
+      const ok2 = await putWithOutbox(`/otherIncome/${incomeEntry.id}.json`, incomeEntry, incomeEntry.id, debt.id);
+
+      if (ok2.success && !ok2.pending) {
+        if (trySavePendingDebtPayment(pendingPayment, 'completed')) {
+          removePendingDebtPayment(payOpId);
+        }
         triggerToast(
           isToManager
             ? `💼 تم سداد ${actualPayAmount.toFixed(3)} د.ت لجيب المدير (خارج كاسة الوردية)`
@@ -2380,10 +3095,12 @@ export default function App() {
         );
         logAudit('sale', `تسديد دين ${debt.customerName}: ${actualPayAmount.toFixed(3)} د.ت [الوجهة: ${isToManager ? 'جيب المدير خارج الكاسة' : 'صندوق الكاسة'}]`);
         loadAllData();
+      } else if (ok2.pending) {
+        triggerToast(`⏳ تم تحديث الدين وحفظ الدفعة في قائمة الانتظار للمزامنة`);
       }
     } else if (target.type === 'group' && target.group) {
       const group = target.group;
-      let remainingToDistribute = payAmount;
+      let remainingToDistribute = roundTND(payAmount);
       const updatedDebtsToSave: Debt[] = [];
       const incomeEntriesToSave: OtherIncome[] = [];
 
@@ -2393,25 +3110,27 @@ export default function App() {
       for (const debt of sortedOpen) {
         if (remainingToDistribute <= 0.0001) break;
 
-        const debtRemaining = Math.max(0, debt.amount - debt.paid);
-        const payForThisDebt = Math.min(debtRemaining, remainingToDistribute);
+        const debtRemaining = Math.max(0, roundTND(debt.amount - debt.paid));
+        const payForThisDebt = roundTND(Math.min(debtRemaining, remainingToDistribute));
 
         if (payForThisDebt > 0) {
-          remainingToDistribute -= payForThisDebt;
+          remainingToDistribute = roundTND(remainingToDistribute - payForThisDebt);
 
-          // Calculate profit margin ratio
+          // Calculate profit margin ratio using historical debt line unitBuy
           let totalDebtCost = 0;
           if (debt.lines) {
             for (const line of debt.lines) {
-              if (line.type === 'item' && line.itemId) {
-                const it = items.find(i => i.id === line.itemId);
-                totalDebtCost += (it?.buy || 0) * (line.qty || 1);
+              if (line.type === 'item') {
+                const historicalBuy = typeof line.unitBuy === 'number'
+                  ? line.unitBuy
+                  : (line.itemId ? (items.find(i => i.id === line.itemId)?.buy || 0) : 0);
+                totalDebtCost += historicalBuy * (line.qty || 1);
               }
             }
           }
           const totalDebtAmount = debt.amount || 1;
           const profitMarginRatio = Math.max(0, (totalDebtAmount - totalDebtCost) / totalDebtAmount);
-          const profitCommission = payForThisDebt * profitMarginRatio;
+          const profitCommission = roundTND(payForThisDebt * profitMarginRatio);
 
           const incomeEntry: OtherIncome = {
             id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6) + Math.floor(Math.random() * 100),
@@ -2424,10 +3143,11 @@ export default function App() {
             destination: destination
           };
 
+          const nextPaid = roundTND(debt.paid + payForThisDebt);
           const updatedDebt: Debt = {
             ...debt,
-            paid: debt.paid + payForThisDebt,
-            status: (debt.paid + payForThisDebt >= debt.amount - 0.001) ? 'paid' : 'open'
+            paid: nextPaid,
+            status: (nextPaid >= debt.amount - 0.001) ? 'paid' : 'open'
           };
 
           updatedDebtsToSave.push(updatedDebt);
@@ -2437,37 +3157,107 @@ export default function App() {
 
       if (updatedDebtsToSave.length === 0) return;
 
-      // Optimistically update debts and otherIncome in state
+      const pendingPayments: PendingDebtPayment[] = [];
+      for (let i = 0; i < updatedDebtsToSave.length; i++) {
+        const d = updatedDebtsToSave[i];
+        const inc = incomeEntriesToSave[i];
+        const originalDebt = debts.find(x => x.id === d.id);
+        const originalPaid = originalDebt ? originalDebt.paid : 0;
+        const payDelta = roundTND(d.paid - originalPaid);
+        const payOpId = `pay_${inc.id}`;
+
+        const pendingPayment: PendingDebtPayment = {
+          id: payOpId,
+          createdAt: Date.now(),
+          debtId: d.id,
+          payAmount: payDelta,
+          incomeId: inc.id,
+          incomeEntry: inc,
+          updatedDebtStatus: d.status,
+          status: 'created'
+        };
+        const ok = savePendingDebtPayment(pendingPayment);
+        if (ok) {
+          pendingPayments.push(pendingPayment);
+        }
+      }
+
+      if (pendingPayments.length === 0) {
+        return triggerToast('❌ فشل حفظ قيد العملية محلياً، تم إيقاف الدفع');
+      }
+
+      // Optimistically update debts and otherIncome for saved payments only
+      const savedDebtIds = new Set(pendingPayments.map(p => p.debtId));
+      const savedIncIds = new Set(pendingPayments.map(p => p.incomeId));
       setDebts(prev => {
-        const map = new Map(updatedDebtsToSave.map(d => [d.id, d]));
+        const map = new Map(updatedDebtsToSave.filter(d => savedDebtIds.has(d.id)).map(d => [d.id, d]));
         return prev.map(d => map.get(d.id) || d);
       });
-      setOtherIncome(prev => [...incomeEntriesToSave, ...prev]);
+      setOtherIncome(prev => [...incomeEntriesToSave.filter(inc => savedIncIds.has(inc.id)), ...prev]);
 
-      // Persist each
-      for (const d of updatedDebtsToSave) {
-        await putWithOutbox(`/debts/${d.id}.json`, d);
-      }
-      for (const inc of incomeEntriesToSave) {
-        await putWithOutbox(`/otherIncome/${inc.id}.json`, inc);
+      let anyPending = false;
+      for (const pendingPayment of pendingPayments) {
+        if (!trySavePendingDebtPayment(pendingPayment, 'debt_in_progress')) {
+          anyPending = true;
+          continue;
+        }
+
+        const res = await safeIncrementDebtPaid(pendingPayment.debtId, pendingPayment.payAmount, 6, pendingPayment.id, pendingPayment.debtId);
+
+        if (res.reason === 'not_found') {
+          setDebts(prev => prev.filter(x => x.id !== pendingPayment.debtId));
+          setOtherIncome(prev => prev.filter(o => o.id !== pendingPayment.incomeId));
+          trySavePendingDebtPayment(pendingPayment, 'completed');
+          removePendingDebtPayment(pendingPayment.id);
+          continue;
+        }
+
+        if (res.pending || !res.success) {
+          anyPending = true;
+          continue;
+        }
+
+        if (!trySavePendingDebtPayment(pendingPayment, 'debt_completed')) {
+          anyPending = true;
+          continue;
+        }
+
+        if (!trySavePendingDebtPayment(pendingPayment, 'income_in_progress')) {
+          anyPending = true;
+          continue;
+        }
+
+        await patchWithOutbox(`/debts/${pendingPayment.debtId}.json`, { status: pendingPayment.updatedDebtStatus }, undefined, pendingPayment.debtId);
+        const ok2 = await putWithOutbox(`/otherIncome/${pendingPayment.incomeId}.json`, pendingPayment.incomeEntry, pendingPayment.incomeId, pendingPayment.debtId);
+
+        if (ok2.success && !ok2.pending) {
+          if (trySavePendingDebtPayment(pendingPayment, 'completed')) {
+            removePendingDebtPayment(pendingPayment.id);
+          }
+        } else {
+          anyPending = true;
+        }
       }
 
-      triggerToast(
-        isToManager
-          ? `💼 تم سداد ${payAmount.toFixed(3)} د.ت لجيب المدير وتوزيعها على ديون "${group.canonicalName}" (خارج الكاسة)`
-          : `🎉 تم تسجيل دفعة ${payAmount.toFixed(3)} د.ت بالكاسة وتوزيعها على ديون "${group.canonicalName}" بنجاح!`
-      );
-      logAudit('sale', `تسديد جماعي لديون الحريف ${group.canonicalName}: ${payAmount.toFixed(3)} د.ت على ${updatedDebtsToSave.length} دين [الوجهة: ${isToManager ? 'جيب المدير خارج الكاسة' : 'صندوق الكاسة'}]`);
-      loadAllData();
+      if (anyPending) {
+        triggerToast(`⏳ تم حفظ الدفعة الجماعية (${payAmount.toFixed(3)} د.ت) في قائمة الانتظار، ستُرفع عند توفر الشبكة`);
+      } else {
+        triggerToast(
+          isToManager
+            ? `💼 تم سداد ${payAmount.toFixed(3)} د.ت لجيب المدير وتوزيعها على ديون "${group.canonicalName}" (خارج الكاسة)`
+            : `🎉 تم تسجيل دفعة ${payAmount.toFixed(3)} د.ت بالكاسة وتوزيعها على ديون "${group.canonicalName}" بنجاح!`
+        );
+        logAudit('sale', `تسديد جماعي لديون الحريف ${group.canonicalName}: ${payAmount.toFixed(3)} د.ت على ${updatedDebtsToSave.length} دين [الوجهة: ${isToManager ? 'جيب المدير خارج الكاسة' : 'صندوق الكاسة'}]`);
+        loadAllData();
+      }
     }
   };
-
   const handleDeleteDebt = async (id: string) => {
     const debt = debts.find(d => d.id === id);
     if (!debt) return;
+
     if (!await promptAndVerifyPin(`هل ترغب بحذف ملف دين الحريف "${debt.customerName}" نهائياً؟`)) return;
 
-    // 1. Rollback items, recharge cards, and forfait balances to inventory/balances
     const itemIncrements: Record<string, number> = {};
     const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
     const forfaitIncrements: Record<string, number> = {};
@@ -2497,61 +3287,66 @@ export default function App() {
           cardIncrements[card.id].totalQty += (line.qty || 1);
         }
         if (line.type === 'forfait' && line.cardOperator) {
-          forfaitIncrements[line.cardOperator] = (forfaitIncrements[line.cardOperator] || 0) + (line.total || 0);
+          let opKey = line.cardOperator;
+          if (opKey === 'Ooredoo 1005' || opKey === 'Ooredoo_1005') {
+            opKey = 'Ooredoo_1005';
+          } else if (opKey === 'Ooredoo 1006' || opKey === 'Ooredoo_1006') {
+            opKey = 'Ooredoo_1006';
+          } else if (opKey === 'Ooredoo') {
+            opKey = 'Ooredoo_1005';
+          }
+          forfaitIncrements[opKey] = roundTND((forfaitIncrements[opKey] || 0) + (line.total || 0));
         }
         if (line.type === 'photo') {
           photoIncrement += (line.qty || 1);
         }
       }
-
-      // Rollback items
-      for (const itemId of Object.keys(itemIncrements)) {
-        const localItem = items.find(i => i.id === itemId);
-        await safeIncrementItemQty(itemId, itemIncrements[itemId], localItem?.qty);
-      }
-
-      // Rollback recharge cards atomically
-      for (const cardId of Object.keys(cardIncrements)) {
-        const { entry, totalQty } = cardIncrements[cardId];
-        await safeIncrementCardQty(cardId, totalQty, entry.qty);
-      }
-
-      // Rollback forfait balance
-      if (Object.keys(forfaitIncrements).length > 0) {
-        const updatedBalance: ForfaitBalance = { ...forfaitBalance };
-        for (const op of Object.keys(forfaitIncrements)) {
-          const inc = forfaitIncrements[op];
-          if (op === 'Ooredoo 1005' || op === 'Ooredoo_1005') {
-            updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + inc;
-          } else if (op === 'Ooredoo 1006' || op === 'Ooredoo_1006') {
-            updatedBalance.Ooredoo_1006 = (updatedBalance.Ooredoo_1006 || 0) + inc;
-          } else if (op === 'Ooredoo') {
-            updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + inc;
-          } else {
-            const curBal = updatedBalance[op] || 0;
-            updatedBalance[op] = curBal + inc;
-          }
-        }
-        updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
-        await putWithOutbox('/forfaitBalance.json', updatedBalance);
-        setForfaitBalance(updatedBalance);
-      }
-
-      // Rollback photo paper stock
-      if (photoIncrement > 0) {
-        await safeIncrementPhotoStock(photoIncrement, photoPaperStock);
-        setPhotoPaperStock(prev => prev + photoIncrement);
-      }
     }
 
-    // 2. Clean up any associated down payments or debt repayments for this debt
+    const stockSteps: PendingStockStep[] = [];
+    for (const itemId of Object.keys(itemIncrements)) {
+      stockSteps.push({
+        kind: 'item', targetId: itemId, qty: itemIncrements[itemId],
+        opId: `revert_inv_item_${id}_${itemId}`, revertOpId: '', status: 'pending'
+      });
+    }
+    for (const cardId of Object.keys(cardIncrements)) {
+      stockSteps.push({
+        kind: 'card', targetId: cardId, qty: cardIncrements[cardId].totalQty,
+        opId: `revert_inv_card_${id}_${cardId}`, revertOpId: '', status: 'pending'
+      });
+    }
+    for (const opKey of Object.keys(forfaitIncrements)) {
+      stockSteps.push({
+        kind: 'forfait', targetId: opKey, qty: forfaitIncrements[opKey],
+        opId: `revert_inv_forfait_${id}_${opKey}`, revertOpId: '', status: 'pending'
+      });
+    }
+    if (photoIncrement > 0) {
+      stockSteps.push({
+        kind: 'photo', targetId: 'photo', qty: photoIncrement,
+        opId: `revert_inv_photo_${id}`, revertOpId: '', status: 'pending'
+      });
+    }
+
     const relatedIncomes = otherIncome.filter(o => o.debtId === id);
-    for (const inc of relatedIncomes) {
-      await putWithOutbox(`/otherIncome/${inc.id}.json`, null);
+    const incomeIdsToDelete = relatedIncomes.map(inc => inc.id);
+
+    const pendingDel: PendingDeleteDebt = {
+      id: `del_debt_${id}`,
+      createdAt: Date.now(),
+      debtId: id,
+      stockSteps,
+      incomeIdsToDelete,
+      status: 'created'
+    };
+
+    if (!savePendingDeleteDebt(pendingDel)) {
+      triggerToast('❌ فشل حفظ قيد الحذف محلياً، تم إيقاف العملية');
+      return;
     }
 
-    // 3. Delete debt record
-    const ok = await putWithOutbox(`/debts/${id}.json`, null);
+    if (!trySavePendingDeleteDebt(pendingDel, 'stock_rollback_in_progress')) return;
 
     // Optimistically update React state immediately
     setDebts(prev => prev.filter(d => d.id !== id));
@@ -2563,44 +3358,101 @@ export default function App() {
         return inc ? { ...item, qty: item.qty + inc } : item;
       }));
     }
-
     if (Object.keys(cardIncrements).length > 0) {
       setCardStock(prevCards => prevCards.map(card => {
         const inc = cardIncrements[card.id];
         return inc ? { ...card, qty: card.qty + inc.totalQty } : card;
       }));
     }
-
     if (Object.keys(forfaitIncrements).length > 0) {
       setForfaitBalance(prev => {
         const next = { ...prev };
-        for (const op of Object.keys(forfaitIncrements)) {
-          next[op] = (next[op] || 0) + forfaitIncrements[op];
+        for (const opKey of Object.keys(forfaitIncrements)) {
+          next[opKey] = roundTND((next[opKey] || 0) + forfaitIncrements[opKey]);
         }
+        next.Ooredoo = roundTND((next.Ooredoo_1005 || 0) + (next.Ooredoo_1006 || 0));
         return next;
       });
     }
+    if (photoIncrement > 0) {
+      setPhotoPaperStock(prev => prev + photoIncrement);
+    }
 
-    if (ok) {
-      triggerToast('✅ تم حذف الدين ورجعت كافة السلع والأرصدة للمستودع');
-      logAudit('delete', `حذف ملف دين بالكامل: ${debt.customerName}`);
+    let allStockCompleted = true;
+    for (const step of pendingDel.stockSteps) {
+      let res;
+      if (step.kind === 'item') {
+        res = await safeIncrementItemQty(step.targetId, step.qty, undefined, 6, step.opId);
+      } else if (step.kind === 'card') {
+        res = await safeIncrementCardQty(step.targetId, step.qty, undefined, 6, step.opId);
+      } else if (step.kind === 'forfait') {
+        res = await safeIncrementForfait({ [step.targetId]: step.qty }, 6, step.opId);
+      } else if (step.kind === 'photo') {
+        res = await safeIncrementPhotoStock(step.qty, undefined, 6, step.opId);
+      }
+      if (res && res.success && !res.pending) {
+        step.status = 'completed';
+        savePendingDeleteDebt(pendingDel);
+      } else {
+        allStockCompleted = false;
+      }
+    }
+
+    if (!allStockCompleted) {
+      triggerToast('⏳ تم حفظ عملية حذف الدين وإرجاع المخزون في قائمة الانتظار، ستُستكمل عند توفر الشبكة');
+      return;
+    }
+
+    if (!trySavePendingDeleteDebt(pendingDel, 'stock_rollback_completed')) return;
+    if (!trySavePendingDeleteDebt(pendingDel, 'income_delete_in_progress')) return;
+
+    let allIncomeDeleted = true;
+    for (const incId of pendingDel.incomeIdsToDelete) {
+      const res = await putWithOutbox(`/otherIncome/${incId}.json`, null);
+      if (!res.success || res.pending) {
+        allIncomeDeleted = false;
+      }
+    }
+
+    if (!allIncomeDeleted) {
+      triggerToast('⏳ تم استرجاع المخزون، وسيُستكمل حذف دفعات الدين فور توفر الشبكة');
+      return;
+    }
+
+    if (!trySavePendingDeleteDebt(pendingDel, 'debt_delete_in_progress')) return;
+
+    const ok = await putWithOutbox(`/debts/${id}.json`, null);
+    if (ok.success && !ok.pending) {
+      if (trySavePendingDeleteDebt(pendingDel, 'completed')) {
+        removePendingDeleteDebt(pendingDel.id);
+      }
+      triggerToast('✅ تم حذف الدين واسترجاع المشتريات للمخزن');
+      logAudit('delete', `حذف دين الحريف ${debt.customerName} بقيمة ${debt.amount.toFixed(3)} د.ت واسترجاع المشتريات للمخزون`);
       loadAllData();
     } else {
-      triggerToast('❌ فشل حذف الدين، تأكد من الاتصال');
+      triggerToast('⏳ تم استرجاع المخزون وحفظ حذف الدين في قائمة الانتظار للمزامنة');
     }
   };
 
   // Edit / Standardize Customer Name & Phone across all debts in the group
   const handleEditCustomer = async (group: CustomerDebtGroup) => {
     if (currentRole !== 'manager') return;
-    const standardName = prompt(
-      `تعديل اسم الحريف لجميع الديون المسجلة (${group.debts.length} ديون مسجلة):\n${group.allNames.length > 1 ? `الأسماء المسجلة حالياً: ${group.allNames.join(' ، ')}` : ''}`,
-      group.canonicalName
-    );
+    const standardName = await openInputDialog({
+      title: 'تعديل وتوحيد اسم الحريف',
+      message: `تعديل اسم الحريف لجميع الديون المسجلة (${group.debts.length} ديون مسجلة)${group.allNames.length > 1 ? ` — الأسماء الحالية: ${group.allNames.join(' ، ')}` : ''}:`,
+      inputType: 'text',
+      defaultValue: group.canonicalName
+    });
     if (!standardName || !standardName.trim()) return;
 
     const trimmed = standardName.trim();
-    const phonePrompt = prompt(`تعديل رقم هاتف الحريف (اختياري):`, group.phone || '');
+    const phonePrompt = await openInputDialog({
+      title: 'تعديل رقم هاتف الحريف',
+      message: `أدخل رقم هاتف الحريف "${trimmed}" (اختياري):`,
+      inputType: 'text',
+      defaultValue: group.phone || '',
+      placeholder: 'رقم الهاتف'
+    });
     const updatedPhone = phonePrompt !== null ? phonePrompt.trim() || undefined : group.phone;
 
     const updatedDebts = group.debts.map(d => ({
@@ -2616,7 +3468,10 @@ export default function App() {
     });
 
     for (const d of updatedDebts) {
-      await putWithOutbox(`/debts/${d.id}.json`, d);
+      await patchWithOutbox(`/debts/${d.id}.json`, {
+        customerName: d.customerName,
+        customerPhone: d.customerPhone
+      });
     }
 
     triggerToast(`✅ تم تعديل اسم الحريف إلى "${trimmed}" في كافة ديونه (${group.debts.length})`);
@@ -2630,8 +3485,10 @@ export default function App() {
     const { name, supplierName, qty, unitCost, notes } = newSparePart;
     if (!name.trim()) return triggerToast('❌ الرجاء إدخال اسم القطعة (مثال: شاشة، بطارية...)');
     if (!supplierName.trim()) return triggerToast('❌ الرجاء إدخال اسم المزوّد (الفورنيسور)');
-    const qtyVal = parseInt(qty, 10) || 1;
-    const costVal = parseFloat(unitCost) || 0;
+    const parsedQty = parseInt(qty, 10);
+    const qtyVal = Number.isFinite(parsedQty) ? parsedQty : 0;
+    const parsedCost = parseFloat(unitCost || '0');
+    const costVal = Number.isFinite(parsedCost) ? parsedCost : -1;
     if (qtyVal <= 0) return triggerToast('❌ الكمية يجب أن تكون أكبر من 0');
     if (costVal < 0) return triggerToast('❌ سعر التكلفة غير صالح');
 
@@ -2648,7 +3505,7 @@ export default function App() {
     };
 
     const ok = await putWithOutbox(`/spareParts/${sp.id}.json`, sp);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم تسجيل قطعة الغيار بنجاح');
       logAudit('edit', `إضافة قطعة غيار من المزوّد ${supplierName}: ${name} عدد ${qtyVal} بتكلفة ${sp.totalCost.toFixed(3)} د.ت`);
       setNewSparePart({ name: '', supplierName: '', qty: '1', unitCost: '', notes: '' });
@@ -2664,8 +3521,8 @@ export default function App() {
 
     const newStatus = sp.status === 'paid' ? 'unpaid' : 'paid';
     const updated = { ...sp, status: newStatus };
-    const ok = await putWithOutbox(`/spareParts/${sp.id}.json`, updated);
-    if (ok) {
+    const ok = await patchWithOutbox(`/spareParts/${sp.id}.json`, { status: newStatus });
+    if (ok.success) {
       triggerToast(newStatus === 'paid' ? '✅ تم تمييز القطعة كخالصة (خُلصت)' : '⏳ تم إرجاع القطعة كغير خالصة (لم تُدفع بعد)');
       logAudit('edit', `تعديل حالة دفع قطعة الغيار "${sp.name}" من المزوّد ${sp.supplierName} إلى ${newStatus === 'paid' ? 'خالصة' : 'غير خالصة'}`);
       loadAllData();
@@ -2678,7 +3535,7 @@ export default function App() {
     if (!await promptAndVerifyPin(`هل ترغب فعلاً بحذف قطعة الغيار "${sp.name}" من المزوّد ${sp.supplierName}؟`)) return;
 
     const ok = await putWithOutbox(`/spareParts/${id}.json`, null);
-    if (ok) {
+    if (ok.success) {
       triggerToast('✅ تم حذف قطعة الغيار من القائمة');
       logAudit('delete', `حذف قطعة غيار من المزوّد ${sp.supplierName}: ${sp.name} بتكلفة ${sp.totalCost.toFixed(3)} د.ت`);
       loadAllData();
@@ -2695,13 +3552,18 @@ export default function App() {
     const prevQty = sp.qty;
     const newVal = sp.qty + delta;
     const updated = { ...sp, qty: newVal, totalCost: newVal * sp.unitCost };
-
     // 1. Instant Optimistic State Update
     setSpareParts(prev => prev.map(s => s.id === id ? updated : s));
     triggerToast(delta > 0 ? `➕ ${sp.name}: ${newVal}` : `➖ ${sp.name}: ${newVal}`);
-
     // 2. Background Sync
-    const ok = await putWithOutbox(`/spareParts/${sp.id}.json`, updated);
+    let ok = false;
+    if (delta > 0) {
+      const res = await safeIncrementSparePartQty(id, delta, sp.unitCost);
+      ok = res.success;
+    } else if (delta < 0) {
+      const res = await safeDecrementSparePartQty(id, Math.abs(delta), sp.unitCost);
+      ok = res.success;
+    }
     if (ok) {
       logAudit('edit', `تعديل سريع لكمية قطعة الغيار "${sp.name}": ${prevQty} ← ${newVal}`);
     } else {
@@ -2953,10 +3815,17 @@ export default function App() {
     }));
   };
 
-  const handleEditCartLineQtyExact = (lineId: string) => {
+  const handleEditCartLineQtyExact = async (lineId: string) => {
     const line = cart.find(c => c.id === lineId);
     if (!line) return;
-    const input = prompt(`تعديل الكمية لـ "${line.label}" في الفاتورة:`, line.qty.toString());
+    const input = await openInputDialog({
+      title: 'تعديل كمية الفاتورة',
+      message: `تعديل الكمية لـ "${line.label}" في الفاتورة:`,
+      inputType: 'number',
+      defaultValue: line.qty.toString(),
+      step: '1',
+      min: '0'
+    });
     if (input === null) return;
     const val = parseInt(input, 10);
     if (isNaN(val) || val <= 0) {
@@ -3022,210 +3891,359 @@ export default function App() {
     if (isFinalizing) return;
 
     setIsFinalizing(true);
-    try {
-      // Optimistic stock decrement checking first (grouped by itemId to prevent duplicate hits and race conditions)
-      const itemQtyMap: Record<string, { itemId: string; qty: number; label: string }> = {};
-      for (const line of cart) {
-        if (line.type === 'item' && line.itemId) {
-          if (!itemQtyMap[line.itemId]) {
-            itemQtyMap[line.itemId] = { itemId: line.itemId, qty: 0, label: line.label };
+    const transactionId = 'sale_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+    const date = new Date().toISOString();
+    const grandTotal = roundTND(cart.reduce((s, c) => s + c.total, 0));
+
+    // 1. Plan and map all stock steps upfront with deterministic IDs
+    const stockSteps: PendingStockStep[] = [];
+
+    // Items
+    const itemQtyMap: Record<string, { itemId: string; qty: number; label: string }> = {};
+    for (const line of cart) {
+      if (line.type === 'item' && line.itemId) {
+        if (!itemQtyMap[line.itemId]) {
+          itemQtyMap[line.itemId] = { itemId: line.itemId, qty: 0, label: line.label };
+        }
+        itemQtyMap[line.itemId].qty += line.qty;
+      }
+    }
+    for (const group of Object.values(itemQtyMap)) {
+      stockSteps.push({
+        kind: 'item',
+        targetId: group.itemId,
+        qty: group.qty,
+        label: group.label,
+        opId: `${transactionId}_item_${group.itemId}`,
+        revertOpId: `rollback_${transactionId}_item_${group.itemId}`,
+        status: 'pending'
+      });
+    }
+
+    // Cards
+    const cardStockDepletions: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
+    for (const line of cart) {
+      if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
+        const normOp = normalizeOpName(line.cardOperator);
+        const normVal = String(line.cardValue).trim();
+        let entry = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
+        if (!entry) {
+          entry = {
+            id: `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`,
+            kind: 'recharge',
+            operator: normOp,
+            value: normVal,
+            qty: 0
+          };
+        }
+        if (!cardStockDepletions[entry.id]) {
+          cardStockDepletions[entry.id] = { entry, totalQty: 0 };
+        }
+        cardStockDepletions[entry.id].totalQty += (line.qty || 1);
+      }
+    }
+    for (const entryId of Object.keys(cardStockDepletions)) {
+      const { entry, totalQty } = cardStockDepletions[entryId];
+      stockSteps.push({
+        kind: 'card',
+        targetId: entry.id,
+        qty: totalQty,
+        label: entry.operator,
+        opId: `${transactionId}_card_${entry.id}`,
+        revertOpId: `rollback_${transactionId}_card_${entry.id}`,
+        status: 'pending'
+      });
+    }
+
+    // Forfait
+    const forfaitDepletions: Record<string, number> = {};
+    for (const line of cart) {
+      if (line.type === 'forfait' && line.cardOperator) {
+        const op = line.cardOperator;
+        if (!forfaitDepletions[op]) {
+          forfaitDepletions[op] = 0;
+        }
+        forfaitDepletions[op] = roundTND(forfaitDepletions[op] + line.unitPrice * (line.qty || 1));
+      }
+    }
+    let safePayload: Record<string, number> | null = null;
+    if (Object.keys(forfaitDepletions).length > 0) {
+      const updatedBalance: ForfaitBalance = { ...forfaitBalance };
+      safePayload = {};
+      for (const op of Object.keys(forfaitDepletions)) {
+        const amt = forfaitDepletions[op];
+        if (op === 'Ooredoo 1005' || op === 'Ooredoo_1005') {
+          const cur = updatedBalance.Ooredoo_1005 || 0;
+          updatedBalance.Ooredoo_1005 = Math.max(0, roundTND(cur - amt));
+          safePayload.Ooredoo_1005 = roundTND((safePayload.Ooredoo_1005 || 0) + amt);
+        } else if (op === 'Ooredoo 1006' || op === 'Ooredoo_1006') {
+          const cur = updatedBalance.Ooredoo_1006 || 0;
+          updatedBalance.Ooredoo_1006 = Math.max(0, roundTND(cur - amt));
+          safePayload.Ooredoo_1006 = roundTND((safePayload.Ooredoo_1006 || 0) + amt);
+        } else if (op === 'Ooredoo') {
+          let rem = amt;
+          const cur1005 = updatedBalance.Ooredoo_1005 ?? 0;
+          const cur1006 = updatedBalance.Ooredoo_1006 ?? 0;
+
+          if (cur1005 >= rem) {
+            updatedBalance.Ooredoo_1005 = roundTND(cur1005 - rem);
+            safePayload.Ooredoo_1005 = roundTND((safePayload.Ooredoo_1005 || 0) + rem);
+            rem = 0;
+          } else {
+            updatedBalance.Ooredoo_1005 = 0;
+            safePayload.Ooredoo_1005 = roundTND((safePayload.Ooredoo_1005 || 0) + cur1005);
+            rem = roundTND(rem - cur1005);
+            updatedBalance.Ooredoo_1006 = Math.max(0, roundTND(cur1006 - rem));
+            safePayload.Ooredoo_1006 = roundTND((safePayload.Ooredoo_1006 || 0) + rem);
           }
-          itemQtyMap[line.itemId].qty += line.qty;
-        }
-      }
-
-      const uniqueItemsToDecrement = Object.values(itemQtyMap);
-      const successList: { itemId: string; amt: number }[] = [];
-      let stockError = '';
-
-      for (const group of uniqueItemsToDecrement) {
-        const localItem = items.find(i => i.id === group.itemId);
-        const res = await safeDecrementItemQty(group.itemId, group.qty, localItem?.qty);
-        if (res.success) {
-          successList.push({ itemId: group.itemId, amt: group.qty });
         } else {
-          stockError = res.reason === 'insufficient' 
-            ? `❌ السلعة "${group.label}" لم تعد كافية بالمخزن! المتبقي: ${res.available}`
-            : `❌ فشل تحديث المخزن للسلعة "${group.label}" بسبب تداخل بالشبكة`;
-          break;
+          const curBal = updatedBalance[op] || 0;
+          updatedBalance[op] = Math.max(0, roundTND(curBal - amt));
+          safePayload[op] = roundTND((safePayload[op] || 0) + amt);
+        }
+      }
+      stockSteps.push({
+        kind: 'forfait',
+        targetId: 'forfait',
+        qty: roundTND(Object.values(forfaitDepletions).reduce((s, v) => s + v, 0)),
+        opId: `${transactionId}_forfait`,
+        revertOpId: `rollback_${transactionId}_forfait`,
+        status: 'pending',
+        payload: safePayload
+      });
+    }
+
+    // Photo
+    const totalPhotosInCart = cart.filter(c => c.type === 'photo').reduce((s, c) => s + (c.qty || 1), 0);
+    if (totalPhotosInCart > 0) {
+      stockSteps.push({
+        kind: 'photo',
+        targetId: 'photo',
+        qty: totalPhotosInCart,
+        opId: `${transactionId}_photo`,
+        revertOpId: `rollback_${transactionId}_photo`,
+        status: 'pending'
+      });
+    }
+
+    // 2. Persist to durable storage BEFORE any stock decrements begin (BUG-4B-03)
+    const durablePendingSale: PendingSale = {
+      transactionId,
+      date,
+      cart: cart.map(c => ({
+        id: c.id,
+        type: c.type,
+        itemId: c.itemId,
+        label: c.label,
+        qty: c.qty,
+        unitPrice: c.unitPrice,
+        unitBuy: c.unitBuy,
+        total: c.total,
+        commission: c.commission,
+        cardOperator: c.cardOperator,
+        cardValue: c.cardValue
+      })),
+      grandTotal,
+      isDebt: invoiceIsDebt,
+      customerName: invoiceCustomerName,
+      customerPhone: invoiceCustomerPhone,
+      initialPayment: invoiceInitialPayment,
+      status: 'created',
+      stockSteps,
+      createdAt: Date.now()
+    };
+
+    const persistOk = savePendingSale(durablePendingSale);
+    if (!persistOk) {
+      setIsFinalizing(false);
+      return triggerToast('❌ فشل حفظ قيد العملية في التخزين الدائم، تم إيقاف العملية لمنع تعليق المخزن');
+    }
+
+    if (!trySavePendingSale(durablePendingSale, 'stock_in_progress')) {
+      setIsFinalizing(false);
+      return triggerToast('❌ فشل حفظ الحالة (stock_in_progress) في التخزين الدائم');
+    }
+
+    try {
+      // 3. Execute each stock step sequentially
+      let anyStockPending = false;
+      for (const step of durablePendingSale.stockSteps || []) {
+        if (step.kind === 'item') {
+          const localItem = items.find(i => i.id === step.targetId);
+          const res = await safeDecrementItemQty(step.targetId, step.qty, localItem?.qty, 6, step.opId);
+          if (res.success && !res.pending) {
+            if (!trySavePendingSaleStep(durablePendingSale, step, 'completed')) {
+              setIsFinalizing(false);
+              return triggerToast('❌ فشل حفظ خطوة السلعة في التخزين الدائم');
+            }
+          } else if (!res.success) {
+            step.status = 'failed';
+            trySavePendingSale(durablePendingSale, 'rollback_in_progress');
+            await executeRollback(durablePendingSale);
+            setIsFinalizing(false);
+            const err = res.reason === 'insufficient'
+              ? `❌ السلعة "${step.label || 'المحددة'}" لم تعد كافية بالمخزن! المتبقي: ${res.available ?? 0}`
+              : `❌ فشل تحديث المخزن للسلعة "${step.label || 'المحددة'}" بسبب تداخل بالشبكة`;
+            return triggerToast(err);
+          } else {
+            // Pending in outbox: keep step pending and let recovery finish when online
+            anyStockPending = true;
+            break;
+          }
+        } else if (step.kind === 'card') {
+          const entry = cardStock.find(c => c.id === step.targetId);
+          const res = await safeDecrementCardQty(step.targetId, step.qty, entry?.qty, 6, step.opId);
+          if (res.success && !res.pending) {
+            if (!trySavePendingSaleStep(durablePendingSale, step, 'completed')) {
+              setIsFinalizing(false);
+              return triggerToast('❌ فشل حفظ خطوة السلعة في التخزين الدائم');
+            }
+          } else if (!res.success) {
+            step.status = 'failed';
+            trySavePendingSale(durablePendingSale, 'rollback_in_progress');
+            await executeRollback(durablePendingSale);
+            setIsFinalizing(false);
+            const cardErr = res.reason === 'insufficient'
+              ? `❌ مخزون بطاقات ${step.label || ''} غير كافي بالمخزن! المتوفر: ${res.available ?? 0}`
+              : `❌ فشل تحديث مخزن بطاقات ${step.label || ''} بسبب تداخل بالشبكة`;
+            return triggerToast(cardErr);
+          } else {
+            anyStockPending = true;
+            break;
+          }
+        } else if (step.kind === 'forfait') {
+          const resForfait = await safeDecrementForfait(step.payload || {}, 6, step.opId);
+          if (resForfait.success && !resForfait.pending) {
+            if (!trySavePendingSaleStep(durablePendingSale, step, 'completed')) {
+              setIsFinalizing(false);
+              return triggerToast('❌ فشل حفظ خطوة السلعة في التخزين الدائم');
+            }
+          } else if (!resForfait.success) {
+            step.status = 'failed';
+            trySavePendingSale(durablePendingSale, 'rollback_in_progress');
+            await executeRollback(durablePendingSale);
+            setIsFinalizing(false);
+            const fErr = resForfait.reason === 'insufficient'
+              ? '❌ رصيد الفورفاي غير كافي بالموزع!'
+              : '❌ فشل تحديث رصيد الفورفاي بسبب تداخل بالشبكة';
+            return triggerToast(fErr);
+          } else {
+            anyStockPending = true;
+            break;
+          }
+        } else if (step.kind === 'photo') {
+          const resPhoto = await safeDecrementPhotoStock(step.qty, photoPaperStock, 6, step.opId);
+          if (resPhoto.success && !resPhoto.pending) {
+            if (!trySavePendingSaleStep(durablePendingSale, step, 'completed')) {
+              setIsFinalizing(false);
+              return triggerToast('❌ فشل حفظ خطوة السلعة في التخزين الدائم');
+            }
+          } else if (!resPhoto.success) {
+            step.status = 'failed';
+            trySavePendingSale(durablePendingSale, 'rollback_in_progress');
+            await executeRollback(durablePendingSale);
+            setIsFinalizing(false);
+            const pErr = resPhoto.reason === 'insufficient'
+              ? `❌ مخزون ورق الصور (الرولو) غير كافي بالمخزن! المتوفر: ${resPhoto.available ?? 0} صورة`
+              : `❌ فشل تحديث مخزون ورق الصور بسبب تداخل بالشبكة`;
+            return triggerToast(pErr);
+          } else {
+            anyStockPending = true;
+            break;
+          }
         }
       }
 
-      // Rollback if any error occurred
-      if (stockError) {
-        for (const item of successList) {
-          const localItem = items.find(i => i.id === item.itemId);
-          await safeIncrementItemQty(item.itemId, item.amt, localItem?.qty);
-        }
-        setIsFinalizing(false);
-        return triggerToast(stockError);
-      }
-
-      // Optimistically update item quantities in local React state immediately
+      // Optimistically update quantities in local React state
       if (Object.keys(itemQtyMap).length > 0) {
         setItems(prevItems => prevItems.map(item => {
           const dec = itemQtyMap[item.id];
           return dec ? { ...item, qty: Math.max(0, item.qty - dec.qty) } : item;
         }));
       }
-
-      // Group card stock depletions by cardStock entry ID & validate stock
-      const cardStockDepletions: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
-      for (const line of cart) {
-        if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
-          const normOp = normalizeOpName(line.cardOperator);
-          const normVal = String(line.cardValue).trim();
-          let entry = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
-          if (!entry) {
-            entry = {
-              id: `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`,
-              kind: 'recharge',
-              operator: normOp,
-              value: normVal,
-              qty: 0
-            };
-          }
-          if (!cardStockDepletions[entry.id]) {
-            cardStockDepletions[entry.id] = { entry, totalQty: 0 };
-          }
-          cardStockDepletions[entry.id].totalQty += (line.qty || 1);
-        }
-      }
-
-      let cardStockError = '';
-      const successfulCardDecrements: { cardId: string; totalQty: number }[] = [];
-
-      for (const entryId of Object.keys(cardStockDepletions)) {
-        const { entry, totalQty } = cardStockDepletions[entryId];
-        const res = await safeDecrementCardQty(entry.id, totalQty, entry.qty);
-        if (res.success) {
-          successfulCardDecrements.push({ cardId: entry.id, totalQty });
-        } else {
-          cardStockError = res.reason === 'insufficient'
-            ? `❌ مخزون بطاقات ${entry.operator} (${entry.value} د.ت) غير كافي بالمخزن! المتوفر: ${res.available || 0}`
-            : `❌ فشل تحديث مخزن بطاقات ${entry.operator} بسبب تداخل بالشبكة`;
-          break;
-        }
-      }
-
-      if (cardStockError) {
-        // Rollback items
-        for (const item of successList) {
-          const localItem = items.find(i => i.id === item.itemId);
-          await safeIncrementItemQty(item.itemId, item.amt, localItem?.qty);
-        }
-        // Rollback cards
-        for (const dec of successfulCardDecrements) {
-          const localCard = cardStock.find(c => c.id === dec.cardId);
-          await safeIncrementCardQty(dec.cardId, dec.totalQty, localCard?.qty);
-        }
-        setIsFinalizing(false);
-        return triggerToast(cardStockError);
-      }
-
-      // Optimistically update cardStock in React state
-      if (successfulCardDecrements.length > 0) {
+      if (Object.keys(cardStockDepletions).length > 0) {
         setCardStock(prevCards => prevCards.map(card => {
-          const dec = successfulCardDecrements.find(d => d.cardId === card.id);
+          const dec = cardStockDepletions[card.id];
           return dec ? { ...card, qty: Math.max(0, card.qty - dec.totalQty) } : card;
         }));
       }
-
-      // Group forfait depletions by operator
-      const forfaitDepletions: Record<string, number> = {};
-      for (const line of cart) {
-        if (line.type === 'forfait' && line.cardOperator) {
-          const op = line.cardOperator;
-          if (!forfaitDepletions[op]) {
-            forfaitDepletions[op] = 0;
-          }
-          forfaitDepletions[op] += line.unitPrice * (line.qty || 1);
-        }
-      }
-
-      // Apply forfait depletions to the forfaitBalance object and write once
-      if (Object.keys(forfaitDepletions).length > 0) {
+      if (safePayload) {
         const updatedBalance: ForfaitBalance = { ...forfaitBalance };
-        for (const op of Object.keys(forfaitDepletions)) {
-          const amt = forfaitDepletions[op];
-          if (op === 'Ooredoo 1005' || op === 'Ooredoo_1005') {
-            const cur = updatedBalance.Ooredoo_1005 || 0;
-            updatedBalance.Ooredoo_1005 = Math.max(0, cur - amt);
-          } else if (op === 'Ooredoo 1006' || op === 'Ooredoo_1006') {
-            const cur = updatedBalance.Ooredoo_1006 || 0;
-            updatedBalance.Ooredoo_1006 = Math.max(0, cur - amt);
-          } else if (op === 'Ooredoo') {
-            let rem = amt;
-            const cur1005 = updatedBalance.Ooredoo_1005 ?? 0;
-            const cur1006 = updatedBalance.Ooredoo_1006 ?? 0;
-
-            if (cur1005 >= rem) {
-              updatedBalance.Ooredoo_1005 = cur1005 - rem;
-              rem = 0;
-            } else {
-              updatedBalance.Ooredoo_1005 = 0;
-              rem -= cur1005;
-              updatedBalance.Ooredoo_1006 = Math.max(0, cur1006 - rem);
-            }
-          } else {
-            const curBal = updatedBalance[op] || 0;
-            updatedBalance[op] = Math.max(0, curBal - amt);
-          }
+        for (const k of Object.keys(safePayload)) {
+          if (k === 'Ooredoo_1005') updatedBalance.Ooredoo_1005 = Math.max(0, roundTND((updatedBalance.Ooredoo_1005 || 0) - safePayload[k]));
+          if (k === 'Ooredoo_1006') updatedBalance.Ooredoo_1006 = Math.max(0, roundTND((updatedBalance.Ooredoo_1006 || 0) - safePayload[k]));
+          if (k !== 'Ooredoo_1005' && k !== 'Ooredoo_1006') updatedBalance[k] = Math.max(0, roundTND((updatedBalance[k] || 0) - safePayload[k]));
         }
-        updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
-        await putWithOutbox('/forfaitBalance.json', updatedBalance);
+        updatedBalance.Ooredoo = roundTND((updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0));
         setForfaitBalance(updatedBalance);
       }
-
-      // Photo Paper Stock depletion
-      const totalPhotosInCart = cart.filter(c => c.type === 'photo').reduce((s, c) => s + (c.qty || 1), 0);
-      let photoStockError = '';
-
-      if (totalPhotosInCart > 0) {
-        const res = await safeDecrementPhotoStock(totalPhotosInCart, photoPaperStock);
-        if (!res.success) {
-          photoStockError = res.reason === 'insufficient'
-            ? `❌ مخزون ورق الصور (الرولو) غير كافي بالمخزن! المتوفر: ${res.available || 0} صورة`
-            : `❌ فشل تحديث مخزون ورق الصور بسبب تداخل بالشبكة`;
-        }
-      }
-
-      if (photoStockError) {
-        // Rollback items
-        for (const item of successList) {
-          const localItem = items.find(i => i.id === item.itemId);
-          await safeIncrementItemQty(item.itemId, item.amt, localItem?.qty);
-        }
-        // Rollback cards
-        for (const dec of successfulCardDecrements) {
-          const localCard = cardStock.find(c => c.id === dec.cardId);
-          await safeIncrementCardQty(dec.cardId, dec.totalQty, localCard?.qty);
-        }
-        setIsFinalizing(false);
-        return triggerToast(photoStockError);
-      }
-
       if (totalPhotosInCart > 0) {
         setPhotoPaperStock(prev => Math.max(0, prev - totalPhotosInCart));
       }
 
-      const date = new Date().toISOString();
-      const grandTotal = cart.reduce((s, c) => s + c.total, 0);
+      if (anyStockPending) {
+        if (showInvoice) {
+          const initialPayVal = invoiceIsDebt ? roundTND(Math.min(grandTotal, Math.max(0, parseFloat(invoiceInitialPayment) || 0))) : 0;
+          setLastInvoice({
+            id: transactionId.toUpperCase(),
+            lines: cart.map(c => ({
+              name: c.label,
+              qty: c.qty,
+              unitPrice: c.unitPrice,
+              total: c.total
+            })),
+            grandTotal,
+            date,
+            isDebt: invoiceIsDebt,
+            customerName: invoiceCustomerName || undefined,
+            customerPhone: invoiceCustomerPhone || undefined,
+            downPayment: initialPayVal
+          });
+        }
+        setCart([]);
+        setInvoiceCustomerName('');
+        setInvoiceCustomerPhone('');
+        setInvoiceInitialPayment('');
+        setInvoiceIsDebt(false);
+        triggerToast('⏳ تم حفظ الفاتورة في قائمة الانتظار بسبب عدم توفر الشبكة، وستُرفع وتُسجّل تلقائياً');
+        return;
+      }
+
+      // 4. Mark stock completed in durable storage before writing financial/sale records
+      if (!trySavePendingSale(durablePendingSale, 'stock_completed')) {
+        setIsFinalizing(false);
+        return triggerToast('❌ فشل حفظ الحالة (stock_completed) في التخزين الدائم');
+      }
+
+      if (!trySavePendingSale(durablePendingSale, 'records_in_progress')) {
+        setIsFinalizing(false);
+        return triggerToast('❌ فشل حفظ الحالة (records_in_progress) في التخزين الدائم');
+      }
+
+      let recordsAllOk = true;
 
       if (invoiceIsDebt) {
-        const initialPayVal = Math.min(grandTotal, Math.max(0, parseFloat(invoiceInitialPayment) || 0));
-        const debtLines = cart.map(c => ({
-          type: c.type,
-          itemId: c.itemId || null,
-          itemName: c.type === 'item' ? c.label : null,
-          qty: c.qty,
-          cardOperator: c.cardOperator || null,
-          cardValue: c.cardValue || null,
-          total: c.total
-        }));
+        const initialPayVal = roundTND(Math.min(grandTotal, Math.max(0, parseFloat(invoiceInitialPayment) || 0)));
+        const debtLines: DebtLine[] = cart.map(c => {
+          let lineBuy = 0;
+          if (c.type === 'item') {
+            lineBuy = typeof c.unitBuy === 'number' ? c.unitBuy : (c.itemId ? (items.find(i => i.id === c.itemId)?.buy || 0) : 0);
+          }
+          return {
+            type: c.type,
+            itemId: c.itemId || null,
+            itemName: c.type === 'item' ? c.label : null,
+            qty: c.qty,
+            unitBuy: c.type === 'item' ? lineBuy : undefined,
+            unitPrice: c.unitPrice,
+            cardOperator: c.cardOperator || null,
+            cardValue: c.cardValue || null,
+            total: c.total
+          };
+        });
 
         const newDebt: Debt = {
-          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+          id: `${transactionId}_debt`,
           customerName: invoiceCustomerName,
           customerPhone: invoiceCustomerPhone || undefined,
           note: cart.map(c => c.label).join(' + '),
@@ -3237,17 +4255,24 @@ export default function App() {
         };
 
         setDebts(prev => [newDebt, ...prev]);
-        await putWithOutbox(`/debts/${newDebt.id}.json`, newDebt);
+        const resDebt = await putWithOutbox(`/debts/${newDebt.id}.json`, newDebt, newDebt.id);
+        if (!resDebt.success || resDebt.pending) {
+          recordsAllOk = false;
+        }
 
         // Record upfront down payment into income/cash register if present
         if (initialPayVal > 0) {
-          // Calculate down payment profit ratio
-          const totalDebtCost = cart.reduce((s, c) => s + ((c.unitBuy || 0) * (c.qty || 1)), 0);
+          const totalDebtCost = debtLines.reduce((s, line) => {
+            if (line.type === 'item') {
+              return s + ((line.unitBuy || 0) * (line.qty || 1));
+            }
+            return s;
+          }, 0);
           const profitRatio = grandTotal > 0 ? Math.max(0, (grandTotal - totalDebtCost) / grandTotal) : 1;
-          const downPaymentCommission = initialPayVal * profitRatio;
+          const downPaymentCommission = roundTND(initialPayVal * profitRatio);
 
           const downPaymentIncome: OtherIncome = {
-            id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+            id: `${transactionId}_downpay`,
             category: 'debt_payment',
             label: `دفعة أولى / تسبيق دين - ${invoiceCustomerName} (${cart.map(c => c.label).join(' + ')})`,
             amount: initialPayVal,
@@ -3256,25 +4281,27 @@ export default function App() {
             debtId: newDebt.id
           };
           setOtherIncome(prev => [downPaymentIncome, ...prev]);
-          await putWithOutbox(`/otherIncome/${downPaymentIncome.id}.json`, downPaymentIncome);
+          const resDownpay = await putWithOutbox(`/otherIncome/${downPaymentIncome.id}.json`, downPaymentIncome, downPaymentIncome.id, newDebt.id);
+          if (!resDownpay.success || resDownpay.pending) {
+            recordsAllOk = false;
+          }
         }
 
-        const remainingDebt = Math.max(0, grandTotal - initialPayVal);
+        const remainingDebt = Math.max(0, roundTND(grandTotal - initialPayVal));
         logAudit('sale', `فاتورة مبيعات بالدين للحريف ${invoiceCustomerName}: المجموع ${grandTotal} د.ت (تسبيق: ${initialPayVal} د.ت - المتبقي: ${remainingDebt} د.ت)`);
         triggerToast(`🧾 تم حفظ الدين على ${invoiceCustomerName} (تسبيق: ${initialPayVal.toFixed(3)} د.ت | متبقي: ${remainingDebt.toFixed(3)} د.ت)`);
         
-        // Trigger Telegram Notification for debt
         triggerTelegramDebtNotification(invoiceCustomerName, remainingDebt, `تسبيق: ${initialPayVal.toFixed(3)} د.ت | ${cart.map(c => c.label).join(' + ')}`, invoiceCustomerPhone || undefined);
       } else {
-        // Create Sale records for items or OtherIncome records for other services
         const createdSales: Sale[] = [];
         const createdIncomes: OtherIncome[] = [];
 
+        let lineIdx = 0;
         for (const line of cart) {
-          const rId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6) + Math.floor(Math.random() * 100);
+          lineIdx++;
           if (line.type === 'item') {
             const sale: Sale = {
-              id: rId,
+              id: `${transactionId}_s_${lineIdx}`,
               itemId: line.itemId || null,
               itemName: line.label,
               qty: line.qty,
@@ -3284,10 +4311,13 @@ export default function App() {
               date
             };
             createdSales.push(sale);
-            await putWithOutbox(`/sales/${sale.id}.json`, sale);
+            const resSale = await putWithOutbox(`/sales/${sale.id}.json`, sale, sale.id);
+            if (!resSale.success || resSale.pending) {
+              recordsAllOk = false;
+            }
           } else {
             const income: OtherIncome = {
-              id: rId,
+              id: `${transactionId}_inc_${lineIdx}`,
               category: line.type,
               label: line.label,
               amount: line.total,
@@ -3298,7 +4328,10 @@ export default function App() {
               qty: line.qty || null
             };
             createdIncomes.push(income);
-            await putWithOutbox(`/otherIncome/${income.id}.json`, income);
+            const resInc = await putWithOutbox(`/otherIncome/${income.id}.json`, income, income.id);
+            if (!resInc.success || resInc.pending) {
+              recordsAllOk = false;
+            }
           }
         }
 
@@ -3309,11 +4342,26 @@ export default function App() {
         triggerToast('✅ تم تسجيل المبيعات النقدية وتحديث الخزينة');
       }
 
+      // 5. Operation conclusively completed: update status & remove durable pending sale
+      if (recordsAllOk) {
+        if (!trySavePendingSale(durablePendingSale, 'completed')) {
+          setIsFinalizing(false);
+          return triggerToast('❌ فشل حفظ الحالة (completed) في التخزين الدائم');
+        }
+        const removed = removePendingSale(transactionId);
+        if (!removed) console.warn('Failed to verify deletion of pending sale', transactionId);
+      } else {
+        if (!trySavePendingSale(durablePendingSale, 'records_in_progress')) {
+        setIsFinalizing(false);
+        return triggerToast('❌ فشل حفظ الحالة (records_in_progress) في التخزين الدائم');
+      }
+        triggerToast('⚠️ تم إنقاص المخزن ولكن تعذر تسجيل بعض القيود المالية بالكامل. سيعاد تسجيلها تلقائياً');
+      }
+
       if (showInvoice) {
-        // Set preview invoice modal
-        const initialPayVal = invoiceIsDebt ? Math.min(grandTotal, Math.max(0, parseFloat(invoiceInitialPayment) || 0)) : 0;
+        const initialPayVal = invoiceIsDebt ? roundTND(Math.min(grandTotal, Math.max(0, parseFloat(invoiceInitialPayment) || 0))) : 0;
         setLastInvoice({
-          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5).toUpperCase(),
+          id: transactionId.toUpperCase(),
           lines: cart.map(c => ({
             name: c.label,
             qty: c.qty,
@@ -3324,17 +4372,16 @@ export default function App() {
           date,
           isDebt: invoiceIsDebt,
           customerName: invoiceCustomerName || undefined,
+          customerPhone: invoiceCustomerPhone || undefined,
           downPayment: initialPayVal
         });
       } else {
         setLastInvoice(null);
       }
 
-      // Trigger WhatsApp & Telegram notifications for the sale
       triggerWhatsAppNotification(cart, grandTotal, invoiceIsDebt, invoiceCustomerName);
       triggerTelegramNotification(cart, grandTotal, invoiceIsDebt, invoiceCustomerName);
 
-      // Reset Form
       setCart([]);
       setInvoiceCustomerName('');
       setInvoiceCustomerPhone('');
@@ -3343,6 +4390,11 @@ export default function App() {
       loadAllData();
     } catch (err) {
       console.error('Error in handleFinalizeInvoice:', err);
+      // BUG-4B-02: NEVER remove PendingSale if rollback fails or if stock completed
+      if (durablePendingSale.status === 'stock_in_progress' || (durablePendingSale.status as string) === 'created') {
+        trySavePendingSale(durablePendingSale, 'rollback_in_progress');
+        await executeRollback(durablePendingSale);
+      }
       triggerToast('❌ حدث خطأ أثناء معالجة الفاتورة');
     } finally {
       setIsFinalizing(false);
@@ -3363,37 +4415,109 @@ export default function App() {
       cancelText: 'إلغاء ❌',
       isDanger: true,
       onConfirm: async () => {
+        const stockSteps: PendingStockStep[] = [];
+        
         if (isSaleRecord) {
           const record = sales.find(s => s.id === id);
-          if (record) {
-            if (record.itemId) {
-              const localItem = items.find(i => i.id === record.itemId);
-              await safeIncrementItemQty(record.itemId, record.qty, localItem?.qty);
-              setItems(prev => prev.map(item => item.id === record.itemId ? { ...item, qty: item.qty + record.qty } : item));
-            }
-          }
-          setSales(prev => prev.filter(s => s.id !== id));
-          const ok = await putWithOutbox(`/sales/${id}.json`, null);
-          if (ok) {
-            triggerToast('✅ تم إلغاء البيع وإعادة الستوك');
-            logAudit('delete', `إلغاء بيع سلع: ${record?.itemName || 'غير معروف'}`);
-            loadAllData();
-          } else {
-            triggerToast('❌ فشل حذف العملية من الخادم السحابي');
+          if (record && record.itemId) {
+            stockSteps.push({
+              kind: 'item',
+              targetId: record.itemId,
+              qty: record.qty || 1,
+              opId: `revert_sale_${id}`,
+              revertOpId: '',
+              status: 'pending'
+            });
           }
         } else {
           const record = otherIncome.find(o => o.id === id);
           if (record) {
-            // Rollback recharge
+            if ((record.category === 'recharge' || record.category === 'card') && record.cardOperator && record.cardValue) {
+              const normOp = normalizeOpName(record.cardOperator);
+              const normVal = String(record.cardValue).trim();
+              let card = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
+              let cardId = card ? card.id : `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`;
+              stockSteps.push({
+                kind: 'card',
+                targetId: cardId,
+                qty: record.qty || 1,
+                opId: `revert_card_${id}`,
+                revertOpId: '',
+                status: 'pending'
+              });
+            }
+            if (record.category === 'forfait' && record.cardOperator) {
+              let op = record.cardOperator;
+              if (op === 'Ooredoo 1005' || op === 'Ooredoo_1005') {
+                op = 'Ooredoo_1005';
+              } else if (op === 'Ooredoo 1006' || op === 'Ooredoo_1006') {
+                op = 'Ooredoo_1006';
+              } else if (op === 'Ooredoo') {
+                op = 'Ooredoo_1005';
+              }
+              stockSteps.push({
+                kind: 'forfait',
+                targetId: op,
+                qty: record.amount,
+                opId: `revert_forfait_${id}`,
+                revertOpId: '',
+                status: 'pending'
+              });
+            }
+            if (record.category === 'photo') {
+              stockSteps.push({
+                kind: 'photo',
+                targetId: 'photo',
+                qty: record.qty || 1,
+                opId: `revert_photo_${id}`,
+                revertOpId: '',
+                status: 'pending'
+              });
+            }
+            if (record.category === 'debt_payment' && record.debtId) {
+              stockSteps.push({
+                kind: 'debt_pay',
+                targetId: record.debtId,
+                qty: -record.amount,
+                opId: `revert_pay_${id}`,
+                revertOpId: '',
+                status: 'pending'
+              });
+            }
+          }
+        }
+
+        const pendingDel: PendingDeleteHistorySale = {
+          id: `del_sale_${id}`,
+          createdAt: Date.now(),
+          saleId: id,
+          isSaleRecord,
+          stockSteps,
+          status: 'created'
+        };
+
+        if (!savePendingDeleteHistorySale(pendingDel)) {
+          triggerToast('❌ فشل حفظ قيد الحذف محلياً، تم إيقاف العملية');
+          return;
+        }
+
+        // Optimistically update React state immediately
+        if (isSaleRecord) {
+          const record = sales.find(s => s.id === id);
+          if (record && record.itemId) {
+            setItems(prev => prev.map(item => item.id === record.itemId ? { ...item, qty: item.qty + (record.qty || 1) } : item));
+          }
+          setSales(prev => prev.filter(s => s.id !== id));
+        } else {
+          const record = otherIncome.find(o => o.id === id);
+          if (record) {
             if ((record.category === 'recharge' || record.category === 'card') && record.cardOperator && record.cardValue) {
               const restoreQty = record.qty || 1;
               const normOp = normalizeOpName(record.cardOperator);
               const normVal = String(record.cardValue).trim();
               const card = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
               if (card) {
-                const res = await safeIncrementCardQty(card.id, restoreQty, card.qty);
-                const newQty = res.newQty !== undefined ? res.newQty : card.qty + restoreQty;
-                setCardStock(prev => prev.map(c => c.id === card.id ? { ...c, qty: newQty } : c));
+                setCardStock(prev => prev.map(c => c.id === card.id ? { ...c, qty: c.qty + restoreQty } : c));
               } else {
                 const canonicalId = `std_card_${normOp.replace(/\s+/g, '')}_${normVal}`;
                 const newCard: CardStockEntry = {
@@ -3403,45 +4527,112 @@ export default function App() {
                   value: normVal,
                   qty: restoreQty
                 };
-                await putWithOutbox(`/cardStock/${newCard.id}.json`, newCard);
+                // Optimistically create new card locally if missing
                 setCardStock(prev => [...prev, newCard]);
               }
             }
-            // Rollback forfait balance
             if (record.category === 'forfait' && record.cardOperator) {
-              const op = record.cardOperator;
-              const updatedBalance: ForfaitBalance = { ...forfaitBalance };
+              let op = record.cardOperator;
               if (op === 'Ooredoo 1005' || op === 'Ooredoo_1005') {
-                updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + record.amount;
+                op = 'Ooredoo_1005';
               } else if (op === 'Ooredoo 1006' || op === 'Ooredoo_1006') {
-                updatedBalance.Ooredoo_1006 = (updatedBalance.Ooredoo_1006 || 0) + record.amount;
+                op = 'Ooredoo_1006';
               } else if (op === 'Ooredoo') {
-                updatedBalance.Ooredoo_1005 = (updatedBalance.Ooredoo_1005 || 0) + record.amount;
-              } else {
-                const curBal = updatedBalance[op] || 0;
-                updatedBalance[op] = curBal + record.amount;
+                op = 'Ooredoo_1005';
               }
-              updatedBalance.Ooredoo = (updatedBalance.Ooredoo_1005 || 0) + (updatedBalance.Ooredoo_1006 || 0);
-              await putWithOutbox('/forfaitBalance.json', updatedBalance);
-              setForfaitBalance(updatedBalance);
+              setForfaitBalance(prev => {
+                const next = { ...prev };
+                next[op] = roundTND((next[op] || 0) + record.amount);
+                next.Ooredoo = roundTND((next.Ooredoo_1005 || 0) + (next.Ooredoo_1006 || 0));
+                return next;
+              });
             }
-            // Rollback photo paper stock
             if (record.category === 'photo') {
-              const restoreQty = record.qty || 1;
-              const res = await safeIncrementPhotoStock(restoreQty, photoPaperStock);
-              const newQty = res.newQty !== undefined ? res.newQty : photoPaperStock + restoreQty;
-              setPhotoPaperStock(newQty);
+              setPhotoPaperStock(prev => prev + (record.qty || 1));
+            }
+            if (record.category === 'debt_payment' && record.debtId) {
+              const targetDebt = debts.find(d => d.id === record.debtId);
+              if (targetDebt) {
+                const newPaid = Math.max(0, roundTND(targetDebt.paid - record.amount));
+                const updatedDebt: Debt = {
+                  ...targetDebt,
+                  paid: newPaid,
+                  status: (newPaid >= targetDebt.amount - 0.001) ? 'paid' : 'open'
+                };
+                setDebts(prev => prev.map(d => d.id === record.debtId ? updatedDebt : d));
+              }
             }
           }
           setOtherIncome(prev => prev.filter(o => o.id !== id));
-          const ok = await putWithOutbox(`/otherIncome/${id}.json`, null);
-          if (ok) {
-            triggerToast('✅ تم إلغاء وحذف المدخول بنجاح');
-            logAudit('delete', `إلغاء مدخول: ${record?.label || 'غير معروف'}`);
-            loadAllData();
-          } else {
-            triggerToast('❌ فشل حذف العملية من الخادم السحابي');
+        }
+
+        if (!trySavePendingDeleteHistorySale(pendingDel, 'stock_restore_in_progress')) return;
+
+        let allStockCompleted = true;
+        for (const step of pendingDel.stockSteps) {
+          let res;
+          if (step.kind === 'item') {
+            res = await safeIncrementItemQty(step.targetId, step.qty, undefined, 6, step.opId);
+          } else if (step.kind === 'card') {
+            const cardId = step.targetId;
+            const existingCard = cardStock.find(c => c.id === cardId);
+            res = await safeIncrementCardQty(cardId, step.qty, undefined, 6, step.opId);
+            if (!existingCard && res && res.success) {
+              const parts = cardId.replace('std_card_', '').split('_');
+              if (parts.length >= 2) {
+                const rawOp = parts.slice(0, -1).join(' ');
+                const val = parts[parts.length - 1];
+                await patchWithOutbox(`/cardStock/${cardId}.json`, {
+                  id: cardId,
+                  kind: 'recharge',
+                  operator: normalizeOpName(rawOp),
+                  value: val
+                });
+              }
+            }
+          } else if (step.kind === 'forfait') {
+            res = await safeIncrementForfait({ [step.targetId]: step.qty }, 6, step.opId);
+          } else if (step.kind === 'photo') {
+            res = await safeIncrementPhotoStock(step.qty, undefined, 6, step.opId);
+          } else if (step.kind === 'debt_pay') {
+            res = await safeIncrementDebtPaid(step.targetId, step.qty, 6, step.opId);
+            if (res && res.success) {
+              const debt = debts.find(d => d.id === step.targetId);
+              if (debt) {
+                const newPaid = Math.max(0, roundTND(debt.paid + step.qty));
+                const newStatus = (newPaid >= debt.amount - 0.001) ? 'paid' : 'open';
+                await patchWithOutbox(`/debts/${step.targetId}.json`, { status: newStatus });
+              }
+            }
           }
+
+          if (res && res.success && !res.pending) {
+            step.status = 'completed';
+            savePendingDeleteHistorySale(pendingDel);
+          } else {
+            allStockCompleted = false;
+          }
+        }
+
+        if (!allStockCompleted) {
+          triggerToast('⏳ تم حفظ إلغاء العملية واسترجاع المخزون في قائمة الانتظار، سيُستكمل تلقائياً عند توفر الشبكة');
+          return;
+        }
+
+        if (!trySavePendingDeleteHistorySale(pendingDel, 'stock_restore_completed')) return;
+        if (!trySavePendingDeleteHistorySale(pendingDel, 'sale_delete_in_progress')) return;
+
+        const path = isSaleRecord ? `/sales/${id}.json` : `/otherIncome/${id}.json`;
+        const ok = await putWithOutbox(path, null);
+        if (ok.success && !ok.pending) {
+          if (trySavePendingDeleteHistorySale(pendingDel, 'completed')) {
+            removePendingDeleteHistorySale(pendingDel.id);
+          }
+          triggerToast('✅ تم إلغاء وحذف المدخول بنجاح');
+          logAudit('delete', `إلغاء مدخول ومعاملة`);
+          loadAllData();
+        } else {
+          triggerToast('⏳ تم استرجاع المخزون وحفظ حذف المدخول في قائمة الانتظار للمزامنة');
         }
       }
     });
@@ -3450,12 +4641,17 @@ export default function App() {
   // ---- 7. General Admin resets / utilities ----
   const handleSaveStartingCash = async (e: React.FormEvent) => {
     e.preventDefault();
+    const parsedVal = parseFloat(startingCashInput);
+    if (isNaN(parsedVal) || parsedVal < 0) {
+      return triggerToast('❌ الرجاء إدخال مبلغ صحيح غير سالب لكاش البداية');
+    }
     if (!await promptAndVerifyPin('أدخل الرمز السري لتسجيل فلوس الكاسة الحالية:')) return;
-    const inputVal = parseFloat((document.getElementById('starting-cash-inp') as HTMLInputElement)?.value) || 0;
-    
+    const inputVal = roundTND(parsedVal);
+
     const okReg = await putWithOutbox('/cashRegister.json', inputVal);
-    if (okReg) {
+    if (okReg.success) {
       setCashRegister(inputVal);
+      setStartingCashInput('');
       // Only set lastCashResetTimestamp if none exists yet, do NOT reset ongoing shift timestamp
       if (!lastCashResetTimestamp) {
         const newTimestamp = new Date().toISOString();
@@ -3487,11 +4683,11 @@ export default function App() {
       const totalQty = group.reduce((s, i) => s + i.qty, 0);
       const mergedBarcodes = Array.from(new Set(group.flatMap(i => i.barcodes || [])));
 
-      await putWithOutbox(`/items/${keep.id}.json`, {
-        ...keep,
-        qty: totalQty,
-        barcodes: mergedBarcodes
-      });
+      await patchWithOutbox(`/items/${keep.id}.json`, { barcodes: mergedBarcodes });
+      const qtyToAdd = totalQty - keep.qty;
+      if (qtyToAdd > 0) {
+        await safeIncrementItemQty(keep.id, qtyToAdd, keep.qty);
+      }
 
       // Delete other duplicate instances
       for (let x = 1; x < group.length; x++) {
@@ -3549,17 +4745,27 @@ export default function App() {
 
   // Change security pin
   const handleChangePin = async () => {
-    const current = prompt('أدخل رمز المدير الحالي:');
+    const current = await openInputDialog({
+      title: 'تغيير رمز المدير',
+      message: 'أدخل رمز المدير الحالي:',
+      inputType: 'password',
+      placeholder: 'الرمز الحالي...'
+    });
     if (!current) return;
-    
+
     const isCurrentOk = await verifyManagerPinViaAuth(current);
     const currentH = await sha256Hex(current);
-    
+
     if (!isCurrentOk && currentH !== managerPin) {
       return triggerToast('❌ الرمز الحالي غير صحيح');
     }
 
-    const next = prompt('أدخل رمز المدير الجديد:');
+    const next = await openInputDialog({
+      title: 'رمز المدير الجديد',
+      message: 'أدخل رمز المدير الجديد (4 أرقام أو أكثر):',
+      inputType: 'password',
+      placeholder: 'الرمز الجديد...'
+    });
     if (!next || next.trim().length < 4) return triggerToast('❌ يجب أن يتكون الرمز من 4 أرقام على الأقل');
 
     const nextTrimmed = next.trim();
@@ -3623,7 +4829,14 @@ export default function App() {
       for (const singleCode of codes) {
         const match = items.find(i => i.barcodes?.includes(singleCode));
         if (match) {
-          const amtStr = prompt(`السلعة "${match.name}" موجودة بالستوك بالباركود (${singleCode}). أدخل الكمية الإضافية لزيادتها:`, '1');
+          const amtStr = await openInputDialog({
+            title: 'زيادة كمية السلعة عبر الباركود',
+            message: `السلعة "${match.name}" موجودة بالستوك بالباركود (${singleCode}). أدخل الكمية الإضافية لزيادتها:`,
+            inputType: 'number',
+            defaultValue: '1',
+            step: '1',
+            min: '1'
+          });
           if (amtStr) {
             const amt = parseInt(amtStr, 10);
             if (amt > 0) {
@@ -3738,12 +4951,8 @@ export default function App() {
       }
       
       if (addedAny) {
-        const updated = {
-          ...match,
-          barcodes: updatedBarcodes
-        };
-        const ok = await putWithOutbox(`/items/${match.id}.json`, updated);
-        if (ok) {
+        const ok = await patchWithOutbox(`/items/${match.id}.json`, { barcodes: updatedBarcodes });
+        if (ok.success) {
           triggerToast(`✅ تم ربط الباركود الإضافي لـ "${match.name}"`);
           loadAllData();
         }
@@ -3773,18 +4982,6 @@ export default function App() {
   }, [expenses, lastCashResetTimestamp]);
 
   const isResettingShiftRef = useRef<boolean>(false);
-
-  const handleDeleteShiftLog = async (logId: string) => {
-    if (!await promptAndVerifyPin('أدخل الرمز السري لحذف سجل تصفير الوردية:')) return;
-    const ok = await putWithOutbox(`/shiftLogs/${logId}.json`, null);
-    if (ok) {
-      setShiftLogs(prev => prev.filter(l => l.id !== logId));
-      triggerToast('🗑️ تم حذف سجل الوردية بنجاح');
-      logAudit('delete', `حذف سجل تصفير وردية ID: ${logId}`);
-    } else {
-      triggerToast('❌ تعذر حذف السجل');
-    }
-  };
 
   const handlePerformShiftReset = async (data: {
     sellerName: string;
@@ -3854,30 +5051,16 @@ export default function App() {
       setOtherIncome([]);
       setExpenses([]);
 
-      // 3. Save shift log & new starting cash
-      const newLog: ShiftLog = {
-        id: `shift_${Date.now()}`,
-        timestamp: new Date().toISOString(),
-        sellerName: data.sellerName,
-        salesTotal: data.salesTotal,
-        otherIncomeTotal: data.otherIncomeTotal,
-        expensesTotal: data.expensesTotal,
-        expectedCashInDrawer: data.expectedCash,
-        actualCashInDrawer: data.actualCash,
-        cashWithdrawn: data.cashWithdrawn,
-        newStartingCash: data.newStartingCash,
-        difference: data.actualCash - data.expectedCash,
-        notes: data.notes
-      };
-
-      const okLog = await putWithOutbox(`/shiftLogs/${newLog.id}.json`, newLog);
+      // 3. Clear any legacy shiftLogs node & save new starting cash + reset timestamp
+      const resetTimestamp = new Date().toISOString();
+      clearOutboxForPaths(['/shiftLogs']);
+      await putWithOutbox('/shiftLogs.json', null);
       const okReg = await putWithOutbox('/cashRegister.json', data.newStartingCash);
-      const okTime = await putWithOutbox('/lastCashResetTimestamp.json', newLog.timestamp);
+      const okTime = await putWithOutbox('/lastCashResetTimestamp.json', resetTimestamp);
 
-      if (okReg || okLog) {
-        setShiftLogs(prev => [...prev, newLog]);
+      if (okReg.success || okTime.success) {
         setCashRegister(data.newStartingCash);
-        setLastCashResetTimestamp(newLog.timestamp);
+        setLastCashResetTimestamp(resetTimestamp);
         setShowShiftHandoverModal(false);
         triggerToast('✅ تم تصفير الكاسة، حفظ تقرير PDF، ومسح السجلات من الفايربيز بنجاح');
         logAudit('reset', `تصفير الوردية وتفريغ السحابة: ${data.sellerName} (كاش مفرغ: ${data.cashWithdrawn.toFixed(3)} د.ت)`);
@@ -3930,27 +5113,19 @@ export default function App() {
     const totalOtherVal = dOther.reduce((s, c) => s + c.amount, 0);
     const totalExpensesVal = dExpenses.reduce((s, c) => s + c.amount, 0);
 
-    // Profit calculations for selected period
+    // Profit calculations for selected period (includes commissions from all categories and all destinations)
     const totalBuyCostOfSalesVal = dSales.reduce((s, c) => s + ((c.unitBuy || 0) * c.qty), 0);
     const totalItemProfitsVal = totalSalesVal - totalBuyCostOfSalesVal;
-    const totalOtherProfitsVal = dOther.reduce((s, c) => s + (c.commission || 0), 0);
+    const totalOtherProfitsVal = dOtherAll.reduce((s, c) => s + (c.commission || 0), 0);
     const netProfitVal = totalItemProfitsVal + totalOtherProfitsVal - totalExpensesVal;
 
     const totalCashInflow = totalSalesVal + totalOtherVal;
     
     // Expected Cash in register calculation:
     let expectedCashInHandVal = 0;
-    let withdrawnAmountForFormula = 0;
 
-    if (dashboardDateFilter === 'shift') {
+    if (dashboardDateFilter === 'shift' || dashboardDateFilter === 'today' || dashboardDateFilter === 'all') {
       expectedCashInHandVal = cashRegister + totalCashInflow - totalExpensesVal;
-    } else if (dashboardDateFilter === 'today') {
-      const todayLogs = shiftLogs.filter(s => new Date(s.timestamp).getTime() >= startOfToday);
-      withdrawnAmountForFormula = todayLogs.reduce((sum, s) => sum + (s.cashWithdrawn || 0), 0);
-      expectedCashInHandVal = cashRegister + totalCashInflow - totalExpensesVal - withdrawnAmountForFormula;
-    } else if (dashboardDateFilter === 'all') {
-      withdrawnAmountForFormula = shiftLogs.reduce((sum, s) => sum + (s.cashWithdrawn || 0), 0);
-      expectedCashInHandVal = cashRegister + totalCashInflow - totalExpensesVal - withdrawnAmountForFormula;
     } else {
       expectedCashInHandVal = totalCashInflow - totalExpensesVal;
     }
@@ -3973,10 +5148,9 @@ export default function App() {
       totalCashInflow,
       totalBuyCostOfSales: totalBuyCostOfSalesVal,
       netProfit: netProfitVal,
-      expectedCashInHand: expectedCashInHandVal,
-      withdrawnAmountForFormula
+      expectedCashInHand: expectedCashInHandVal
     };
-  }, [sales, otherIncome, expenses, cashRegister, dashboardDateFilter, lastCashResetTimestamp, shiftLogs]);
+  }, [sales, otherIncome, expenses, cashRegister, dashboardDateFilter, lastCashResetTimestamp]);
 
   const {
     dOther,
@@ -3996,63 +5170,85 @@ export default function App() {
     expectedCashInHand
   } = filteredDashboardData;
 
-  const totalOwed = debts.filter(d => d.status === 'open').reduce((s, d) => s + (d.amount - d.paid), 0);
+  const totalOwed = useMemo(
+    () => debts.filter(d => d.status === 'open').reduce((s, d) => s + Math.max(0, roundTND((d.amount || 0) - (d.paid || 0))), 0),
+    [debts]
+  );
 
   // Smart Customer Grouping and Debt Calculations
   const groupedCustomerDebts = useMemo(() => {
     return groupDebtsByCustomer(debts);
   }, [debts]);
 
-  const openCustomerGroups = useMemo(() => {
-    return groupedCustomerDebts.filter(g => g.totalRemaining > 0.001 && (
-      !debtSearch || 
-      g.allNames.some(n => normalizeArabic(n).includes(normalizeArabic(debtSearch))) ||
-      (g.phone && g.phone.includes(debtSearch))
-    ));
-  }, [groupedCustomerDebts, debtSearch]);
+  const deferredInvoiceCustomerName = useDeferredValue(invoiceCustomerName);
+  const deferredInvoiceCustomerPhone = useDeferredValue(invoiceCustomerPhone);
 
-  const paidCustomerGroups = useMemo(() => {
-    return groupedCustomerDebts.filter(g => g.totalRemaining <= 0.001);
-  }, [groupedCustomerDebts]);
-
-  // Real-time suggestions for manual debt input
-  const manualDebtSuggestions = useMemo(() => {
-    return findCustomerSuggestions(manualDebt.name, manualDebt.phone, debts, 45);
-  }, [manualDebt.name, manualDebt.phone, debts]);
-
-  // Top fuzzy match for manual debt (for smart detection alert)
-  const topManualDebtMatch = useMemo(() => {
-    if (!manualDebt.name || manualDebt.name.trim().length < 2) return null;
-    const suggestions = findCustomerSuggestions(manualDebt.name, manualDebt.phone, debts, 60);
-    if (suggestions.length === 0) return null;
-    const top = suggestions[0];
-    // If exact name string is already typed, don't show the "Did you mean" prompt
-    if (top.canonicalName.trim().toLowerCase() === manualDebt.name.trim().toLowerCase()) {
-      return null;
-    }
-    return top;
-  }, [manualDebt.name, manualDebt.phone, debts]);
-
-  // Real-time suggestions for POS cart credit/debt input
+  // Real-time suggestions for POS cart credit/debt input (reuses groupedCustomerDebts)
   const invoiceCustomerSuggestions = useMemo(() => {
-    return findCustomerSuggestions(invoiceCustomerName, invoiceCustomerPhone, debts, 45);
-  }, [invoiceCustomerName, invoiceCustomerPhone, debts]);
+    return findCustomerSuggestionsFromGroups(
+      deferredInvoiceCustomerName,
+      deferredInvoiceCustomerPhone,
+      groupedCustomerDebts,
+      45
+    );
+  }, [deferredInvoiceCustomerName, deferredInvoiceCustomerPhone, groupedCustomerDebts]);
 
   const topInvoiceCustomerMatch = useMemo(() => {
-    if (!invoiceCustomerName || invoiceCustomerName.trim().length < 2) return null;
-    const suggestions = findCustomerSuggestions(invoiceCustomerName, invoiceCustomerPhone, debts, 60);
-    if (suggestions.length === 0) return null;
-    const top = suggestions[0];
-    if (top.canonicalName.trim().toLowerCase() === invoiceCustomerName.trim().toLowerCase()) {
+    if (!deferredInvoiceCustomerName || deferredInvoiceCustomerName.trim().length < 2) return null;
+    const top = invoiceCustomerSuggestions[0];
+    if (!top || top.score < 85) return null;
+    if (top.canonicalName.trim().toLowerCase() === deferredInvoiceCustomerName.trim().toLowerCase()) {
       return null;
     }
     return top;
-  }, [invoiceCustomerName, invoiceCustomerPhone, debts]);
+  }, [deferredInvoiceCustomerName, invoiceCustomerSuggestions]);
+
+  // Stable handlers for DebtsTab so unrelated App re-renders don't trigger DebtsTab re-renders
+  const debtHandlersRef = useRef({
+    handleAddManualDebt,
+    handleEditCustomer,
+    handlePayCustomerGroup,
+    handlePayDebt,
+    handleDeleteDebt
+  });
+  debtHandlersRef.current = {
+    handleAddManualDebt,
+    handleEditCustomer,
+    handlePayCustomerGroup,
+    handlePayDebt,
+    handleDeleteDebt
+  };
+  const stableOnAddManualDebt = useCallback(
+    (data: { name: string; phone: string; amount: string; note: string }) => debtHandlersRef.current.handleAddManualDebt(data),
+    []
+  );
+  const stableOnEditCustomer = useCallback(
+    (group: CustomerDebtGroup) => debtHandlersRef.current.handleEditCustomer(group),
+    []
+  );
+  const stableOnPayCustomerGroup = useCallback(
+    (group: CustomerDebtGroup, isFullPayment: boolean) => debtHandlersRef.current.handlePayCustomerGroup(group, isFullPayment),
+    []
+  );
+  const stableOnPayDebt = useCallback(
+    (debtId: string, fullPayment: boolean) => debtHandlersRef.current.handlePayDebt(debtId, fullPayment),
+    []
+  );
+  const stableOnDeleteDebt = useCallback(
+    (id: string) => debtHandlersRef.current.handleDeleteDebt(id),
+    []
+  );
 
   // Render variables
-  const openDebts = debts.filter(d => d.status === 'open' && (!debtSearch || normalizeArabic(d.customerName).includes(normalizeArabic(debtSearch))));
-  const paidDebts = debts.filter(d => d.status === 'paid').slice(-8).reverse();
-  const lowStockItems = items.filter(i => i.qty <= 3);
+  const paidDebts = useMemo(
+    () =>
+      debts
+        .filter(d => d.status === 'paid')
+        .sort((a, b) => (new Date(b.date).getTime() || 0) - (new Date(a.date).getTime() || 0))
+        .slice(0, 8),
+    [debts]
+  );
+  const lowStockItems = useMemo(() => items.filter(i => i.qty <= 3), [items]);
 
   // Grouped counters for each category
   const categoryTotals = useMemo(() => {
@@ -4077,7 +5273,10 @@ export default function App() {
   }, [items]);
 
   const filteredItems = items.filter(i => {
-    const matchesSearch = !stockSearch || normalizeArabic(i.name).includes(normalizeArabic(stockSearch));
+    const q = normalizeArabic(stockSearch);
+    const matchesSearch = !stockSearch || normalizeArabic(i.name).includes(q)
+      || (i.barcodes && i.barcodes.some(b => normalizeArabic(b).includes(q)))
+      || (i.barcode ? normalizeArabic(i.barcode).includes(q) : false);
     const cat = i.category || 'accessory';
     const matchesCategory = selectedStockCategory === 'all' || cat === selectedStockCategory;
     return matchesSearch && matchesCategory;
@@ -4368,28 +5567,55 @@ export default function App() {
       </header>
 
       {/* Offline Pending Outbox Warning Banner */}
-      {outboxCount > 0 && (
-        <div className="bg-rose-600 text-white px-4 py-3 shadow-lg flex flex-wrap items-center justify-between gap-3 z-40 text-xs font-bold border-b-2 border-rose-800">
-          <div className="flex items-center gap-2.5 max-w-3xl">
-            <span className="text-xl shrink-0">⚠️</span>
-            <div>
-              <span className="font-black text-sm block">
-                تنبيه هام جداً: يوجد {outboxCount} عملية معلقة لم تُرسل للسحابة من هذا الجهاز!
-              </span>
-              <span className="text-[11px] opacity-90 font-medium">
-                هذه العمليات محلياً فقط. لا تغلق المتصفح ولا تغير الجهاز قبل إرسالها لتفادي تداخل حسابات الصندوق.
-              </span>
+      {outboxCount > 0 && (() => {
+        const outboxList = loadOutbox();
+        const failedCount = outboxList.filter(e => !!e.error).length;
+        const pendingCount = outboxCount - failedCount;
+        return (
+          <div className="bg-rose-600 text-white px-4 py-3 shadow-lg flex flex-wrap items-center justify-between gap-3 z-40 text-xs font-bold border-b-2 border-rose-800">
+            <div className="flex items-center gap-2.5 max-w-3xl">
+              <span className="text-xl shrink-0">{failedCount > 0 ? '🚨' : '⚠️'}</span>
+              <div>
+                <span className="font-black text-sm block">
+                  {failedCount > 0 
+                    ? `تنبيه: يوجد ${failedCount} عملية فشلت بشكل دائم بسبب نقص في المخزون أو تعارض!`
+                    : `تنبيه هام: يوجد ${pendingCount} عملية معلقة لم تُرسل للسحابة من هذا الجهاز!`
+                  }
+                </span>
+                <span className="text-[11px] opacity-90 font-medium block mt-0.5">
+                  {failedCount > 0
+                    ? 'تم تسجيل المبيعات لكن لم يتم خصم المخزون. يرجى مراجعة المخزن.'
+                    : 'هذه العمليات محلياً فقط. لا تغلق المتصفح قبل إرسالها لتفادي فقدان البيانات.'
+                  }
+                </span>
+              </div>
+            </div>
+            <div className="flex gap-2 shrink-0">
+              {failedCount > 0 && (
+                <button
+                  onClick={() => {
+                    const list = loadOutbox();
+                    saveOutboxList(list.filter(e => !e.error));
+                    triggerToast('🗑️ تم مسح الإشعارات الخاصة بالعمليات الفاشلة');
+                  }}
+                  className="bg-rose-800 text-white hover:bg-rose-900 px-3 py-2 rounded-xl text-xs font-bold shadow-md cursor-pointer transition-all"
+                >
+                  مسح تنبيه الفشل
+                </button>
+              )}
+              {pendingCount > 0 && (
+                <button
+                  onClick={handleManualFlushOutbox}
+                  className="bg-white text-rose-950 hover:bg-rose-100 px-4 py-2 rounded-xl text-xs font-black shadow-md cursor-pointer transition-all flex items-center gap-1.5"
+                >
+                  <RefreshCw size={14} className="animate-spin-slow" />
+                  <span>إرسال المعلق ({pendingCount})</span>
+                </button>
+              )}
             </div>
           </div>
-          <button
-            onClick={handleManualFlushOutbox}
-            className="bg-white text-rose-950 hover:bg-rose-100 px-4 py-2 rounded-xl text-xs font-black shadow-md cursor-pointer transition-all flex items-center gap-1.5 shrink-0"
-          >
-            <RefreshCw size={14} className="animate-spin-slow" />
-            <span>إعادة محاولة إرسال العمليات الآن ({outboxCount})</span>
-          </button>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Main Tab Navigation */}
       {currentRole && (
@@ -4502,11 +5728,14 @@ export default function App() {
                   </div>
                   
                   <form onSubmit={handleSaveStartingCash} className="flex gap-2 mt-3">
-                    <input 
+                    <input
                       id="starting-cash-inp"
-                      type="number" 
+                      type="number"
                       step="0.001"
+                      min="0"
                       placeholder="0.000"
+                      value={startingCashInput}
+                      onChange={e => setStartingCashInput(e.target.value)}
                       className="flex-1 bg-white border border-stone-200 px-3 py-2 rounded-xl text-stone-800 font-mono text-sm"
                     />
                     <button type="submit" className="bg-stone-800 hover:bg-stone-900 text-white font-bold px-4 rounded-xl text-xs cursor-pointer">
@@ -4651,8 +5880,8 @@ export default function App() {
                     {expenses.length === 0 ? (
                       <p className="text-center text-stone-400 py-4 text-xs">لا توجد مصاريف مسجلة</p>
                     ) : (
-                      expenses.slice(0, expensesLimit).map((e, idx) => (
-                        <div key={idx} className="flex justify-between items-center text-xs p-2.5 bg-stone-50 rounded-xl border border-stone-100">
+                      expenses.slice(0, expensesLimit).map((e) => (
+                        <div key={e.id} className="flex justify-between items-center text-xs p-2.5 bg-stone-50 rounded-xl border border-stone-100">
                           <div>
                             <span className="font-bold text-stone-800">{e.desc}</span>
                             <span className="text-[10px] text-stone-400 mr-2">{new Date(e.date).toLocaleDateString('fr-TN')}</span>
@@ -4685,110 +5914,6 @@ export default function App() {
                         عرض جميع المصاريف ({expenses.length})
                       </button>
                     </div>
-                  )}
-                </div>
-
-                {/* Shift Handover Logs Table */}
-                <div className="bg-white rounded-2xl border border-stone-200 p-5 shadow-xs space-y-3">
-                  <div className="flex items-center justify-between border-b border-stone-100 pb-2">
-                    <h3 className="font-extrabold text-stone-800 text-xs flex items-center gap-2">
-                      <span>📜 سجل تسليم الورديات وتصفيرات الكاسة المسجلة ({shiftLogs.length})</span>
-                    </h3>
-                    <span className="text-[10px] text-stone-400">سجل أرشيف الورديات</span>
-                  </div>
-                  {shiftLogs.length === 0 ? (
-                    <p className="text-center text-stone-400 text-xs py-4">لم يتم تسجيل أي تصفير وردية سابق بعد</p>
-                  ) : (
-                    <>
-                      <div className="overflow-x-auto max-h-72 overflow-y-auto rounded-xl border border-stone-100">
-                        <table className="w-full text-right text-xs">
-                          <thead className="sticky top-0 bg-stone-50 z-10 shadow-xs">
-                            <tr className="text-stone-600 border-b border-stone-200 text-[11px]">
-                              <th className="p-2.5 rounded-r-xl">تاريخ ووقت التصفير</th>
-                              <th className="p-2.5">اسم الوردية / البائع</th>
-                              <th className="p-2.5">مداخيل الوردية</th>
-                              <th className="p-2.5">الفعلي بالدرج</th>
-                              <th className="p-2.5">المسحوب للخزنة</th>
-                              <th className="p-2.5">كاش بداية القادمة</th>
-                              <th className="p-2.5">الفارق / الحالة</th>
-                              <th className="p-2.5 rounded-l-xl text-center">إجراءات</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-stone-100 font-mono text-[11px]">
-                            {shiftLogs.slice().reverse().slice(0, shiftLogsLimit).map((log) => {
-                              const totalIncome = (log.salesTotal || 0) + (log.otherIncomeTotal || 0);
-                              const diff = log.difference || 0;
-                              return (
-                                <tr key={log.id} className="hover:bg-stone-50/80 transition-colors">
-                                  <td className="p-2.5 text-stone-500">{new Date(log.timestamp).toLocaleString('ar-TN')}</td>
-                                  <td className="p-2.5 font-sans font-bold text-stone-800">{log.sellerName || 'غير مسمى'}</td>
-                                  <td className="p-2.5 text-emerald-700 font-bold">{totalIncome.toFixed(3)} د.ت</td>
-                                  <td className="p-2.5 text-stone-900 font-bold">{(log.actualCashInDrawer || 0).toFixed(3)} د.ت</td>
-                                  <td className="p-2.5 text-blue-700 font-bold">{(log.cashWithdrawn || 0).toFixed(3)} د.ت</td>
-                                  <td className="p-2.5 text-amber-700 font-bold">{(log.newStartingCash || 0).toFixed(3)} د.ت</td>
-                                  <td className="p-2.5 font-sans">
-                                    {Math.abs(diff) < 0.001 ? (
-                                      <span className="text-emerald-700 font-bold bg-emerald-50 px-2 py-0.5 rounded-md">مطابقة ✅</span>
-                                    ) : diff < 0 ? (
-                                      <span className="text-rose-700 font-bold bg-rose-50 px-2 py-0.5 rounded-md dir-ltr">عجز {Math.abs(diff).toFixed(3)} ⚠️</span>
-                                    ) : (
-                                      <span className="text-blue-700 font-bold bg-blue-50 px-2 py-0.5 rounded-md dir-ltr">فائض {diff.toFixed(3)} ✨</span>
-                                    )}
-                                  </td>
-                                  <td className="p-2.5 text-center font-sans">
-                                    {currentRole === 'owner' && (
-                                      <button
-                                        onClick={() => handleDeleteShiftLog(log.id)}
-                                        title="حذف هذا السجل"
-                                        className="p-1 text-stone-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
-                                      >
-                                        <Trash2 size={13} />
-                                      </button>
-                                    )}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      {/* Pagination / Expand controls */}
-                      <div className="flex flex-wrap gap-2 justify-between items-center pt-2 text-xs">
-                        <span className="text-stone-400 text-[10px]">
-                          عرض {Math.min(shiftLogsLimit, shiftLogs.length)} من إجمالي {shiftLogs.length} وردية
-                        </span>
-                        <div className="flex gap-2">
-                          {shiftLogs.length > shiftLogsLimit && (
-                            <>
-                              <button
-                                type="button"
-                                onClick={() => setShiftLogsLimit(prev => prev + 10)}
-                                className="bg-amber-50 hover:bg-amber-100 text-amber-800 font-bold px-3 py-1.5 rounded-lg text-[10px] transition-colors cursor-pointer border border-amber-200"
-                              >
-                                عرض المزيد (+10) ⬇️
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setShiftLogsLimit(shiftLogs.length)}
-                                className="bg-stone-800 hover:bg-stone-900 text-white font-bold px-3 py-1.5 rounded-lg text-[10px] transition-colors cursor-pointer"
-                              >
-                                عرض كل السجلات ({shiftLogs.length}) 📜
-                              </button>
-                            </>
-                          )}
-                          {shiftLogsLimit > 5 && (
-                            <button
-                              type="button"
-                              onClick={() => setShiftLogsLimit(5)}
-                              className="bg-stone-100 hover:bg-stone-200 text-stone-600 font-bold px-3 py-1.5 rounded-lg text-[10px] transition-colors cursor-pointer border border-stone-200"
-                            >
-                              طي السجل ⬆️
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    </>
                   )}
                 </div>
               </div>
@@ -5000,8 +6125,8 @@ export default function App() {
                       <p className="text-stone-400 text-center py-6 text-xs">لا يوجد أي مخزون مسجل للبطاقات</p>
                     ) : (
                       <div className="space-y-2 max-h-48 overflow-y-auto">
-                        {cardStock.map((c, idx) => (
-                          <div key={idx} className="flex justify-between items-center text-xs p-2.5 bg-stone-50 rounded-xl border border-stone-100">
+                        {cardStock.map((c) => (
+                          <div key={c.id} className="flex justify-between items-center text-xs p-2.5 bg-stone-50 rounded-xl border border-stone-100">
                             <span className="font-bold text-stone-800">📶 {c.operator} — {c.value} د.ت</span>
                             <div className="flex items-center gap-2">
                               {currentRole === 'manager' ? (
@@ -5159,10 +6284,10 @@ export default function App() {
                       {[
                         { key: 'Orange', name: 'Orange', color: 'orange', dot: 'bg-orange-500', bg: 'bg-orange-50/50', border: 'border-orange-100' },
                         { key: 'Tunisie Telecom', name: 'اتصالات تونس (Tunisie Telecom)', color: 'sky', dot: 'bg-sky-600', bg: 'bg-sky-50/50', border: 'border-sky-100' }
-                      ].map((opItem, idx) => {
+                      ].map((opItem) => {
                         const bal = forfaitBalance[opItem.key] || 0;
                         return (
-                          <div key={idx} className={`flex justify-between items-center text-xs p-2.5 ${opItem.bg} rounded-xl border ${opItem.border}`}>
+                          <div key={opItem.key} className={`flex justify-between items-center text-xs p-2.5 ${opItem.bg} rounded-xl border ${opItem.border}`}>
                             <span className="font-bold text-stone-800 flex items-center gap-1.5">
                               <span className={`w-2.5 h-2.5 rounded-full ${opItem.dot} inline-block`}></span>
                               🌐 رصيد {opItem.name}
@@ -5333,8 +6458,8 @@ export default function App() {
                     {forfaitPlans
                       .slice()
                       .sort((a, b) => a.price - b.price)
-                      .map((p, idx) => (
-                      <div key={idx} className="flex justify-between items-center p-2.5 bg-stone-50 rounded-xl border border-stone-100">
+                      .map((p) => (
+                      <div key={p.id} className="flex justify-between items-center p-2.5 bg-stone-50 rounded-xl border border-stone-100">
                         <div>
                           <div className="font-bold text-xs text-stone-800">{p.name}</div>
                           <div className="text-[10px] text-stone-400">{p.validity}</div>
@@ -5468,8 +6593,8 @@ export default function App() {
                     {filteredItems.length === 0 ? (
                       <p className="text-stone-400 text-center py-8 text-xs">لا توجد سلع مطابقة لفتشك</p>
                     ) : (
-                      filteredItems.map((i, idx) => (
-                        <div key={idx} className="p-3 bg-stone-50 hover:bg-stone-100/50 border border-stone-100 rounded-xl transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      filteredItems.map((i) => (
+                        <div key={i.id} className="p-3 bg-stone-50 hover:bg-stone-100/50 border border-stone-100 rounded-xl transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                           <div className="flex items-center gap-2.5 overflow-hidden">
                             {/* Product Image or Fallback Camera Add Button */}
                             {i.imageUrl ? (
@@ -5849,11 +6974,11 @@ export default function App() {
                               className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
                             >
                               <option value="">-- اختر السلعة --</option>
-                              {sellFilteredItems.map((i, idx) => {
+                              {sellFilteredItems.map((i) => {
                                 const cat = i.category || 'accessory';
                                 const catInfo = CATEGORY_MAP[cat] || CATEGORY_MAP.accessory;
                                 return (
-                                  <option key={idx} value={i.id}>
+                                  <option key={i.id} value={i.id}>
                                     {catInfo.icon} [{catInfo.label}] {i.name} (المتوفر: {i.qty} قطع) — {i.sell.toFixed(3)} د.ت
                                   </option>
                                 );
@@ -6011,8 +7136,8 @@ export default function App() {
                                 {forfaitPlans
                                   .slice()
                                   .sort((a, b) => a.price - b.price)
-                                  .map((p, idx) => (
-                                    <option key={idx} value={p.id} dir="ltr">
+                                  .map((p) => (
+                                    <option key={p.id} value={p.id} dir="ltr">
                                       {p.name} {p.validity ? `(${p.validity})` : ''} ── {p.price.toFixed(3)} DT
                                     </option>
                                   ))}
@@ -6170,8 +7295,8 @@ export default function App() {
                         <span>أضف سلعاً من العمود الأيمن.</span>
                       </div>
                     ) : (
-                      cart.map((line, idx) => (
-                        <div key={idx} className="p-3 bg-stone-50 hover:bg-stone-100/60 rounded-xl border border-stone-200/80 text-[11px] transition-all space-y-2">
+                      cart.map((line) => (
+                        <div key={line.id} className="p-3 bg-stone-50 hover:bg-stone-100/60 rounded-xl border border-stone-200/80 text-[11px] transition-all space-y-2">
                           {/* Row 1: Item Label & Delete Button */}
                           <div className="flex justify-between items-start gap-2">
                             <div className="font-bold text-stone-900 text-xs leading-snug flex-1 break-words">
@@ -6330,7 +7455,7 @@ export default function App() {
                             <div className="flex flex-wrap gap-1 mt-1">
                               {invoiceCustomerSuggestions.slice(0, 3).map((sug, i) => (
                                 <button
-                                  key={i}
+                                  key={`${sug.canonicalName}-${sug.phone || i}`}
                                   type="button"
                                   onClick={() => {
                                     setInvoiceCustomerName(sug.canonicalName);
@@ -6452,8 +7577,8 @@ export default function App() {
                         return <p className="text-stone-400 text-center py-6 text-xs">لا توجد عمليات مسجلة لتوة</p>;
                       }
 
-                      return merged.slice(0, 10).map((entry, idx) => (
-                        <div key={idx} className="flex justify-between items-center p-2.5 bg-stone-50 rounded-xl border border-stone-100">
+                      return merged.slice(0, 10).map((entry) => (
+                        <div key={`${entry.isSale ? 's' : 'o'}_${entry.id}`} className="flex justify-between items-center p-2.5 bg-stone-50 rounded-xl border border-stone-100">
                           <div>
                             <div className="font-bold text-stone-800 text-xs flex items-center gap-1.5 flex-wrap">
                               <span>{entry.icon} {entry.label}</span>
@@ -6514,8 +7639,8 @@ export default function App() {
                     {expenses.length === 0 ? (
                       <p className="text-center text-stone-400 py-4 text-xs">لا توجد مصاريف مسجلة</p>
                     ) : (
-                      expenses.slice(0, expensesLimit).map((e, idx) => (
-                        <div key={idx} className="flex justify-between items-center text-xs p-2.5 bg-stone-50 rounded-xl border border-stone-100">
+                      expenses.slice(0, expensesLimit).map((e) => (
+                        <div key={e.id} className="flex justify-between items-center text-xs p-2.5 bg-stone-50 rounded-xl border border-stone-100">
                           <div>
                             <span className="font-bold text-stone-800">{e.desc}</span>
                             <span className="text-[10px] text-stone-400 mr-2">{new Date(e.date).toLocaleDateString('fr-TN')}</span>
@@ -6556,458 +7681,18 @@ export default function App() {
 
             {/* TAB 4: DEBTS */}
             {currentTab === 'debts' && (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                
-                {/* Add debt form */}
-                <div className="bg-white dark:bg-stone-900 rounded-2xl border border-stone-200 dark:border-stone-800 p-5 shadow-xs h-fit space-y-3">
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-extrabold text-stone-800 dark:text-stone-100 text-xs text-rose-800 dark:text-rose-400 flex items-center gap-1.5">
-                      <Plus size={16} /> تسجيل دين يدوي خارجي
-                    </h3>
-                    <span className="text-[10px] bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 font-bold px-2 py-0.5 rounded-full">
-                      دفتر الديون
-                    </span>
-                  </div>
-
-                  <form onSubmit={handleAddManualDebt} className="space-y-3">
-                    <div>
-                      <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">اسم الحريف بالكامل</label>
-                      <input 
-                        type="text" 
-                        placeholder="اسم الحريف (مثال: أحمد الطرابلسي)"
-                        value={manualDebt.name}
-                        onChange={e => setManualDebt(prev => ({ ...prev, name: e.target.value }))}
-                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 px-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 focus:ring-2 focus:ring-rose-500 focus:outline-none"
-                      />
-
-                      {/* Smart Fuzzy Detection Alert Prompt */}
-                      {topManualDebtMatch && (
-                        <div className="mt-2 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 p-2.5 rounded-xl text-[11px] animate-fade-in space-y-1.5">
-                          <div className="flex items-start gap-1.5 text-amber-900 dark:text-amber-200 font-bold">
-                            <AlertCircle size={14} className="shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
-                            <div>
-                              <span>هل تقصد الحريف المسجل: </span>
-                              <strong className="underline decoration-amber-500 font-black">{topManualDebtMatch.canonicalName}</strong>؟
-                            </div>
-                          </div>
-                          <div className="text-[10px] text-amber-800/80 dark:text-amber-300/80 pr-4">
-                            {topManualDebtMatch.reason}
-                            {topManualDebtMatch.totalRemaining > 0 && ` • لديه حالياً ديون قائمة بقيمة ${topManualDebtMatch.totalRemaining.toFixed(3)} د.ت`}
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setManualDebt(prev => ({
-                                ...prev,
-                                name: topManualDebtMatch.canonicalName,
-                                phone: topManualDebtMatch.phone || prev.phone
-                              }));
-                            }}
-                            className="w-full bg-amber-600 hover:bg-amber-700 text-white font-bold py-1 px-2 rounded-lg text-[10px] flex items-center justify-center gap-1 cursor-pointer transition-all shadow-xs"
-                          >
-                            <UserCheck size={12} /> اعتماد اسم وبيانات "{topManualDebtMatch.canonicalName}"
-                          </button>
-                        </div>
-                      )}
-
-                      {/* Smart Quick Suggestion Pills */}
-                      {manualDebtSuggestions.length > 0 && !topManualDebtMatch && (
-                        <div className="flex flex-wrap gap-1 mt-1.5">
-                          <span className="text-[9px] text-stone-400 dark:text-stone-500 w-full font-medium">حرفاء مسجلون مطابقون:</span>
-                          {manualDebtSuggestions.slice(0, 3).map((sug, i) => (
-                            <button
-                              key={i}
-                              type="button"
-                              onClick={() => setManualDebt(prev => ({ ...prev, name: sug.canonicalName, phone: sug.phone || prev.phone }))}
-                              className="bg-stone-100 hover:bg-stone-200 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-800 dark:text-stone-200 px-2 py-0.5 rounded-full text-[10px] transition-colors border border-stone-200 dark:border-stone-700 cursor-pointer flex items-center gap-1"
-                            >
-                              <span>👤 {sug.canonicalName}</span>
-                              {sug.totalRemaining > 0 && (
-                                <span className="text-rose-600 dark:text-rose-400 font-mono font-bold">({sug.totalRemaining.toFixed(3)} د.ت)</span>
-                              )}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    <div>
-                      <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">رقم هاتف الحريف</label>
-                      <input 
-                        type="text" 
-                        placeholder="رقم الهاتف (اختياري)"
-                        value={manualDebt.phone}
-                        onChange={e => setManualDebt(prev => ({ ...prev, phone: e.target.value }))}
-                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 px-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 font-mono focus:ring-2 focus:ring-rose-500 focus:outline-none"
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">المبلغ د.ت</label>
-                      <input 
-                        type="number" 
-                        step="0.001"
-                        placeholder="0.000"
-                        value={manualDebt.amount}
-                        onChange={e => setManualDebt(prev => ({ ...prev, amount: e.target.value }))}
-                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 px-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 font-mono focus:ring-2 focus:ring-rose-500 focus:outline-none"
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-[10px] text-stone-500 dark:text-stone-400 mb-0.5 font-medium">تفاصيل وملاحظة الدين</label>
-                      <input 
-                        type="text" 
-                        placeholder="سلفة كاش، شاحن، بطاقة..."
-                        value={manualDebt.note}
-                        onChange={e => setManualDebt(prev => ({ ...prev, note: e.target.value }))}
-                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 px-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 focus:ring-2 focus:ring-rose-500 focus:outline-none"
-                      />
-                    </div>
-
-                    <button type="submit" className="w-full bg-rose-700 hover:bg-rose-800 text-white font-bold py-2.5 rounded-xl text-xs cursor-pointer shadow-xs transition-colors flex items-center justify-center gap-1.5">
-                      <CreditCard size={14} /> سجل الدين بالدفتر 💳
-                    </button>
-                  </form>
-                </div>
-
-                {/* Debts listing columns (width 2) */}
-                <div className="md:col-span-2 space-y-4">
-                  <div className="bg-white dark:bg-stone-900 rounded-2xl border border-stone-200 dark:border-stone-800 p-5 shadow-xs space-y-3">
-                    
-                    {/* Header with stats and View Mode Switcher */}
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-stone-100 dark:border-stone-800">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <h3 className="font-extrabold text-stone-800 dark:text-stone-100 text-sm">📋 الديون المفتوحة</h3>
-                          <span className="bg-rose-100 dark:bg-rose-950/60 text-rose-800 dark:text-rose-300 px-2.5 py-0.5 rounded-full text-[10px] font-black">
-                            المجموع: {totalOwed.toFixed(3)} د.ت
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-stone-500 dark:text-stone-400 mt-0.5">
-                          {openCustomerGroups.length} حرفاء مدينين • إجمالي {openDebts.length} دين مفتوح
-                        </p>
-                      </div>
-
-                      {/* View Mode Switcher */}
-                      <div className="flex items-center bg-stone-100 dark:bg-stone-800 p-1 rounded-xl gap-1 text-xs shrink-0 self-start sm:self-auto">
-                        <button
-                          type="button"
-                          onClick={() => setDebtViewMode('grouped')}
-                          className={`flex items-center gap-1 px-2.5 py-1 rounded-lg font-bold transition-all text-[11px] cursor-pointer ${
-                            debtViewMode === 'grouped'
-                              ? 'bg-white dark:bg-stone-900 text-rose-700 dark:text-rose-400 shadow-xs'
-                              : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
-                          }`}
-                        >
-                          <Users size={13} /> تجميع ذكي للحرفاء ({openCustomerGroups.length})
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setDebtViewMode('list')}
-                          className={`flex items-center gap-1 px-2.5 py-1 rounded-lg font-bold transition-all text-[11px] cursor-pointer ${
-                            debtViewMode === 'list'
-                              ? 'bg-white dark:bg-stone-900 text-rose-700 dark:text-rose-400 shadow-xs'
-                              : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
-                          }`}
-                        >
-                          <Layers size={13} /> السجلات الفردية ({openDebts.length})
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Search Bar */}
-                    <div className="relative">
-                      <input 
-                        type="text" 
-                        placeholder="🔍 فتش باسم الحريف (يتعرف على الحروف المختلفة والأرقام)..."
-                        value={debtSearch}
-                        onChange={e => setDebtSearch(e.target.value)}
-                        className="w-full bg-stone-50 dark:bg-stone-800/80 border border-stone-200 dark:border-stone-700 pl-10 pr-3 py-2 rounded-xl text-xs text-stone-800 dark:text-stone-100 focus:ring-2 focus:ring-rose-500 focus:outline-none"
-                      />
-                      <Search className="absolute left-3 top-2.5 text-stone-400" size={14} />
-                    </div>
-
-                    {/* GROUPED VIEW */}
-                    {debtViewMode === 'grouped' && (
-                      <div className="space-y-3 max-h-[500px] overflow-y-auto pr-1">
-                        {openCustomerGroups.length === 0 ? (
-                          <div className="text-center py-10 space-y-1 text-stone-400 dark:text-stone-500">
-                            <CheckCircle size={32} className="mx-auto text-emerald-500 opacity-80" />
-                            <p className="font-bold text-xs">لا يوجد أي ديون مفتوحة حالياً 🎉</p>
-                            <p className="text-[10px]">كافة الحرفاء قاموا بتسوية مستحقاتهم بالكامل</p>
-                          </div>
-                        ) : (
-                          openCustomerGroups.map(group => {
-                            const isExpanded = !!expandedCustomerGroups[group.id];
-                            const hasMultipleNames = group.allNames.length > 1;
-
-                            return (
-                              <div 
-                                key={group.id}
-                                className="p-3.5 bg-stone-50 dark:bg-stone-800/60 hover:bg-stone-100/60 dark:hover:bg-stone-800 rounded-2xl border border-stone-200/80 dark:border-stone-700/80 transition-all space-y-2.5"
-                              >
-                                {/* Group Top Row: Customer info & Total Balance */}
-                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                                  <div className="space-y-1">
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                      <div className="font-extrabold text-stone-900 dark:text-stone-100 text-sm flex items-center gap-1.5">
-                                        <span className="w-6 h-6 rounded-full bg-rose-100 dark:bg-rose-950 text-rose-700 dark:text-rose-300 flex items-center justify-center text-xs font-black">
-                                          👤
-                                        </span>
-                                        <span>{group.canonicalName}</span>
-                                        {currentRole === 'manager' && (
-                                          <button
-                                            type="button"
-                                            onClick={() => handleEditCustomer(group)}
-                                            className="text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 transition-colors cursor-pointer"
-                                            title="تعديل اسم أو هاتف الحريف"
-                                          >
-                                            <Pencil size={12} />
-                                          </button>
-                                        )}
-                                      </div>
-
-                                      {group.openDebts.length > 1 && (
-                                        <span className="bg-amber-100 dark:bg-amber-950/80 text-amber-900 dark:text-amber-300 font-extrabold px-2 py-0.5 rounded-full text-[10px]">
-                                          {group.openDebts.length} ديون مفتوحة ⚡
-                                        </span>
-                                      )}
-
-                                      {group.phone && (
-                                        <a 
-                                          href={`tel:${group.phone}`}
-                                          className="text-[10px] text-stone-500 dark:text-stone-400 hover:text-stone-800 dark:hover:text-stone-200 font-mono flex items-center gap-1 bg-white dark:bg-stone-900 px-2 py-0.5 rounded-full border border-stone-200 dark:border-stone-700"
-                                        >
-                                          <PhoneCall size={10} /> {group.phone}
-                                        </a>
-                                      )}
-                                    </div>
-
-                                    {/* Smart Multiple Names / Fuzzy Cluster Alert */}
-                                    {hasMultipleNames && (
-                                      <div className="flex items-center gap-1.5 text-[10px] text-amber-800 dark:text-amber-300 bg-amber-50/80 dark:bg-amber-950/40 px-2.5 py-1 rounded-lg border border-amber-200 dark:border-amber-800/60">
-                                        <Merge size={12} className="shrink-0" />
-                                        <span>رصد أسماء متشابهة: {group.allNames.join(' ، ')}</span>
-                                        {currentRole === 'manager' && (
-                                          <button
-                                            type="button"
-                                            onClick={() => handleEditCustomer(group)}
-                                            className="mr-auto font-bold text-amber-900 dark:text-amber-200 underline hover:text-amber-700 cursor-pointer text-[10px]"
-                                          >
-                                            توحيد الاسم 🪄
-                                          </button>
-                                        )}
-                                      </div>
-                                    )}
-                                  </div>
-
-                                  {/* Right side: Amount & Settle Actions */}
-                                  <div className="flex items-center gap-2 self-end sm:self-auto">
-                                    <div className="text-right">
-                                      <div className="text-[10px] text-stone-400">إجمالي المتبقي</div>
-                                      <div className="font-mono text-base font-black text-rose-700 dark:text-rose-400">
-                                        {group.totalRemaining.toFixed(3)} د.ت
-                                      </div>
-                                    </div>
-                                  </div>
-                                </div>
-
-                                {/* Customer Group Actions Bar */}
-                                <div className="flex items-center justify-between gap-2 pt-2 border-t border-stone-200/60 dark:border-stone-700/60 flex-wrap">
-                                  <div className="flex items-center gap-1.5">
-                                    <button
-                                      type="button"
-                                      onClick={() => handlePayCustomerGroup(group, true)}
-                                      className="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-2.5 py-1 rounded-lg text-[10px] cursor-pointer transition-colors shadow-xs flex items-center gap-1"
-                                      title="سداد كامل الديون المفتوحة لهذا الحريف دفعة واحدة"
-                                    >
-                                      <Check size={12} /> سداد كامل ({group.totalRemaining.toFixed(3)} د.ت)
-                                    </button>
-
-                                    <button
-                                      type="button"
-                                      onClick={() => handlePayCustomerGroup(group, false)}
-                                      className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-2.5 py-1 rounded-lg text-[10px] cursor-pointer transition-colors shadow-xs flex items-center gap-1"
-                                      title="تسديد دفعة على الحساب يتم توزيعها تلقائياً على أقدم الديون"
-                                    >
-                                      <CreditCard size={12} /> دفعة على الحساب 💵
-                                    </button>
-                                  </div>
-
-                                  {/* Toggle breakdown button */}
-                                  <button
-                                    type="button"
-                                    onClick={() => setExpandedCustomerGroups(prev => ({ ...prev, [group.id]: !prev[group.id] }))}
-                                    className="text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-white text-[10px] font-bold flex items-center gap-1 cursor-pointer px-2 py-1 rounded-lg hover:bg-stone-200/60 dark:hover:bg-stone-700 transition-colors"
-                                  >
-                                    <span>تفاصيل الديون ({group.debts.length})</span>
-                                    {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-                                  </button>
-                                </div>
-
-                                {/* Expanded Itemized Debt Records for this customer */}
-                                {isExpanded && (
-                                  <div className="pt-2 border-t border-stone-200/60 dark:border-stone-700/60 space-y-2 animate-fade-in">
-                                    <div className="text-[10px] font-bold text-stone-500 dark:text-stone-400">
-                                      سجل الديون الفردية الخاصة بـ "{group.canonicalName}":
-                                    </div>
-                                    <div className="space-y-1.5">
-                                      {group.debts.map((d, dIdx) => {
-                                        const dRemaining = Math.max(0, d.amount - d.paid);
-                                        const isPaid = d.status === 'paid' || dRemaining <= 0.001;
-
-                                        return (
-                                          <div 
-                                            key={d.id || dIdx}
-                                            className={`p-2 rounded-xl text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 border ${
-                                              isPaid 
-                                                ? 'bg-emerald-50/50 dark:bg-emerald-950/20 border-emerald-200/60 dark:border-emerald-800/40 opacity-75' 
-                                                : 'bg-white dark:bg-stone-900 border-stone-200 dark:border-stone-700'
-                                            }`}
-                                          >
-                                            <div className="space-y-0.5">
-                                              <div className="flex items-center gap-2">
-                                                <span className="font-bold text-stone-800 dark:text-stone-200 text-xs">
-                                                  {d.note || 'دين'}
-                                                </span>
-                                                {d.customerName !== group.canonicalName && (
-                                                  <span className="text-[9px] bg-stone-100 dark:bg-stone-800 text-stone-500 px-1.5 py-0.2 rounded">
-                                                    سُجل باسم: {d.customerName}
-                                                  </span>
-                                                )}
-                                                {isPaid && (
-                                                  <span className="text-[9px] bg-emerald-100 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-300 font-bold px-1.5 py-0.2 rounded">
-                                                    مخلص بالكامل ✅
-                                                  </span>
-                                                )}
-                                              </div>
-                                              <div className="text-[10px] text-stone-400">
-                                                التاريخ: {new Date(d.date).toLocaleDateString('fr-TN')}
-                                                {d.customerPhone && ` • 📞 ${d.customerPhone}`}
-                                              </div>
-                                            </div>
-
-                                            <div className="flex items-center gap-2 self-end sm:self-auto">
-                                              <div className="text-right font-mono text-xs font-bold">
-                                                <span className="text-stone-400 text-[10px]">الأصل: {d.amount.toFixed(3)}</span>{' '}
-                                                <span className={isPaid ? "text-emerald-700 dark:text-emerald-400" : "text-rose-700 dark:text-rose-400"}>
-                                                  المتبقي: {dRemaining.toFixed(3)} د.ت
-                                                </span>
-                                              </div>
-
-                                              {!isPaid && (
-                                                <div className="flex items-center gap-1">
-                                                  <button
-                                                    type="button"
-                                                    onClick={() => handlePayDebt(d.id, true)}
-                                                    className="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-2 py-0.5 rounded text-[10px] cursor-pointer"
-                                                    title="سداد هذا الدين الفردي"
-                                                  >
-                                                    ✅ سداد
-                                                  </button>
-                                                  <button
-                                                    type="button"
-                                                    onClick={() => handlePayDebt(d.id, false)}
-                                                    className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-2 py-0.5 rounded text-[10px] cursor-pointer"
-                                                    title="سداد جزء من هذا الدين"
-                                                  >
-                                                    💵 جزء
-                                                  </button>
-                                                </div>
-                                              )}
-
-                                              {currentRole === 'manager' && (
-                                                <button
-                                                  type="button"
-                                                  onClick={() => handleDeleteDebt(d.id)}
-                                                  className="text-stone-400 hover:text-red-700 cursor-pointer p-1 rounded hover:bg-red-50 dark:hover:bg-red-950"
-                                                  title="حذف هذا الدين"
-                                                >
-                                                  <Trash2 size={13} />
-                                                </button>
-                                              )}
-                                            </div>
-                                          </div>
-                                        );
-                                      })}
-                                    </div>
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
-                    )}
-
-                    {/* FLAT LIST VIEW */}
-                    {debtViewMode === 'list' && (
-                      <div className="space-y-2 max-h-[500px] overflow-y-auto pr-1">
-                        {openDebts.length === 0 ? (
-                          <p className="text-stone-400 text-center py-8 text-xs">لا يوجد أي ديون مفتوحة حالياً 🎉</p>
-                        ) : (
-                          openDebts.map((d, idx) => {
-                            const remaining = d.amount - d.paid;
-                            return (
-                              <div key={idx} className="p-3 bg-stone-50 dark:bg-stone-800/60 hover:bg-stone-100/50 dark:hover:bg-stone-800 border border-stone-100 dark:border-stone-700/60 rounded-xl transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-                                <div>
-                                  <div className="font-bold text-stone-900 dark:text-stone-100">{d.customerName}</div>
-                                  {d.customerPhone && <div className="text-[10px] text-stone-400 font-mono">📞 {d.customerPhone}</div>}
-                                  <div className="text-[10px] text-stone-500 dark:text-stone-400 mt-0.5">📝 التفاصيل: {d.note}</div>
-                                  <div className="text-[10px] text-stone-400">التاريخ: {new Date(d.date).toLocaleDateString('fr-TN')}</div>
-                                </div>
-                                <div className="flex flex-col items-end gap-1.5">
-                                  <div className="font-bold font-mono">
-                                    <span className="text-stone-400">المجموع: {d.amount.toFixed(3)}</span>{' '}
-                                    <span className="text-rose-700 dark:text-rose-400">المتبقي: {remaining.toFixed(3)} د.ت</span>
-                                  </div>
-                                  <div className="flex gap-1.5">
-                                    <button onClick={() => handlePayDebt(d.id, true)} className="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">
-                                      ✅ سداد كامل
-                                    </button>
-                                    <button onClick={() => handlePayDebt(d.id, false)} className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">
-                                      💵 جزء
-                                    </button>
-                                    {currentRole === 'manager' && (
-                                      <button onClick={() => handleDeleteDebt(d.id)} className="text-stone-400 hover:text-red-700 cursor-pointer p-1">
-                                        <Trash2 size={13} />
-                                      </button>
-                                    )}
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Recently paid debts */}
-                  <div className="bg-white dark:bg-stone-900 rounded-2xl border border-stone-200 dark:border-stone-800 p-5 shadow-xs text-xs">
-                    <h3 className="font-extrabold text-stone-800 dark:text-stone-100 text-xs mb-3 text-emerald-800 dark:text-emerald-400 flex items-center gap-1.5">
-                      <CheckCircle size={14} /> ديون مخلصة مؤخراً
-                    </h3>
-                    {paidDebts.length === 0 ? (
-                      <p className="text-stone-400 dark:text-stone-500 text-center py-6">لا توجد ديون مخلصة مسجلة</p>
-                    ) : (
-                      <div className="space-y-1.5">
-                        {paidDebts.map((d, idx) => (
-                          <div key={idx} className="flex justify-between items-center p-2.5 bg-emerald-50/45 dark:bg-emerald-950/30 rounded-xl border border-emerald-100 dark:border-emerald-900/40">
-                            <div>
-                              <span className="font-bold text-stone-800 dark:text-stone-200">{d.customerName}</span>
-                              <span className="text-[10px] text-stone-400 mr-2">{d.note}</span>
-                            </div>
-                            <span className="font-mono text-emerald-700 dark:text-emerald-400 font-bold">{d.amount.toFixed(3)} د.ت</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-              </div>
+              <DebtsTab
+                debts={debts}
+                groupedCustomerDebts={groupedCustomerDebts}
+                totalOwed={totalOwed}
+                paidDebts={paidDebts}
+                currentRole={currentRole}
+                onAddManualDebt={stableOnAddManualDebt}
+                onEditCustomer={stableOnEditCustomer}
+                onPayCustomerGroup={stableOnPayCustomerGroup}
+                onPayDebt={stableOnPayDebt}
+                onDeleteDebt={stableOnDeleteDebt}
+              />
             )}
 
             {/* TAB 5: SALES HISTORY & AUDIT LOGS (Manager Only) */}
@@ -7110,8 +7795,8 @@ export default function App() {
                       <div className="space-y-2 max-h-[500px] overflow-y-auto pr-1">
                         {filteredHistory
                          .slice(0, historyLimit)
-                         .map((entry, idx) => (
-                          <div key={idx} className="flex justify-between items-center p-2.5 bg-stone-50 hover:bg-stone-100/50 rounded-xl border border-stone-100 transition-colors">
+                         .map((entry) => (
+                          <div key={`${entry.isSale ? 's' : 'o'}_${entry.id}`} className="flex justify-between items-center p-2.5 bg-stone-50 hover:bg-stone-100/50 rounded-xl border border-stone-100 transition-colors">
                             <div className="flex items-center gap-2.5">
                               <span className="text-base">{entry.icon}</span>
                               <div>
@@ -7784,10 +8469,92 @@ export default function App() {
         </div>
       )}
 
+      {/* Custom Input Modal Dialog (replaces window.prompt for iFrame compatibility) */}
+      {inputDialog.isOpen && (
+        <div
+          className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in font-sans"
+          dir="rtl"
+          onKeyDown={e => {
+            if (e.key === 'Escape') resolveInputDialog(null);
+          }}
+        >
+          <div className="bg-white rounded-3xl border border-stone-200 p-6 w-full max-w-sm shadow-2xl animate-scale-up text-right">
+            <h3 className="font-extrabold text-stone-900 text-sm mb-2 flex items-center gap-2">
+              <Pencil size={15} className="text-red-700 shrink-0" />
+              <span>{inputDialog.title}</span>
+            </h3>
+            <p className="text-stone-600 text-xs leading-relaxed mb-4 whitespace-pre-line">
+              {inputDialog.message}
+            </p>
+
+            {inputDialog.inputType === 'select' && inputDialog.options ? (
+              <div className="space-y-1.5 mb-4">
+                {inputDialog.options.map(opt => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => resolveInputDialog(opt.value)}
+                    className={`w-full text-right px-3.5 py-2.5 rounded-xl text-xs font-bold border transition-all cursor-pointer flex items-center justify-between ${
+                      inputDialog.value === opt.value
+                        ? 'bg-red-50 border-red-600 text-red-900'
+                        : 'bg-stone-50 border-stone-200 text-stone-800 hover:bg-stone-100'
+                    }`}
+                  >
+                    <span>{opt.label}</span>
+                    {inputDialog.value === opt.value && <Check size={14} className="text-red-700" />}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => resolveInputDialog(null)}
+                  className="w-full mt-2 bg-stone-100 hover:bg-stone-200 text-stone-700 font-extrabold py-2.5 rounded-xl text-xs cursor-pointer transition-colors"
+                >
+                  إلغاء
+                </button>
+              </div>
+            ) : (
+              <form
+                onSubmit={e => {
+                  e.preventDefault();
+                  resolveInputDialog(inputDialog.value);
+                }}
+                className="space-y-4"
+              >
+                <input
+                  type={inputDialog.inputType}
+                  step={inputDialog.step}
+                  min={inputDialog.min}
+                  placeholder={inputDialog.placeholder}
+                  value={inputDialog.value}
+                  onChange={e => setInputDialog(prev => ({ ...prev, value: e.target.value }))}
+                  autoFocus
+                  className="w-full bg-stone-50 border border-stone-300 focus:border-red-700 px-3.5 py-2.5 rounded-xl text-sm text-stone-900 font-mono focus:outline-none focus:ring-2 focus:ring-red-700/20"
+                />
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="submit"
+                    className="bg-red-700 hover:bg-red-800 text-white font-black py-2.5 rounded-xl text-xs cursor-pointer shadow-md transition-colors"
+                  >
+                    تأكيد ✅
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => resolveInputDialog(null)}
+                    className="bg-stone-100 hover:bg-stone-200 text-stone-700 font-extrabold py-2.5 rounded-xl text-xs cursor-pointer transition-colors"
+                  >
+                    إلغاء
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Connection Indicator footer status line */}
       {currentRole && (
         <footer className="fixed bottom-0 left-0 right-0 bg-white border-t border-stone-200 py-2 px-4 shadow-md text-[10px] text-stone-400 text-center select-none z-30">
-          📍 العنوان: نبر، الكاف | هاتف: 41 444 355 | متصل بالخادم السحابي لـ Yosri GSM
+          📍 العنوان: نبر، الكاف | هاتف: <span dir="ltr" className="inline-block font-mono">41 444 355</span> | متصل بالخادم السحابي لـ Yosri GSM
         </footer>
       )}
     </div>

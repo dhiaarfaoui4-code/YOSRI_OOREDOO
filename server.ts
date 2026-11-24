@@ -21,8 +21,11 @@ async function startServer() {
 
       const botToken = String(rawBotToken).replace(/\s+/g, "");
       const chatId = String(rawChatId).replace(/\s+/g, "");
+      if (!/^[0-9]+:[A-Za-z0-9_-]{20,}$/.test(botToken) || !/^-?[0-9A-Za-z_@]+$/.test(chatId)) {
+        return res.status(400).json({ success: false, error: "Invalid Telegram botToken or chatId format" });
+      }
 
-      const base64Data = pdfBase64.replace(/^data:application\/pdf;base64,/, "");
+      const base64Data = String(pdfBase64).replace(/^data:application\/pdf;base64,/, "");
       const buffer = Buffer.from(base64Data, "base64");
       const blob = new Blob([buffer], { type: "application/pdf" });
 
@@ -69,6 +72,9 @@ async function startServer() {
 
       const botToken = String(rawBotToken).replace(/\s+/g, "");
       const chatId = String(rawChatId).replace(/\s+/g, "");
+      if (!/^[0-9]+:[A-Za-z0-9_-]{20,}$/.test(botToken) || !/^-?[0-9A-Za-z_@]+$/.test(chatId)) {
+        return res.status(400).json({ error: "Invalid Telegram botToken or chatId format" });
+      }
 
       console.log(`Sending Telegram notification to chat ${chatId} using mode ${parseMode}...`);
 
@@ -78,7 +84,7 @@ async function startServer() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
-          text: message,
+          text: String(message),
           parse_mode: parseMode,
         }),
       });
@@ -119,7 +125,7 @@ async function startServer() {
       // CallMeBot uses a GET request
       const whatsappUrl = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(
         cleanPhone
-      )}&text=${encodeURIComponent(message)}&apikey=${encodeURIComponent(apiKey)}`;
+      )}&text=${encodeURIComponent(String(message))}&apikey=${encodeURIComponent(apiKey)}`;
 
       const response = await fetch(whatsappUrl);
       const textResponse = await response.text();
@@ -146,10 +152,10 @@ async function startServer() {
     try {
       const { imageData, inventory } = req.body;
 
-      if (!imageData || !inventory || !Array.isArray(inventory)) {
+      if (typeof imageData !== "string" || !imageData.trim() || imageData.length > 15_000_000 || !inventory || !Array.isArray(inventory)) {
         return res.status(400).json({
           success: false,
-          error: "Missing required parameters: imageData or inventory"
+          error: "Invalid or missing required parameters: imageData or inventory"
         });
       }
 

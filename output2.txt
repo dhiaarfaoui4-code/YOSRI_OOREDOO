@@ -1,0 +1,202 @@
+4 1 const targetFunction = `  const handleDeleteDebt = async (id: string) => {
+5 1     const debt = debts.find(d => d.id === id);
+6 1     if (!debt) return;
+7 1     if (!await promptAndVerifyPin(\`هل ترغب بحذف ملف دين الحريف "\${debt.customerName}" نهائياً؟\`)) return;
+8 1 
+9 1     // 1. Rollback items, recharge cards, and forfait balances to inventory/balances
+10 1     const itemIncrements: Record<string, number> = {};
+11 1     const cardIncrements: Record<string, { entry: CardStockEntry; totalQty: number }> = {};
+12 1     const forfaitIncrements: Record<string, number> = {};
+13 1     let photoIncrement = 0;
+14 1 
+15 2     if (debt.lines) {
+16 3       for (const line of debt.lines) {
+17 4         if (line.type === 'item' && line.itemId) {
+18 4           itemIncrements[line.itemId] = (itemIncrements[line.itemId] || 0) + line.qty;
+19 3         }
+20 4         if (line.type === 'recharge' && line.cardOperator && line.cardValue) {
+21 4           const normOp = normalizeOpName(line.cardOperator);
+22 4           const normVal = String(line.cardValue).trim();
+23 4           let card = cardStock.find(c => normalizeOpName(c.operator) === normOp && String(c.value).trim() === normVal);
+24 5           if (!card) {
+25 6             card = {
+26 6               id: \`std_card_\${normOp.replace(/\\s+/g, '')}_\${normVal}\`,
+27 6               kind: 'recharge',
+28 6               operator: normOp,
+29 6               value: normVal,
+30 6               qty: 0
+31 5             };
+32 4           }
+33 5           if (!cardIncrements[card.id]) {
+34 5             cardIncrements[card.id] = { entry: card, totalQty: 0 };
+35 4           }
+36 4           cardIncrements[card.id].totalQty += (line.qty || 1);
+37 3         }
+38 4         if (line.type === 'forfait' && line.cardOperator) {
+39 4           let opKey = line.cardOperator;
+40 5           if (opKey === 'Ooredoo 1005' || opKey === 'Ooredoo_1005') {
+41 5             opKey = 'Ooredoo_1005';
+42 5           } else if (opKey === 'Ooredoo 1006' || opKey === 'Ooredoo_1006') {
+43 5             opKey = 'Ooredoo_1006';
+44 5           } else if (opKey === 'Ooredoo') {
+45 5             opKey = 'Ooredoo_1005';
+46 4           }
+47 4           forfaitIncrements[opKey] = (forfaitIncrements[opKey] || 0) + (line.total || 0);
+48 3         }
+49 4         if (line.type === 'photo') {
+50 4           photoIncrement += (line.qty || 1);
+51 3         }
+52 2       }
+53 1     }
+54 1 
+55 1     const stockSteps: PendingStockStep[] = [];
+56 2     for (const itemId of Object.keys(itemIncrements)) {
+57 3       stockSteps.push({
+58 3         kind: 'item',
+59 3         targetId: itemId,
+60 3         qty: itemIncrements[itemId],
+61 3         opId: \`revert_inv_item_\${id}_\${itemId}\`,
+62 3         revertOpId: '',
+63 3         status: 'pending'
+64 2       });
+65 1     }
+66 2     for (const cardId of Object.keys(cardIncrements)) {
+67 2       const { totalQty } = cardIncrements[cardId];
+68 3       stockSteps.push({
+69 3         kind: 'card',
+70 3         targetId: cardId,
+71 3         qty: totalQty,
+72 3         opId: \`revert_inv_card_\${id}_\${cardId}\`,
+73 3         revertOpId: '',
+74 3         status: 'pending'
+75 2       });
+76 1     }
+77 2     for (const opKey of Object.keys(forfaitIncrements)) {
+78 3       stockSteps.push({
+79 3         kind: 'forfait',
+80 3         targetId: opKey,
+81 3         qty: forfaitIncrements[opKey],
+82 3         opId: \`revert_inv_forfait_\${id}_\${opKey}\`,
+83 3         revertOpId: '',
+84 3         status: 'pending'
+85 2       });
+86 1     }
+87 2     if (photoIncrement > 0) {
+88 3       stockSteps.push({
+89 3         kind: 'photo',
+90 3         targetId: 'photo',
+91 3         qty: photoIncrement,
+92 3         opId: \`revert_inv_photo_\${id}\`,
+93 3         revertOpId: '',
+94 3         status: 'pending'
+95 2       });
+96 1     }
+97 1 
+98 1     const relatedIncomes = otherIncome.filter(o => o.debtId === id);
+99 1     const incomeIdsToDelete = relatedIncomes.map(inc => inc.id);
+100 1 
+101 1     const pendingDelOpId = \`del_debt_\${id}\`;
+102 2     const pendingDel: PendingDeleteDebt = {
+103 2       id: pendingDelOpId,
+104 2       createdAt: Date.now(),
+105 2       debtId: id,
+106 2       stockSteps,
+107 2       incomeIdsToDelete,
+108 2       status: 'created'
+109 1     };
+110 1 
+111 1     const persistOk = savePendingDeleteDebt(pendingDel);
+112 2     if (!persistOk) {
+113 2       return triggerToast('❌ فشل حفظ قيد الحذف محلياً، تم إيقاف العملية');
+114 1     }
+115 1 
+116 1     // Optimistically update React state immediately
+117 1     setDebts(prev => prev.filter(d => d.id !== id));
+118 1     setOtherIncome(prev => prev.filter(o => o.debtId !== id));
+119 1 
+120 2     if (Object.keys(itemIncrements).length > 0) {
+121 3       setItems(prevItems => prevItems.map(item => {
+122 3         const inc = itemIncrements[item.id];
+123 3         return inc ? { ...item, qty: item.qty + inc } : item;
+124 2       }));
+125 1     }
+126 1 
+127 2     if (Object.keys(cardIncrements).length > 0) {
+128 3       setCardStock(prevCards => prevCards.map(card => {
+129 3         const inc = cardIncrements[card.id];
+130 3         return inc ? { ...card, qty: card.qty + inc.totalQty } : card;
+131 2       }));
+132 1     }
+133 1 
+134 2     if (Object.keys(forfaitIncrements).length > 0) {
+135 3       setForfaitBalance(prev => {
+136 3         const next = { ...prev };
+137 4         for (const opKey of Object.keys(forfaitIncrements)) {
+138 5           if (next[opKey] !== undefined) {
+139 5             next[opKey] += forfaitIncrements[opKey];
+140 4           }
+141 3         }
+142 3         return next;
+143 2       });
+144 1     }
+145 2     if (photoIncrement > 0) {
+146 2       setPhotoPaperStock(prev => prev + photoIncrement);
+147 1     }
+148 1 
+149 1     if (!trySavePendingDeleteDebt(pendingDel, 'stock_rollback_in_progress')) return;
+150 1 
+151 1     let allStockCompleted = true;
+152 2     for (const step of pendingDel.stockSteps) {
+153 2       let res;
+154 3       if (step.kind === 'item') {
+155 3         res = await safeIncrementItemQty(step.targetId, step.qty, undefined, 6, step.opId);
+156 3       } else if (step.kind === 'card') {
+157 3         res = await safeIncrementCardQty(step.targetId, step.qty, undefined, 6, step.opId);
+158 3       } else if (step.kind === 'forfait') {
+159 3         res = await safeIncrementForfait({ [step.targetId]: step.qty }, 6, step.opId);
+160 3       } else if (step.kind === 'photo') {
+161 3         res = await safeIncrementPhotoStock(step.qty, undefined, 6, step.opId);
+162 2       }
+163 2 
+164 3       if (res && res.success && !res.pending) {
+165 3         step.status = 'completed';
+166 3         savePendingDeleteDebt(pendingDel);
+167 3       } else {
+168 3         allStockCompleted = false;
+169 2       }
+170 1     }
+171 1 
+172 2     if (allStockCompleted) {
+173 2       if (!trySavePendingDeleteDebt(pendingDel, 'stock_rollback_completed')) return;
+174 1     }
+175 1 
+176 2     if (pendingDel.status === 'stock_rollback_completed') {
+177 2       if (!trySavePendingDeleteDebt(pendingDel, 'income_delete_in_progress')) return;
+178 1     }
+179 1 
+180 2     if (pendingDel.status === 'income_delete_in_progress') {
+181 2       let allIncomeDeleted = true;
+182 3       for (const incomeId of pendingDel.incomeIdsToDelete) {
+183 3         const res = await putWithOutbox(\`/otherIncome/\${incomeId}.json\`, null);
+184 4         if (!res.success || res.pending) {
+185 4           allIncomeDeleted = false;
+186 3         }
+187 2       }
+188 3       if (allIncomeDeleted) {
+189 3          if (!trySavePendingDeleteDebt(pendingDel, 'debt_delete_in_progress')) return;
+190 2       }
+191 1     }
+192 1 
+193 2     if (pendingDel.status === 'debt_delete_in_progress') {
+194 2       const ok = await putWithOutbox(\`/debts/\${id}.json\`, null);
+195 3       if (ok.success && !ok.pending) {
+196 4         if (trySavePendingDeleteDebt(pendingDel, 'completed')) {
+197 4           removePendingDeleteDebt(pendingDel.id);
+198 3         }
+199 2       }
+200 2       
+201 2       triggerToast('✅ تم حذف الدين واسترجاع المشتريات للمخزن');
+202 2       logAudit('delete', \`حذف دين الحريف \${debt.customerName} بقيمة \${debt.amount.toFixed(3)} د.ت واسترجاع المشتريات للمخزون\`);
+203 2       loadAllData();
+204 1     }
+205 0   };`;

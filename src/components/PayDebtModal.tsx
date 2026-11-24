@@ -31,6 +31,7 @@ export const PayDebtModal: React.FC<PayDebtModalProps> = ({
   const [payAmountInput, setPayAmountInput] = useState<string>('');
   const [destination, setDestination] = useState<'drawer' | 'manager'>('drawer');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [errorMsg, setErrorMsg] = useState<string>('');
 
   const customerName = target?.type === 'group' 
     ? (target.group?.canonicalName || 'حريف')
@@ -56,6 +57,7 @@ export const PayDebtModal: React.FC<PayDebtModalProps> = ({
       setPayAmountInput(initialAmt.toFixed(3));
       setDestination('drawer');
       setIsSubmitting(false);
+      setErrorMsg('');
     }
   }, [isOpen, target, totalRemaining]);
 
@@ -66,11 +68,15 @@ export const PayDebtModal: React.FC<PayDebtModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (payAmount <= 0) return;
-    if (payAmount > totalRemaining + 0.001) {
-      alert(`المبلغ المدفوع (${payAmount.toFixed(3)}) يتجاوز إجمالي الدين المتبقي (${totalRemaining.toFixed(3)} د.ت)`);
+    if (payAmount <= 0) {
+      setErrorMsg('يرجى إدخال مبلغ صحيح أكبر من 0.');
       return;
     }
+    if (payAmount > totalRemaining + 0.001) {
+      setErrorMsg(`المبلغ المدفوع (${payAmount.toFixed(3)}) يتجاوز إجمالي الدين المتبقي (${totalRemaining.toFixed(3)} د.ت)`);
+      return;
+    }
+    setErrorMsg('');
 
     try {
       setIsSubmitting(true);
@@ -127,7 +133,7 @@ export const PayDebtModal: React.FC<PayDebtModalProps> = ({
                   </div>
                   {customerPhone && (
                     <div className="text-[10px] text-stone-400 font-mono">
-                      📞 {customerPhone}
+                      📞 <span dir="ltr" className="inline-block font-mono">{customerPhone}</span>
                     </div>
                   )}
                 </div>
@@ -167,7 +173,7 @@ export const PayDebtModal: React.FC<PayDebtModalProps> = ({
                 max={totalRemaining + 0.001}
                 required
                 value={payAmountInput}
-                onChange={e => setPayAmountInput(e.target.value)}
+                onChange={e => { setPayAmountInput(e.target.value); if (errorMsg) setErrorMsg(''); }}
                 className="w-full bg-stone-50 dark:bg-stone-800 border-2 border-stone-200 dark:border-stone-700 focus:border-rose-500 dark:focus:border-rose-500 rounded-2xl px-3.5 py-2.5 text-base font-mono font-black text-stone-900 dark:text-stone-100 outline-none transition-all"
                 placeholder="0.000"
               />
@@ -175,6 +181,13 @@ export const PayDebtModal: React.FC<PayDebtModalProps> = ({
                 د.ت
               </span>
             </div>
+
+            {errorMsg && (
+              <div className="mt-2 p-2.5 rounded-xl bg-rose-50 dark:bg-rose-950/60 border border-rose-300 dark:border-rose-700 text-rose-800 dark:text-rose-200 text-[11px] font-bold flex items-center gap-1.5">
+                <AlertCircle size={14} className="shrink-0" />
+                <span>{errorMsg}</span>
+              </div>
+            )}
 
             {/* Quick Amount Buttons */}
             <div className="flex flex-wrap gap-1.5 mt-2">
