@@ -130,7 +130,7 @@ export type AppRole = 'manager' | 'seller';
 
 export interface PendingSaleLine {
   id: string;
-  type: 'item' | 'recharge' | 'forfait' | 'photo' | 'service';
+  type: 'item' | 'recharge' | 'forfait' | 'photo' | 'service' | 'bill';
   itemId?: string;
   label: string;
   qty: number;

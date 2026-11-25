@@ -493,7 +493,7 @@ export default function App() {
   const [sparePartsLimit, setSparePartsLimit] = useState(20);
 
   // Income Line Form State
-  const [incomeType, setIncomeType] = useState<'item' | 'recharge' | 'forfait' | 'photo' | 'service'>('item');
+  const [incomeType, setIncomeType] = useState<'item' | 'recharge' | 'forfait' | 'photo' | 'service' | 'bill'>('item');
   const [sellSearch, setSellSearch] = useState('');
   const [sellItemId, setSellItemId] = useState('');
   const [sellQty, setSellQty] = useState('1');
@@ -512,6 +512,10 @@ export default function App() {
   const [serviceType, setServiceType] = useState('Cache');
   const [serviceCustomDesc, setServiceCustomDesc] = useState('');
   const [serviceAmount, setServiceAmount] = useState('');
+  const [billType, setBillType] = useState('STEG (كهرباء وغاز)');
+  const [billCustomDesc, setBillCustomDesc] = useState('');
+  const [billReference, setBillReference] = useState('');
+  const [billAmount, setBillAmount] = useState('');
 
   // Finalize invoice form
   const [invoiceCustomerName, setInvoiceCustomerName] = useState('');
@@ -532,13 +536,13 @@ export default function App() {
   const [selectedSellCategory, setSelectedSellCategory] = useState<string>('all');
   const [auditLogSearch, setAuditLogSearch] = useState('');
   const [historySearch, setHistorySearch] = useState('');
-  const [historyCategory, setHistoryCategory] = useState<'all' | 'item' | 'recharge' | 'forfait' | 'photo' | 'service'>('all');
+  const [historyCategory, setHistoryCategory] = useState<'all' | 'item' | 'recharge' | 'forfait' | 'photo' | 'service' | 'bill'>('all');
   const [historyDateFilter, setHistoryDateFilter] = useState<'all' | 'today' | 'yesterday' | '7days' | '30days'>('all');
 
   // Cart
   interface CartLine {
     id: string;
-    type: 'item' | 'recharge' | 'forfait' | 'photo' | 'service';
+    type: 'item' | 'recharge' | 'forfait' | 'photo' | 'service' | 'bill';
     itemId?: string;
     label: string;
     qty: number;
@@ -2129,7 +2133,7 @@ export default function App() {
         })),
         ...otherToRemove.map(o => ({
           date: o.date,
-          label: `${o.category === 'forfait_replenish' ? 'شحن رصيد فورفي' : o.category === 'card' ? 'بيع كارت شحن' : 'خدمة أخرى'}: ${o.label}`,
+          label: `${o.category === 'forfait_replenish' ? 'شحن رصيد فورفي' : o.category === 'card' ? 'بيع كارت شحن' : o.category === 'bill' ? 'خلاص فاتورة' : 'خدمة أخرى'}: ${o.label}`,
           qty: o.qty || 1,
           price: o.amount / (o.qty || 1),
           total: o.amount
@@ -2379,7 +2383,7 @@ export default function App() {
         })),
         ...shiftOtherIncome.map(o => ({
           date: o.date,
-          label: `${o.category === 'forfait_replenish' ? 'شحن رصيد فورفي' : o.category === 'card' ? 'بيع كارت شحن' : 'خدمة أخرى'}: ${o.label}`,
+          label: `${o.category === 'forfait_replenish' ? 'شحن رصيد فورفي' : o.category === 'card' ? 'بيع كارت شحن' : o.category === 'bill' ? 'خلاص فاتورة' : 'خدمة أخرى'}: ${o.label}`,
           qty: o.qty || 1,
           price: o.amount / (o.qty || 1),
           total: o.amount
@@ -3717,6 +3721,35 @@ export default function App() {
       setServiceAmount('');
       triggerToast('✅ تم إضافة خدمة الصيانة للفاتورة');
     }
+
+    else if (incomeType === 'bill') {
+      const desc = billType === 'other' ? billCustomDesc.trim() : billType;
+      if (!desc) return triggerToast('❌ حدد نوع الفاتورة');
+      const billAmt = roundTND(parseFloat(billAmount) || 0);
+      if (!Number.isFinite(billAmt) || billAmt <= 0) return triggerToast('❌ أدخل قيمة الفاتورة الصحيحة');
+
+      const refText = billReference.trim() ? ` (${billReference.trim()})` : '';
+      const label = `خلاص فاتورة ${desc}${refText} — [izi الزيتونة]`;
+
+      const newLine: CartLine = {
+        id: Math.random().toString(36).slice(2, 9),
+        type: 'bill',
+        label,
+        qty: 1,
+        unitPrice: billAmt,
+        unitBuy: billAmt,
+        total: billAmt,
+        commission: 0,
+        cardOperator: 'izi',
+        cardValue: billAmt.toFixed(3),
+        customerPhone: billReference.trim() || undefined
+      };
+      setCart(prev => [...prev, newLine]);
+      setBillCustomDesc('');
+      setBillReference('');
+      setBillAmount('');
+      triggerToast('✅ تم إضافة خلاص الفاتورة (izi الزيتونة) للفاتورة');
+    }
   };
 
   const handleRemoveFromCart = (id: string) => {
@@ -3735,11 +3768,16 @@ export default function App() {
     setCart(prev => prev.map(c => {
       if (c.id === lineId) {
         const faceVal = parseFloat(c.cardValue || '0');
-        const newCommission = c.type === 'recharge' && faceVal > 0 ? (val - faceVal) * c.qty : c.commission;
+        const newCommission =
+          c.type === 'recharge' && faceVal > 0
+            ? roundTND((val - faceVal) * c.qty)
+            : c.type === 'bill' && faceVal > 0
+            ? Math.max(0, roundTND((val - faceVal) * c.qty))
+            : c.commission;
         return {
           ...c,
           unitPrice: val,
-          total: val * c.qty,
+          total: roundTND(val * c.qty),
           commission: newCommission
         };
       }
@@ -3803,11 +3841,16 @@ export default function App() {
     setCart(prev => prev.map(c => {
       if (c.id === lineId) {
         const faceVal = parseFloat(c.cardValue || '0');
-        const newCommission = c.type === 'recharge' && faceVal > 0 ? (c.unitPrice - faceVal) * newQty : c.commission;
+        const newCommission =
+          c.type === 'recharge' && faceVal > 0
+            ? roundTND((c.unitPrice - faceVal) * newQty)
+            : c.type === 'bill' && faceVal > 0
+            ? Math.max(0, roundTND((c.unitPrice - faceVal) * newQty))
+            : c.commission;
         return {
           ...c,
           qty: newQty,
-          total: c.unitPrice * newQty,
+          total: roundTND(c.unitPrice * newQty),
           commission: newCommission
         };
       }
@@ -3873,11 +3916,16 @@ export default function App() {
     setCart(prev => prev.map(c => {
       if (c.id === lineId) {
         const faceVal = parseFloat(c.cardValue || '0');
-        const newCommission = c.type === 'recharge' && faceVal > 0 ? (c.unitPrice - faceVal) * val : c.commission;
+        const newCommission =
+          c.type === 'recharge' && faceVal > 0
+            ? roundTND((c.unitPrice - faceVal) * val)
+            : c.type === 'bill' && faceVal > 0
+            ? Math.max(0, roundTND((c.unitPrice - faceVal) * val))
+            : c.commission;
         return {
           ...c,
           qty: val,
-          total: c.unitPrice * val,
+          total: roundTND(c.unitPrice * val),
           commission: newCommission
         };
       }
@@ -4228,13 +4276,15 @@ export default function App() {
           let lineBuy = 0;
           if (c.type === 'item') {
             lineBuy = typeof c.unitBuy === 'number' ? c.unitBuy : (c.itemId ? (items.find(i => i.id === c.itemId)?.buy || 0) : 0);
+          } else if (c.type === 'bill') {
+            lineBuy = typeof c.unitBuy === 'number' ? c.unitBuy : roundTND(Math.max(0, c.unitPrice - (c.commission || 0)));
           }
           return {
             type: c.type,
             itemId: c.itemId || null,
             itemName: c.type === 'item' ? c.label : null,
             qty: c.qty,
-            unitBuy: c.type === 'item' ? lineBuy : undefined,
+            unitBuy: (c.type === 'item' || c.type === 'bill') ? lineBuy : undefined,
             unitPrice: c.unitPrice,
             cardOperator: c.cardOperator || null,
             cardValue: c.cardValue || null,
@@ -4263,7 +4313,7 @@ export default function App() {
         // Record upfront down payment into income/cash register if present
         if (initialPayVal > 0) {
           const totalDebtCost = debtLines.reduce((s, line) => {
-            if (line.type === 'item') {
+            if (line.type === 'item' || line.type === 'bill') {
               return s + ((line.unitBuy || 0) * (line.qty || 1));
             }
             return s;
@@ -5106,6 +5156,7 @@ export default function App() {
     const totalRechargeSalesVal = dOther.filter(o => o.category === 'recharge').reduce((s, c) => s + c.amount, 0);
     const totalPhotoSalesVal = dOther.filter(o => o.category === 'photo').reduce((s, c) => s + c.amount, 0);
     const totalServiceSalesVal = dOther.filter(o => o.category === 'service').reduce((s, c) => s + c.amount, 0);
+    const totalBillSalesVal = dOther.filter(o => o.category === 'bill').reduce((s, c) => s + c.amount, 0);
     const totalDebtPaymentSalesVal = dOther.filter(o => o.category === 'debt_payment').reduce((s, c) => s + c.amount, 0);
     const totalManagerDebtPaymentVal = dManagerDebts.reduce((s, c) => s + c.amount, 0);
     
@@ -5140,6 +5191,7 @@ export default function App() {
       totalRechargeSales: totalRechargeSalesVal,
       totalPhotoSales: totalPhotoSalesVal,
       totalServiceSales: totalServiceSalesVal,
+      totalBillSales: totalBillSalesVal,
       totalDebtPaymentSales: totalDebtPaymentSalesVal,
       totalManagerDebtPayment: totalManagerDebtPaymentVal,
       totalServicesAndOthers: totalServicesAndOthersVal,
@@ -5159,6 +5211,7 @@ export default function App() {
     totalRechargeSales,
     totalPhotoSales,
     totalServiceSales,
+    totalBillSales,
     totalDebtPaymentSales,
     totalManagerDebtPayment,
     totalServicesAndOthers,
@@ -5415,7 +5468,7 @@ export default function App() {
       date: o.date,
       isSale: false,
       total: o.amount,
-      icon: o.category === 'recharge' ? '📶' : o.category === 'forfait' ? '🌐' : o.category === 'photo' ? '🪪' : '🔧'
+      icon: o.category === 'recharge' ? '📶' : o.category === 'forfait' ? '🌐' : o.category === 'photo' ? '🪪' : o.category === 'bill' ? '🧾' : o.category === 'debt_payment' ? '💳' : '🔧'
     }));
 
     let combined = [...rawSales, ...rawOther];
@@ -5787,9 +5840,14 @@ export default function App() {
                     <span className="text-xs font-bold text-amber-800">📶 إجمالي بطاقات الشحن</span>
                     <div className="font-mono text-xl font-black text-amber-700 mt-1">{totalRechargeSales.toFixed(3)} د.ت</div>
                   </div>
-                  <div className="bg-purple-50/80 border border-purple-200 p-4 rounded-2xl text-center shadow-xs">
+                  <div className="bg-purple-50/80 border border-purple-200 p-4 rounded-2xl text-center shadow-xs flex flex-col justify-center">
                     <span className="text-xs font-bold text-purple-800">🛠️ بقية الخدمات والعمليات</span>
-                    <div className="font-mono text-xl font-black text-purple-700 mt-1">{totalServicesAndOthers.toFixed(3)} د.ت</div>
+                    <div className="font-mono tabular-nums text-xl font-black text-purple-700 mt-1">{totalServicesAndOthers.toFixed(3)} د.ت</div>
+                    {totalBillSales > 0 && (
+                      <div className="text-[10px] text-purple-700/80 font-bold mt-1 font-mono tabular-nums">
+                        منها فواتير izi الزيتونة: {totalBillSales.toFixed(3)} د.ت
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -6778,6 +6836,7 @@ export default function App() {
                         <option value="item">🛍️ بيع سلعة من المخزن</option>
                         <option value="recharge">📶 بطاقة شحن رصيد</option>
                         <option value="forfait">🌐 شحن رصيد فورفاي / أنترنات</option>
+                        <option value="bill">🧾 خلاص الفاتورات (منصة izi الزيتونة)</option>
                         <option value="photo">🪪 صور شمسية فوتوغرافية</option>
                         <option value="service">🔧 صيانة جوال / خدمات أخرى</option>
                       </select>
@@ -7271,6 +7330,70 @@ export default function App() {
                         </div>
                       )}
 
+                      {/* Sub-form: Bill Payments (izi - Zitouna Payment) */}
+                      {incomeType === 'bill' && (
+                        <div className="space-y-3">
+                          <div className="text-[11px] font-bold text-stone-700">
+                            🧾 خلاص الفاتورات عبر منصة <span className="font-mono text-red-700">izi</span> (الزيتونة)
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <div>
+                              <label className="block text-[10px] text-stone-500 mb-0.5">نوع الفاتورة</label>
+                              <select
+                                value={billType}
+                                onChange={e => setBillType(e.target.value)}
+                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-bold"
+                              >
+                                <option value="STEG (كهرباء وغاز)">⚡ STEG (فاتورة الكهرباء والغاز)</option>
+                                <option value="SONEDE (ماء)">💧 SONEDE (فاتورة الماء)</option>
+                                <option value="أنترنات / خط قار">🌐 أنترنات / خط قار (Topnet / TT / Orange / Ooredoo)</option>
+                                <option value="جوال / اشتراك (Postpaid)">📱 فاتورة جوال / اشتراك شهري</option>
+                                <option value="معاليم الطريق السيار / جباية">🚗 الطريق السيار / جباية / معاليم عمومية</option>
+                                <option value="other">🧾 فاتورة أخرى...</option>
+                              </select>
+                            </div>
+
+                            <div>
+                              <label className="block text-[10px] text-stone-500 mb-0.5">قيمة الفاتورة (د.ت)</label>
+                              <input
+                                type="number"
+                                step="0.001"
+                                min="0"
+                                placeholder="0.000"
+                                value={billAmount}
+                                onChange={e => setBillAmount(e.target.value)}
+                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono font-bold"
+                              />
+                            </div>
+                          </div>
+
+                          {billType === 'other' && (
+                            <div>
+                              <label className="block text-[10px] text-stone-500 mb-0.5">اكتب نوع الفاتورة بالتفصيل</label>
+                              <input
+                                type="text"
+                                placeholder="مثال: فاتورة CNSS، خط نقل، اشتراك..."
+                                value={billCustomDesc}
+                                onChange={e => setBillCustomDesc(e.target.value)}
+                                className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800"
+                              />
+                            </div>
+                          )}
+
+                          <div>
+                            <label className="block text-[10px] text-stone-500 mb-0.5">رقم الفاتورة / العقد / الهاتف (اختياري)</label>
+                            <input
+                              type="text"
+                              placeholder="مثال: رقم العقد أو الهاتف"
+                              value={billReference}
+                              onChange={e => setBillReference(e.target.value)}
+                              className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-mono"
+                            />
+                          </div>
+                        </div>
+                      )}
+
                     </div>
 
                     <button 
@@ -7569,7 +7692,7 @@ export default function App() {
                           destination: o.destination || 'drawer',
                           icon: o.destination === 'manager' 
                             ? '💼' 
-                            : o.category === 'recharge' ? '📶' : o.category === 'forfait' ? '🌐' : o.category === 'photo' ? '🪪' : o.category === 'debt_payment' ? '💳' : '🔧' 
+                            : o.category === 'recharge' ? '📶' : o.category === 'forfait' ? '🌐' : o.category === 'photo' ? '🪪' : o.category === 'bill' ? '🧾' : o.category === 'debt_payment' ? '💳' : '🔧' 
                         }))
                       ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
@@ -7764,6 +7887,7 @@ export default function App() {
                           <option value="item">🛍️ مبيعات السلع والقطع بالمخزن</option>
                           <option value="recharge">📶 شحن الكروت والبطاقات</option>
                           <option value="forfait">🌐 باقات الأنترنت (Forfaits)</option>
+                          <option value="bill">🧾 خلاص الفاتورات (منصة izi الزيتونة)</option>
                           <option value="photo">🪪 خدمات تصوير فوتوغرافي</option>
                           <option value="service">🔧 صيانة الأجهزة والخدمات الأخرى</option>
                         </select>
