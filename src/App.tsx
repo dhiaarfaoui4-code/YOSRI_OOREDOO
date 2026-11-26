@@ -279,6 +279,12 @@ export const normalizeOpName = (op?: string | null): string => {
 
 export const roundTND = (n: number): number => Math.round((n + Number.EPSILON) * 1000) / 1000;
 
+const OOREDOO_NKALMEK_PLANS: ForfaitPlan[] = [
+  { id: 'ooredoo_nkalmek_30', name: 'Offre Nkalmek 30 DT', validity: '', price: 30.0 },
+  { id: 'ooredoo_nkalmek_37', name: 'Offre Nkalmek 37 DT', validity: '', price: 37.0 },
+  { id: 'ooredoo_nkalmek_50', name: 'Offre Nkalmek 50 DT', validity: '', price: 50.0 }
+];
+
 export default function App() {
   // ---- Core States ----
   const [items, setItems] = useState<Item[]>([]);
@@ -516,6 +522,20 @@ export default function App() {
   const [billCustomDesc, setBillCustomDesc] = useState('');
   const [billReference, setBillReference] = useState('');
   const [billAmount, setBillAmount] = useState('');
+
+  const availableForfaitPlans = useMemo(() => {
+    const isOoredooOp = forfaitOp === 'Ooredoo 1005' || forfaitOp === 'Ooredoo 1006';
+    const list = [...forfaitPlans];
+    if (isOoredooOp) {
+      for (const np of OOREDOO_NKALMEK_PLANS) {
+        const exists = list.some(
+          p => p.id === np.id || (p.name.toLowerCase().includes('nkalmek') && Math.abs(p.price - np.price) < 0.01)
+        );
+        if (!exists) list.push(np);
+      }
+    }
+    return list.sort((a, b) => a.price - b.price);
+  }, [forfaitPlans, forfaitOp]);
 
   // Finalize invoice form
   const [invoiceCustomerName, setInvoiceCustomerName] = useState('');
@@ -3648,7 +3668,7 @@ export default function App() {
     }
 
     else if (incomeType === 'forfait') {
-      const plan = forfaitPlans.find(p => p.id === forfaitPlanId);
+      const plan = availableForfaitPlans.find(p => p.id === forfaitPlanId);
       if (!plan) return triggerToast('❌ الرجاء اختيار باقة فورفاي');
       const override = parseFloat(forfaitPriceOverride);
       const finalPrice = !isNaN(override) && override >= 0 ? override : plan.price;
@@ -6823,8 +6843,8 @@ export default function App() {
                         onChange={e => {
                           setIncomeType(e.target.value as any);
                           // Select first forfait plan by default if switching to forfait
-                          if (e.target.value === 'forfait' && forfaitPlans.length > 0) {
-                            setForfaitPlanId(forfaitPlans[0].id);
+                          if (e.target.value === 'forfait' && availableForfaitPlans.length > 0) {
+                            setForfaitPlanId(availableForfaitPlans[0].id);
                           }
                           // Select first inventory item if switching to items
                           if (e.target.value === 'item' && items.length > 0) {
@@ -7163,7 +7183,13 @@ export default function App() {
                               <label className="block text-[10px] text-stone-500 mb-0.5">المشغل</label>
                               <select 
                                 value={forfaitOp} 
-                                onChange={e => setForfaitOp(e.target.value)} 
+                                onChange={e => {
+                                  const nextOp = e.target.value;
+                                  setForfaitOp(nextOp);
+                                  if (!nextOp.includes('Ooredoo') && forfaitPlanId.startsWith('ooredoo_nkalmek_')) {
+                                    setForfaitPlanId(forfaitPlans[0]?.id || '');
+                                  }
+                                }} 
                                 className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 font-bold"
                               >
                                 <option value="Ooredoo 1005">🔴 Ooredoo 1005</option>
@@ -7192,14 +7218,11 @@ export default function App() {
                                 className="w-full bg-white border border-stone-200 px-3 py-2 rounded-xl text-xs text-stone-800 text-left font-mono font-medium"
                               >
                                 <option value="" dir="rtl" className="font-sans">-- اختر الباقة --</option>
-                                {forfaitPlans
-                                  .slice()
-                                  .sort((a, b) => a.price - b.price)
-                                  .map((p) => (
-                                    <option key={p.id} value={p.id} dir="ltr">
-                                      {p.name} {p.validity ? `(${p.validity})` : ''} ── {p.price.toFixed(3)} DT
-                                    </option>
-                                  ))}
+                                {availableForfaitPlans.map((p) => (
+                                  <option key={p.id} value={p.id} dir="ltr">
+                                    {p.name} {p.validity ? `(${p.validity})` : ''} ── {p.price.toFixed(3)} DT
+                                  </option>
+                                ))}
                               </select>
                             </div>
                           </div>
